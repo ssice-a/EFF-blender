@@ -218,6 +218,15 @@ for p in payloads:
     assert p["bone_paths"] == ["Root", "Tip", "Unused"]
     assert len(p["skin"]) == p["vertex_count"]
 
+# Skin edits must invalidate the session cache.  A stale cache here would
+# silently ship the previous vertex-group weights and bone palette.
+cached_mesh, = (package / "meshes").glob("*.mesh")
+before_skin = addon.read_mesh(cached_mesh)["skin"]
+accessory.vertex_groups[0].add([0], .25, "REPLACE")
+addon.export_package(package, selected, [])
+after_skin = addon.read_mesh(cached_mesh)["skin"]
+assert before_skin != after_skin
+
 # Export checkbox off keeps the authored default appearance and shape sliders,
 # without exporting any key bindings. It does not change the saved project.
 static_package = output / "without-switches"

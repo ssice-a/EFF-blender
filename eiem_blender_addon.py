@@ -85,18 +85,47 @@ def _owner_revision(owner):
     )
 
 
+def _vertex_group_digest(obj):
+    """Return a stable digest of the authored skin weights on *obj*.
+
+    Blender does not expose a revision counter for vertex-group membership or
+    weights.  Depsgraph updates cover most edits, but weight edits can leave a
+    session cache looking clean.  The mesh resource cache must therefore carry
+    a compact content fingerprint so an export can never reuse a skin payload
+    after the author changes a group, weight, or group name.
+    """
+    groups = getattr(obj, "vertex_groups", None)
+    mesh = getattr(obj, "data", None)
+    if groups is None or mesh is None:
+        return ""
+    digest = hashlib.sha1()
+    digest.update(struct.pack("<II", len(groups), len(mesh.vertices)))
+    for group in groups:
+        encoded = str(group.name).encode("utf-8", "replace")
+        digest.update(struct.pack("<I", len(encoded)))
+        digest.update(encoded)
+    for vertex in mesh.vertices:
+        entries = sorted(
+            (int(item.group), float(item.weight)) for item in vertex.groups)
+        digest.update(struct.pack("<I", len(entries)))
+        for group_index, weight in entries:
+            digest.update(struct.pack("<If", group_index, weight))
+    return digest.hexdigest()
+
+
 def _mesh_resource_token(obj):
     mesh = getattr(obj, "data", None)
     armature = next((modifier.object for modifier in obj.modifiers
                      if modifier.type == "ARMATURE" and modifier.object), None)
     shape_keys = getattr(mesh, "shape_keys", None)
     return (
-        "mesh-v1",
+        "mesh-v2",
         _owner_revision(obj),
         _owner_revision(mesh),
         _owner_revision(shape_keys),
         _owner_revision(armature),
         _owner_revision(getattr(armature, "data", None)),
+        _vertex_group_digest(obj),
     )
 
 
