@@ -249,9 +249,6 @@ def set_switch_group_key(group, key, scene=None):
            for _, control in shape_controls_in_scene(scene)
            for attribute in ("hotkey_increase", "hotkey_decrease")):
         raise ValueError("已有形态键控制使用快捷键 " + key)
-    ui_key = str(getattr(scene, "eiem_ui_key", "")).strip()
-    if ui_key and validate_switch_key(ui_key) == key:
-        raise ValueError("Mod UI 已使用快捷键 " + key)
     group["eiem_key"] = key
     return key
 
@@ -286,9 +283,6 @@ def set_shape_control_hotkey(obj, control, key, direction, scene=None):
     if any(validate_switch_key(group.get("eiem_key", "")) == key
            for group in switch_groups(scene)):
         raise ValueError("已有网格切换组使用快捷键 " + key)
-    ui_key = str(getattr(scene, "eiem_ui_key", "")).strip()
-    if ui_key and validate_switch_key(ui_key) == key:
-        raise ValueError("Mod UI 已使用快捷键 " + key)
     target = (control.as_pointer(), attribute)
     for _, candidate in shape_controls_in_scene(scene):
         for candidate_attribute in ("hotkey_increase", "hotkey_decrease"):
@@ -418,9 +412,6 @@ def create_switch_group(name, key, objects, scene=None):
            for _, control in shape_controls_in_scene(scene)
            for attribute in ("hotkey_increase", "hotkey_decrease")):
         raise ValueError("已有形态键控制使用快捷键 " + key)
-    ui_key = str(getattr(scene, "eiem_ui_key", "")).strip()
-    if ui_key and validate_switch_key(ui_key) == key:
-        raise ValueError("Mod UI 已使用快捷键 " + key)
     root = next(
         (collection for collection in scene.collection.children
          if collection.get("eiem_switch_root")), None)
@@ -563,11 +554,19 @@ def plan_shape_controls(objects, include_hotkeys=True):
     bindings = {}
     hotkeys = []
     shared = {}
+    # Several authored parts can be merged into one replacement Mesh.  Their
+    # Blender objects often carry the same Shape Key (for example one key on
+    # body, cloth and accessories).  A control belongs to the merged source
+    # channel, not to each part, so emit one variable and one slider for that
+    # channel and reuse it in every part action.
+    by_source_channel = {}
+    hotkey_by_variable = {}
     for obj in objects:
         identity = obj.data.as_pointer()
         if identity not in shared:
             sync_new_shape_controls(obj)
             mesh_id = author_identity(obj.data, bpy.data.meshes)
+            source_identity = mesh_source_identity(obj)
             actions = []
             used = set()
             for control in obj.data.eiem_shape_controls:
@@ -595,10 +594,27 @@ def plan_shape_controls(objects, include_hotkeys=True):
                         "形态键滑条的默认值或范围无效：" + key.name)
                 if not control.identity:
                     control.identity = uuid.uuid4().hex[:16]
-                variable = "$shape_%s_%s" % (mesh_id, control.identity)
                 label = (control.label or key.name).replace(
                     "\r", " ").replace("\n", " ")
-                declarations.append((variable, label, *values))
+                channel_key = (source_identity, channel_name)
+                existing = by_source_channel.get(channel_key)
+                if existing is None:
+                    variable = "$shape_%s_%s" % (mesh_id, control.identity)
+                    existing = {
+                        "variable": variable,
+                        "label": label,
+                        "values": values,
+                    }
+                    by_source_channel[channel_key] = existing
+                    declarations.append((variable, label, *values))
+                else:
+                    variable = existing["variable"]
+                    old_values = existing["values"]
+                    if any(abs(float(left) - float(right)) > 1e-6
+                           for left, right in zip(old_values, values)):
+                        raise ValueError(
+                            "同一源 Mesh 的形态键 %s 在不同部件上的滑条范围不一致"
+                            % channel_name)
                 actions.append("shape.%s=%s" % (channel_name, variable))
                 if not include_hotkeys:
                     continue
@@ -616,6 +632,14 @@ def plan_shape_controls(objects, include_hotkeys=True):
                 for direction_label, hotkey, target in configured_hotkeys:
                     if not hotkey:
                         continue
+                    hotkey_key = (variable, direction_label)
+                    previous = hotkey_by_variable.get(hotkey_key)
+                    if previous is not None:
+                        if previous["key"] != validate_switch_key(hotkey):
+                            raise ValueError(
+                                "同一源 Mesh 的形态键 %s 在不同部件上使用了不同快捷键"
+                                % channel_name)
+                        continue
                     hotkeys.append({
                         "object": obj,
                         "shape": key.name,
@@ -626,79 +650,7 @@ def plan_shape_controls(objects, include_hotkeys=True):
                         "speed": speed,
                         "target": target,
                     })
+                    hotkey_by_variable[hotkey_key] = hotkeys[-1]
             shared[identity] = actions
         bindings[obj] = shared[identity]
     return declarations, bindings, hotkeys
-
-
-def lua_string(value):
-    # Lua decimal escapes preserve control characters without JSON unicode escapes.
-    return '"' + ''.join(
-        ('\\%03d' % ord(char) if ord(char) < 32
-         else '\\' + char if char in {'"', '\\'}
-         else char)
-        for char in str(value)
-    ) + '"'
-
-
-def generate_mod_ui(groups, shape_controls, shape_hotkeys=None, scene=None,
-                    include_hotkeys=True):
-    scene = scene or bpy.context.scene
-    shape_hotkeys = shape_hotkeys or []
-    key = (validate_switch_key(scene.eiem_ui_key)
-           if include_hotkeys and scene.eiem_ui_key.strip() else "")
-    if any(key == group[3] for group in groups):
-        raise ValueError("Mod UI 开关键与切换组按键重复，请修改 UI 开关键")
-    if any(key == control["key"] for control in shape_hotkeys):
-        raise ValueError("Mod UI 开关键与形态键控制按键重复，请修改 UI 开关键")
-    lines = [
-        "-- Optional Blender template. All window behavior belongs to this Lua file.",
-        "return function()",
-    ]
-    if key:
-        lines.append('  if mod.get("$ui_open") == 0 then return end')
-    lines.append("  imgui.SetNextWindowSize(360, 0, imgui.Cond.FirstUseEver)")
-    if key:
-        lines.extend([
-            "  local visible, open = imgui.Begin(%s, true)"
-            % lua_string(scene.eiem_ui_title),
-            '  if not open then mod.set("$ui_open", 0) end',
-            "  if visible then",
-        ])
-    else:
-        lines.append("  if imgui.Begin(%s) then"
-                     % lua_string(scene.eiem_ui_title))
-    for group, states, default, group_key, variable in groups:
-        lines.append("    imgui.Text(%s)" % lua_string(group.name))
-        values = switch_state_values(group)
-        for value, state in zip(values, states):
-            lines.extend([
-                "    if imgui.RadioButton(%s, mod.get(%s) == %d) then" % (
-                    lua_string(state.name + "##" + variable + str(value)),
-                    lua_string(variable), value),
-                "      mod.set(%s, %d)" % (lua_string(variable), value),
-            ])
-            lines.append("    end")
-        lines.append("    imgui.Separator()")
-    for variable, label, default, minimum, maximum in shape_controls:
-        lines.extend([
-            "    do",
-            "      local changed, value = imgui.SliderFloat(%s, mod.get(%s), %.9g, %.9g)" % (
-                lua_string(label + "##" + variable), lua_string(variable),
-                minimum, maximum),
-            "      if changed then mod.set(%s, value) end"
-            % lua_string(variable),
-            "    end",
-        ])
-    variables = (
-        [group[4] for group in groups]
-        + [control[0] for control in shape_controls]
-    )
-    if variables:
-        lines.append('    if imgui.Button("恢复默认值") then')
-        for variable in variables:
-            lines.append("      mod.set(%s, mod.default(%s))" % (
-                lua_string(variable), lua_string(variable)))
-        lines.append("    end")
-    lines.extend(["  end", "  imgui.End()", "end", ""])
-    return key, '\n'.join(lines)

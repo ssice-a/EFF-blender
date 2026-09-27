@@ -47,13 +47,13 @@ for cycle in range(3):
     assert bpy.ops.eiem.import_material.get_rna_type() is not None
     assert bpy.ops.eiem.import_physics.get_rna_type() is not None
     assert bpy.ops.eiem.export_physics.get_rna_type() is not None
-    assert bpy.ops.eiem.organize_physics.get_rna_type() is not None
     assert bpy.ops.eiem.physics_parameters.get_rna_type() is not None
     assert bpy.ops.eiem.physics_curve_key.get_rna_type() is not None
     assert bpy.ops.eiem.switch_key_record.get_rna_type() is not None
     assert bpy.ops.eiem.switch_state_drag.get_rna_type() is not None
     assert bpy.ops.eiem.shape_key_record.get_rna_type() is not None
     assert hasattr(bpy.types, "EIEM_UL_switch_states")
+    assert hasattr(bpy.types, "VIEW3D_PT_eiem_updates")
     assert hasattr(bpy.types, "OBJECT_PT_eiem_physics")
     assert hasattr(bpy.types, "EIEM_MT_physics_create")
     assert not hasattr(bpy.types, "EIEM_MT_physics_copy")

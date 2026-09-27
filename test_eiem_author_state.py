@@ -41,6 +41,8 @@ assert abs(addon.plan_shape_controls([obj])[0][0][2]-.6)<1e-6
 extra = obj.shape_key_add(name="Sleeve")
 assert addon.plan_shape_controls([obj])[0][0][0] == variable
 copy = obj.copy();copy.data = mesh.copy();copy.name="Independent"
+copy["eiem_render_asset"] = "Independent"
+copy.data["eiem_target_asset"] = "Independent"
 bpy.context.scene.collection.objects.link(copy)
 decl, bind, hotkeys = addon.plan_shape_controls([copy, obj])
 assert bind[obj][0] == "shape.Inflate="+variable and bind[copy][0] != bind[obj][0]

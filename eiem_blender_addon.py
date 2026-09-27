@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EIEM Resource Package",
     "author": "EIEM",
-    "version": (0, 34, 0),
+    "version": (0, 35, 0),
     "blender": (3, 0, 0),
     "location": "File > Import/Export > EIEM package",
     "category": "Import-Export",
@@ -87,8 +87,6 @@ delete_switch_group = controls.delete_switch_group
 mesh_source_identity = controls.mesh_source_identity
 plan_switch_export = controls.plan_switch_export
 plan_shape_controls = controls.plan_shape_controls
-lua_string = controls.lua_string
-generate_mod_ui = controls.generate_mod_ui
 
 
 # Keep the existing add-on scripting API while LOD policy lives in one module.
@@ -1722,6 +1720,8 @@ def write_merged_mesh(output, objects):
         (skin, bindposes, bone_hashes, bone_paths, bone_index_paths,
          bone_sources, bone_source_candidates) = export_skin_binding(
             obj, obj.find_armature(), source_vertices)
+        blend_vertices, blend_frames, blend_channels, blend_weights, additional = \
+            export_blend_shapes(obj, to_source, source_vertices)
         parts.append({
             "obj": obj,
             "vertices": vertices, "normals": normals, "tangents": tangents,
@@ -1736,6 +1736,11 @@ def write_merged_mesh(output, objects):
             "bone_index_paths": bone_index_paths,
             "bone_sources": bone_sources,
             "bone_source_candidates": bone_source_candidates,
+            "blend_vertices": blend_vertices,
+            "blend_frames": blend_frames,
+            "blend_channels": blend_channels,
+            "blend_weights": blend_weights,
+            "additional": additional,
         })
 
     # One Mesh has one joint palette. Sibling parts routinely address different
@@ -1883,9 +1888,110 @@ def write_merged_mesh(output, objects):
         writer.i32(len(candidates))
         for source in candidates:
             writer.string(source[0]); writer.string(source[1]); writer.u32(source[2])
+
     # Blend shapes keep their part-local vertex indices shifted by that part's
-    # base offset, exactly like the geometry they displace.
-    writer.i32(0); writer.i32(0); writer.i32(0); writer.floats([]); writer.i32(0)
+    # base offset, exactly like the geometry they displace.  The old merged
+    # writer discarded this stream, leaving ShapeControl declarations pointing
+    # at a Mesh with zero channels.  Accumulate matching channel/frame names
+    # across sibling parts so one slider drives the complete merged Mesh.
+    blend_channel_records = {}
+    blend_channel_order = []
+    vertex_base = 0
+    merged_additional = []
+    for part in parts:
+        part_additional = part["additional"]
+        if part_additional and len(part_additional) != part["count"]:
+            raise ValueError(
+                "合并网格的附加形态数据与顶点数量不一致：" + part["obj"].name)
+        if part_additional:
+            merged_additional.extend(part_additional)
+        else:
+            merged_additional.extend([(0.0, 0.0, 0.0)] * part["count"])
+
+        local_frames = part["blend_frames"]
+        local_weights = part["blend_weights"]
+        for channel_name, channel_hash, first_frame, frame_count in part["blend_channels"]:
+            channel_key = (str(channel_name), int(channel_hash))
+            channel = blend_channel_records.get(channel_key)
+            if channel is None:
+                channel = {"name": str(channel_name), "hash": int(channel_hash),
+                           "frames": [], "frame_keys": {}}
+                blend_channel_records[channel_key] = channel
+                blend_channel_order.append(channel_key)
+            for local_index in range(frame_count):
+                frame_index = first_frame + local_index
+                if frame_index >= len(local_frames):
+                    raise ValueError(
+                        "合并网格的形态键帧引用无效：" + part["obj"].name)
+                frame_name, _, _, has_normals, has_tangents, has_additional = \
+                    local_frames[frame_index]
+                weight = (float(local_weights[frame_index])
+                          if frame_index < len(local_weights) else 100.0)
+                frame_key = (str(frame_name), weight)
+                target_frame = channel["frame_keys"].get(frame_key)
+                if target_frame is None:
+                    target_frame = {
+                        "name": str(frame_name), "weight": weight,
+                        "has_normals": bool(has_normals),
+                        "has_tangents": bool(has_tangents),
+                        "has_additional": bool(has_additional),
+                        "vertices": [],
+                    }
+                    channel["frame_keys"][frame_key] = target_frame
+                    channel["frames"].append(target_frame)
+                else:
+                    target_frame["has_normals"] |= bool(has_normals)
+                    target_frame["has_tangents"] |= bool(has_tangents)
+                    target_frame["has_additional"] |= bool(has_additional)
+                start = local_frames[frame_index][1]
+                count = local_frames[frame_index][2]
+                end = min(len(part["blend_vertices"]), start + count)
+                for vertex_index, delta_position, delta_normal, delta_tangent in \
+                        part["blend_vertices"][start:end]:
+                    target_frame["vertices"].append((
+                        int(vertex_index) + vertex_base,
+                        delta_position, delta_normal, delta_tangent))
+        vertex_base += part["count"]
+
+    merged_blend_vertices = []
+    merged_blend_frames = []
+    merged_blend_channels = []
+    merged_blend_weights = []
+    for channel_key in blend_channel_order:
+        channel = blend_channel_records[channel_key]
+        first_frame = len(merged_blend_frames)
+        for frame in channel["frames"]:
+            first_vertex = len(merged_blend_vertices)
+            merged_blend_vertices.extend(frame["vertices"])
+            merged_blend_frames.append((
+                frame["name"], first_vertex, len(frame["vertices"]),
+                frame["has_normals"], frame["has_tangents"],
+                frame["has_additional"],
+            ))
+            merged_blend_weights.append(frame["weight"])
+        merged_blend_channels.append((
+            channel["name"], channel["hash"], first_frame,
+            len(merged_blend_frames) - first_frame,
+        ))
+
+    writer.i32(len(merged_blend_vertices))
+    writer.blend_vertices(merged_blend_vertices)
+    writer.i32(len(merged_blend_frames))
+    for name, first, count, has_normals, has_tangents, has_additional in merged_blend_frames:
+        writer.string(name); writer.u32(first); writer.u32(count)
+        writer.raw(bytes((int(has_normals), int(has_tangents), int(has_additional))))
+    writer.i32(len(merged_blend_channels))
+    for name, name_hash, first, count in merged_blend_channels:
+        writer.string(name); writer.u32(name_hash); writer.u32(first); writer.u32(count)
+    writer.floats(merged_blend_weights)
+    # Additional normals are optional and are already per exported vertex for
+    # each part (export_blend_shapes rejects topology-changing data).  Keep the
+    # stream aligned with the concatenated vertex buffer when any part has it.
+    has_additional = any(part["additional"] for part in parts)
+    additional_values = merged_additional if has_additional else []
+    writer.i32(len(additional_values))
+    for value in additional_values:
+        for component in value: writer.f32(component)
     # Write through the parameter: the palette loop above rebinds the local.
     Path(output).write_bytes(writer.data)
     return {
@@ -2182,6 +2288,18 @@ def prepare_export_root(root):
                     generated_ui.unlink()
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def mod_export_directory(directory):
+    """Return the package directory used by the file-browser exporters.
+
+    The file browser selects a parent directory; every export gets one stable
+    ``mod`` child so meshes, materials, textures and ``mod.ini`` never spill
+    into the user's working folder.  Selecting an existing ``mod`` directory
+    keeps that explicit choice without creating ``mod/mod``.
+    """
+    selected = Path(directory or os.getcwd()).expanduser().resolve()
+    return selected if selected.name.lower() == "mod" else selected / "mod"
 
 
 def visible_eiem_resources(context=None):
@@ -2772,14 +2890,8 @@ def write_export_package(root, plan, armatures, physics_objects=None,
         if control["key"] in used_hotkeys:
             raise ValueError("多个控制使用同一快捷键：" + control["key"])
         used_hotkeys.add(control["key"])
-    ui_payload = generate_mod_ui(
-        switch_groups, shape_controls, shape_hotkeys,
-        include_hotkeys=switches_enabled
-    ) if bpy.context.scene.eiem_ui_template else None
-    if switch_groups or shape_controls or ui_payload:
+    if switch_groups or shape_controls:
         resource_lines.append("[Constants]")
-        if ui_payload and ui_payload[0]:
-            resource_lines.append("$ui_open=0")
         for group, states, default, key, variable in switch_groups:
             resource_lines.append("persist %s=%d" % (variable, default))
         for variable, label, default, minimum, maximum in shape_controls:
@@ -2811,13 +2923,6 @@ def write_export_package(root, plan, armatures, physics_objects=None,
                 control["variable"] + "=%.9g" % control["target"],
                 "",
             ])
-        if ui_payload:
-            ui_key, ui_source = ui_payload
-            if ui_key:
-                resource_lines.extend(["[KeyModUI]", "key=" + ui_key, "scope=both",
-                                       "type=cycle", "$ui_open=0,1", ""])
-            resource_lines.extend(["[UIMod]", "path=ui.lua", ""])
-            (root / "ui.lua").write_text(ui_source, encoding="utf-8")
     exported_armatures = {}
     seen_skeleton_sections = set()
     seen_physics_sections = set()
@@ -3385,8 +3490,7 @@ class EIEM_PT_shape_controls(bpy.types.Panel):
             body.separator()
             body.label(text="独立按键控制", icon="EVENT_F")
             draw_shape_hotkey_rows(body, control, index)
-        layout.label(text="新增形态键自动导出变量；原生通道需主动接管")
-        layout.label(text="勾选“生成简单 UI”可同时生成独立控制窗口")
+        layout.label(text="新增形态键会自动导出为滑块；快捷键按需设置")
 
 
 class EIEM_PT_mesh_properties(bpy.types.Panel):
@@ -3689,13 +3793,6 @@ class EIEM_OT_switch_state(bpy.types.Operator):
                 state = add_switch_state(group, "款式 %d" % (len(switch_states(group)) + 1))
                 capture_switch_state(group, state, context)
                 group.eiem_switch_state_index = len(switch_states(group)) - 1
-            elif self.action == "MEMBER_ADD":
-                if not context.selected_objects:
-                    raise ValueError("请先选择要加入当前组的 EIEM 网格")
-                assign_switch_meshes(switch_states(group)[0], context.selected_objects,
-                                     context.scene)
-            elif self.action == "MEMBER_REMOVE":
-                assign_switch_meshes(None, context.selected_objects, context.scene)
             elif self.action == "SELECT_MEMBERS":
                 bpy.ops.object.select_all(action="DESELECT")
                 for obj in switch_members(group):
@@ -3752,11 +3849,6 @@ class EIEM_PT_switches(bpy.types.Panel):
         layout.use_property_split = False
         layout.use_property_decorate = False
         layout.operator("eiem.switch_create", icon="ADD")
-        draw_eiem_rna_property(layout, context.scene, "eiem_ui_template", "生成简单 UI", factor=0.3)
-        if context.scene.eiem_ui_template:
-            draw_eiem_rna_property(layout, context.scene, "eiem_ui_key", "UI 开关键", factor=0.3)
-            draw_eiem_rna_property(layout, context.scene, "eiem_ui_title", "UI 标题", factor=0.3)
-            layout.label(text="按键留空则常显；布局在生成的 Lua 中")
         draw_eiem_rna_property(layout, context.scene, "eiem_switch_active", "当前组", factor=0.3)
         groups = switch_groups(context.scene)
         if groups:
@@ -3777,10 +3869,6 @@ class EIEM_PT_switches(bpy.types.Panel):
             key_row.operator("eiem.switch_key_record", text="录制按键", icon="REC")
             members = switch_members(group)
             row = layout.row(align=True)
-            op = row.operator("eiem.switch_state", text="所选加入组", icon="ADD")
-            op.action = "MEMBER_ADD"
-            op = row.operator("eiem.switch_state", text="所选移出组", icon="REMOVE")
-            op.action = "MEMBER_REMOVE"
             op = row.operator("eiem.switch_state", text="选择组内物体")
             op.action = "SELECT_MEMBERS"
             layout.label(text="%d 个受控网格；调整眼睛显隐后记录款式" % len(members),
@@ -3805,12 +3893,39 @@ class EIEM_PT_switches(bpy.types.Panel):
                 op = row.operator("eiem.switch_state", text="预览当前款式", icon="HIDE_OFF")
                 op.action, op.state_name = "PREVIEW", current.name
         layout.operator("eiem.switch_restore_preview", icon="LOOP_BACK")
-        layout.separator()
-        layout.label(text="相机关控制游戏显隐；眼睛仅用于 Blender 预览")
-        obj = context.object
-        if obj and obj.type == "MESH" and obj.data.get("eiem_section"):
-            draw_eiem_rna_property(layout, obj, "hide_render", "游戏隐藏（相机）", factor=0.5)
         layout.operator("eiem.export_package", text="导出所选 mod", icon="EXPORT")
+
+
+def draw_update_status(layout):
+    row = layout.row(align=True)
+    row.enabled = _update_state["status"] != "checking"
+    row.operator("eiem.check_update", text="检查更新", icon="FILE_REFRESH")
+    status = _update_state["status"]
+    if status == "checking":
+        layout.label(text="正在检查 GitHub Release...")
+    elif status == "latest":
+        layout.label(text="已是最新版本")
+    elif status == "available":
+        layout.label(text="发现新版本 " + _update_state["tag"])
+        row = layout.row(align=True)
+        row.operator("eiem.open_update_release", text="查看 Release", icon="URL")
+        row.operator("eiem.ignore_update_release", text="忽略此版本", icon="HIDE_ON")
+    elif status == "ignored":
+        layout.label(text="已忽略 " + _update_state["tag"])
+        layout.operator("eiem.check_update", text="仍要查看此版本").force = True
+    elif status == "error":
+        layout.label(text="检查失败：" + _update_state["message"], icon="ERROR")
+
+
+class EIEM_PT_updates(bpy.types.Panel):
+    bl_label = "EIEM 更新"
+    bl_idname = "VIEW3D_PT_eiem_updates"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "EIEM"
+
+    def draw(self, context):
+        draw_update_status(self.layout)
 
 
 def operator_lod_levels(operator, meshes):
@@ -3897,14 +4012,14 @@ class EIEM_OT_export(ExportHelper, bpy.types.Operator):
         self.layout.label(text=self.scope_message)
         self.layout.prop(self, "include_switches")
         draw_lod_options(self.layout, self)
-        self.layout.label(text="仅处理所选资源；相机关写入游戏显隐状态")
+        self.layout.label(text="只处理所选资源；导出结果会写入所选目录下的 mod 文件夹")
 
     def execute(self, context):
         try:
             meshes, rigs = selected_eiem_resources(context)
             levels = self._lod_levels(meshes)
             stats = export_package(
-                self.directory or os.path.dirname(self.filepath),
+                mod_export_directory(self.directory or os.path.dirname(self.filepath)),
                 mesh_objects=meshes,
                 armatures=rigs,
                 physics_objects=selected_eiem_physics(context),
@@ -3952,7 +4067,7 @@ class EIEM_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
             meshes, _ = selected_eiem_resources(context)
             levels = self._lod_levels(meshes)
             stats = export_package(
-                self.directory or os.path.dirname(self.filepath),
+                mod_export_directory(self.directory or os.path.dirname(self.filepath)),
                 mesh_objects=meshes, armatures=[], physics_objects=[],
                 mesh_only=True, lod_levels=levels)
             self.report(
@@ -3985,25 +4100,7 @@ class EIEM_AddonPreferences(bpy.types.AddonPreferences):
     ignored_release_tag: StringProperty(name="Ignored release", default="")
 
     def draw(self, context):
-        layout = self.layout
-        row = layout.row()
-        row.enabled = _update_state["status"] != "checking"
-        row.operator("eiem.check_update", text="检查更新", icon='FILE_REFRESH')
-        status = _update_state["status"]
-        if status == "checking":
-            layout.label(text="正在检查 GitHub Release...")
-        elif status == "latest":
-            layout.label(text="已是最新版本")
-        elif status == "available":
-            layout.label(text="发现新版本 " + _update_state["tag"])
-            row = layout.row()
-            row.operator("eiem.open_update_release", text="查看 Release", icon='URL')
-            row.operator("eiem.ignore_update_release", text="忽略此版本", icon='HIDE_ON')
-        elif status == "ignored":
-            layout.label(text="已忽略 " + _update_state["tag"])
-            layout.operator("eiem.check_update", text="仍要查看此版本").force = True
-        elif status == "error":
-            layout.label(text="检查失败：" + _update_state["message"], icon='ERROR')
+        draw_update_status(self.layout)
 
 
 class EIEM_OT_check_update(bpy.types.Operator):
@@ -4093,6 +4190,7 @@ classes = (
     EIEM_OT_switch_state,
     EIEM_OT_switch_restore,
     EIEM_PT_switches,
+    EIEM_PT_updates,
     EIEM_OT_import,
     EIEM_OT_export,
     EIEM_OT_export_mesh_only,
@@ -4106,9 +4204,6 @@ def register():
     for cls in classes: bpy.utils.register_class(cls)
     physics_authoring.register(globals())
     bpy.types.Mesh.eiem_shape_controls = CollectionProperty(type=EIEM_PG_shape_control)
-    bpy.types.Scene.eiem_ui_template = BoolProperty(name="生成简单 UI", default=False)
-    bpy.types.Scene.eiem_ui_key = StringProperty(name="UI 开关键", default="", description="用户指定；留空生成常显 UI")
-    bpy.types.Scene.eiem_ui_title = StringProperty(name="UI 标题", default="Mod controls")
     bpy.types.Collection.eiem_switch_state_index = IntProperty(
         name="当前款式", default=0, min=0)
     bpy.types.Scene.eiem_switch_active = PointerProperty(
@@ -4123,9 +4218,6 @@ def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_export)
     del bpy.types.Scene.eiem_switch_active
-    del bpy.types.Scene.eiem_ui_key
-    del bpy.types.Scene.eiem_ui_template
-    del bpy.types.Scene.eiem_ui_title
     del bpy.types.Collection.eiem_switch_state_index
     del bpy.types.Mesh.eiem_shape_controls
     for cls in reversed(classes): bpy.utils.unregister_class(cls)

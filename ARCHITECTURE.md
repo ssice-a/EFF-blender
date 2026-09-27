@@ -1,26 +1,23 @@
-# Architecture
+﻿# Blender 侧架构
 
-EIEM Blender 是三端管线中的作者端：AnimeStudio 生产原始 EIEM 资源，Blender 产生 Mod 资源，EIEM DLL 在游戏内消费这些文件。
+EIEM Blender 是三端管线的作者端：AnimeStudio 生成 EIEM 源包，Blender 编辑并生成 Mod，EIEM DLL 在游戏中加载 Mod。
 
 ## 模块
 
 | 模块 | 责任 | 不应包含 |
 |---|---|---|
-| `eiem_format.py` | 二进制读写、INI 静态声明读取、安全路径 | `bpy`、场景对象、UI |
-| `eiem_lod.py` | LOD 身份、发现和导出计划 | 文件写入、Blender UI |
-| `eiem_blender_controls.py` | 款式与形态键作者状态、导出计划 | 网格二进制序列化 |
-| `eiem_blender_addon.py` | 场景适配、导入导出编排、面板和操作 | 新的独立协议实现 |
-| `eiem_physics_*.py` | 可选物理数据、作者 UI 和辅助显示 | 普通 Mesh 导出的必需依赖 |
+| `eiem_format.py` | Mesh、材质、贴图、骨骼和 INI 的格式读写 | `bpy`、场景对象和 UI |
+| `eiem_lod.py` | LOD 身份发现与导出计划 | 文件写入和 Blender UI |
+| `eiem_blender_controls.py` | 款式切换、形态键控制和导出计划 | 二进制 Mesh 序列化 |
+| `eiem_blender_addon.py` | 场景导入、资源导出、面板和操作符 | 新的独立格式实现 |
+| `eiem_physics_*.py` | 可选物理数据、作者工具和预览 | 普通 Mesh 导出的必需依赖 |
 
 ## 约束
 
-- 文件格式先进入纯模块，并由普通 Python 测试覆盖。
-- Blender 对大型数组使用批量 RNA API；单对象操作才使用逐项 API。
-- UI 默认只呈现完成当前任务所需的输入，高级输入由开关展开。
-- 导出由选择集决定；不隐式扩大到同源网格或切换组。
-- 骨骼槽顺序是协议身份，显示名称只是作者信息。
-- 物理模块可以读取共享 Rig，但普通 Mesh 流程不依赖物理模块成功初始化。
+- 导出只处理用户选中的 EIEM 网格及其依赖，不隐式扩大到其他源资源。
+- 同一源 Mesh 的多个部件共享形态键变量；合并 Mesh 保留形态键数据和顶点偏移。
+- 骨骼路径和绑定矩阵来自资源身份，不依赖 Blender 显示名称。
+- 导出窗口负责把包写入所选父目录的 `mod/` 子目录。
+- 更新检查只读取 GitHub Release，不自动改写插件文件。
 
-## 下一步拆分
-
-`eiem_blender_addon.py` 仍包含场景构建与包写入。后续只有在集成测试覆盖对应边界后，才继续拆成 `scene_import` 与 `package_export`；不为缩短文件而复制状态或增加双向依赖。
+导出格式和资源解析集中在纯模块与后台测试中；需要场景状态的逻辑保留在主插件模块。

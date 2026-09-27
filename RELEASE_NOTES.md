@@ -1,8 +1,9 @@
-# EIEM Blender v0.34.0
+﻿# EIEM Blender v0.35.0
 
-在 Blender 中编辑 EIEM 模型、材质、贴图、款式和形态键，导出游戏 Mod 包。
+- 修复合并网格丢失形态键的问题，并按源 Mesh 合并重复的形态键控制项。
+- 移除已废弃的简单 UI 生成、物理文件整理按钮和切换组的加入/移出快捷入口。
+- 导出结果统一放入所选父目录下的 `mod/` 文件夹。
+- 在 3D 视图的 EIEM 面板增加检查更新入口。
+- 保留默认勾选的“导出按键切换”以及形态键滑块导出。
 
-- 导出窗口新增默认勾选的“导出按键切换”。取消后导出默认款式，不导出快捷键；形态键和滑块仍可使用。
-- 支持当前 [AnimeStudio v1.2.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.2.0) 的源包，与 [EIEM v1.2.0](https://github.com/ssice-a/EIEM/releases/tag/v1.2.0) 配套使用。旧源包需要重新导出。
-
-**安装：**下载 `EIEM_Blender_v0.34.0.zip`，在 Blender 插件设置中选择“从磁盘安装”。更新前先移除旧版并保存正在编辑的工程。使用说明见 [README](https://github.com/ssice-a/EIEM-blender#readme)。
+**安装：**下载 `EIEM_Blender_v0.35.0.zip`，在 Blender 插件设置中选择“从磁盘安装”。更新前先移除旧版并保存当前工程。

@@ -91,6 +91,13 @@ first.data.polygons[1].material_index = 1
 second = part('PartB', ['Root', 'Root/Cloth'], [mat_c],
              [(2, 0, 0), (3, 0, 0), (2, 1, 0)], [(0, 1, 2)])
 
+# Both sibling parts carry the same authored Shape Key.  The merged resource
+# must keep one channel and shift Part B's local delta indices after Part A.
+for obj, vertex in ((first, 0), (second, 1)):
+    obj.shape_key_add(name='Basis')
+    key = obj.shape_key_add(name='Inflate')
+    key.data[vertex].co.z += 0.5
+
 # These slots are unchanged from the source Render.  They still need explicit
 # material resources once the parts are folded into one new global slot layout.
 first['eiem_original_material_sections_json'] = json.dumps(
@@ -114,6 +121,11 @@ assert result['vertex_count'] == 7, result['vertex_count']
 assert result['submesh_count'] == 3, result['submesh_count']
 assert len(result['submeshes']) == 3, result['submeshes']
 assert result['index_count'] == 9, result['index_count']
+assert len(result['blend_channels']) == 1, result['blend_channels']
+assert result['blend_channels'][0][0] == 'Inflate', result['blend_channels']
+assert len(result['blend_frames']) == 1, result['blend_frames']
+assert result['blend_frames'][0][2] == 2, result['blend_frames']
+assert {vertex[0] for vertex in result['blend_vertices']} == {0, 5}, result['blend_vertices']
 
 # The palette is the ordered union, seeded by the widest part.
 assert result['bone_paths'] == ['Root', 'Root/Pelvis', 'Root/Cloth'], result['bone_paths']

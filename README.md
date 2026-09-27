@@ -1,39 +1,40 @@
-# EIEM Blender 插件
+﻿# EIEM Blender 插件
 
-在 Blender 中制作《明日方舟：终末地》的 EIEM Mod。导入 [AnimeStudio](https://github.com/ssice-a/AnimeStudio) 导出的 EIEM 资源，编辑模型、材质和贴图，再导出供 [EIEM 游戏插件](https://github.com/ssice-a/EIEM) 使用的 Mod 包。
+EIEM Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以在 Blender 中编辑网格、材质、贴图、款式切换和形态键，然后导出可放入 EIEM `plugin/mods` 的 Mod 文件夹。
 
 ## 功能
 
-- 编辑模型、材质、贴图与 LOD；支持多个部件、材质槽和形态键。
-- 为服装或部件制作款式切换，设置游戏快捷键和默认款式。
-- 为形态键设置滑块及可选的快捷键，生成简单的游戏内控制界面。
-- 只导出选中的资源；提供普通 Mod 包和仅网格包两种导出方式。
-- 在插件设置中手动检查更新，可忽略指定版本。
+- 导入和编辑 EIEM 网格、材质、贴图、骨骼、LOD 与物理资源。
+- 支持多个部件、材质槽、合并网格和形态键。
+- 为形态键提供 Blender 滑块，并可按需录制游戏快捷键。
+- 创建款式切换组，设置默认款式和游戏快捷键。
+- 导出完整 Mod 或仅网格包；导出按键切换选项默认开启。
+- 在 EIEM 面板中检查 GitHub Release 更新并忽略指定版本。
 
 ## 安装
 
-从 [Releases](https://github.com/ssice-a/EIEM-blender/releases) 下载 `EIEM_Blender_v*.zip`。在 Blender 的插件设置中选择“从磁盘安装”，直接选择 ZIP，然后启用插件。更新前先移除旧版，避免重复安装；请保存正在编辑的 `.blend` 工程。
+从 [Releases](https://github.com/ssice-a/EIEM-blender/releases) 下载 `EIEM_Blender_v*.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。更新前先移除旧版并保存当前 `.blend` 工程。
 
 ## 制作 Mod
 
-1. 在 AnimeStudio 中选中游戏 Prefab，导出 EIEM 源包。
-2. 在 Blender 中选择 **文件 → 导入 → EIEM Mod 包**，打开源包里的 `mod.ini`。
-3. 编辑模型、材质和贴图。需要款式切换时，在 **3D 视图 → N → EIEM → 网格切换**中创建款式并选择默认状态。形态键滑块可在网格数据属性中设置。
-4. 选择要导出的 EIEM 网格，使用 **文件 → 导出 → EIEM Mod 包**。可在导出窗口选择 LOD 和“导出按键切换”。
-5. 将导出的文件夹放入游戏目录下的 `plugin/mods/`，进游戏后按 F10 刷新。
+1. 在 AnimeStudio 中导出 EIEM 源包。
+2. 在 Blender 选择 **文件 → 导入 → EIEM Mod 包**，打开源包中的 `mod.ini`。
+3. 编辑模型、材质和贴图。需要款式切换时，在 **3D 视图 → N → EIEM → 网格切换**中创建切换组并设置默认状态。
+4. 需要形态键时，在网格数据属性的 **EIEM 形态键控制**中点击“接管当前形态键”。这会把已有的 Blender 形态键登记为导出滑块；它不会修改顶点，也不会自动创建游戏快捷键。快捷键需要在同一面板中单独录制。
+5. 选择要导出的 EIEM 网格，使用 **文件 → 导出 → EIEM Mod 包**。导出窗口中的“导出按键切换”默认勾选；取消后只导出默认款式，不导出款式和形态键快捷键，但仍保留形态键及其滑块。
+6. 选择一个输出父目录。插件会自动创建 `mod/`，并把 `mod.ini`、`meshes/`、`materials/`、`textures/`、`skeletons/` 和 `physics/` 放在其中。将这个 `mod` 文件夹复制到游戏的 `plugin/mods/`。
+7. 进入游戏后按 F10 刷新 Mod。
 
-“**导出按键切换**”默认勾选。取消后，Mod 使用你设置的默认款式，不导出款式或形态键快捷键；模型形态键、滑块和其他资源仍会导出。这个选项只影响本次导出，不会更改 `.blend` 工程中的设置。
+导出只处理当前选择的资源。请保留 AnimeStudio 源包和 `.blend` 工程，避免覆盖源资源。
 
-只需模型、材质和贴图时，可选 **EIEM 仅网格包**。关闭网格的相机开关会在导出包中隐藏游戏原模型；眼睛和显示器开关只影响 Blender 中的预览。请将导出包保存到新的目录，保留 AnimeStudio 源包和 `.blend` 工程。
+## 更新
 
-旧版 EIEM 源包需要使用当前 AnimeStudio 重新导出。有关安装游戏插件和使用现成 Mod 的说明，请看 [EIEM README](https://github.com/ssice-a/EIEM#readme)。
+在 Blender 的 **3D 视图 → N → EIEM → EIEM 更新**面板点击“检查更新”。发现新版本后可以打开 Release 或忽略该版本；插件不会自动替换文件。
 
 ## TODO
 
-- 扩展新增骨骼与物理效果的制作支持。
-- 改进多角色制作体验。
+- 继续完善多角色制作流程和物理效果作者工具。
 
-## 鸣谢与声明
+## 鸣谢与免责声明
 
-- 感谢 [AnimeStudio](https://github.com/Escartem/AnimeStudio) 及其贡献者。其他依赖的版权与许可证见 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)。
-- 插件不包含游戏美术资产；游戏素材版权属于鹰角网络。使用前请阅读 [EIEM 用户协议与免责声明](https://github.com/ssice-a/EIEM#用户协议与免责声明)，自行承担使用风险。
+感谢 [AnimeStudio](https://github.com/Escartem/AnimeStudio) 及其贡献者。第三方依赖的许可见 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)。插件不包含游戏资源；游戏素材版权归鹰角网络所有。使用前请阅读 [EIEM 用户协议与免责声明](https://github.com/ssice-a/EIEM#用户协议与免责声明)，并自行承担使用风险。

@@ -11,6 +11,8 @@ spec = importlib.util.spec_from_file_location("eiem_shapes_test", addon_path)
 addon = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(addon)
 addon.register()
+assert addon.mod_export_directory(output) == output / "mod"
+assert addon.mod_export_directory(output / "mod") == output / "mod"
 mesh = bpy.data.meshes.new("Source")
 mesh.from_pydata([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [], [(0, 1, 2)])
 mesh["eiem_section"] = "MeshSource"
@@ -22,9 +24,6 @@ obj["eiem_render_asset"] = "SourceAsset"
 obj["eiem_render_section"] = "RenderSource"
 obj["eiem_author_package"] = str(output / "offline")
 bpy.context.view_layer.objects.active = obj
-bpy.context.scene.eiem_ui_title = "衣服控制"
-bpy.context.scene.eiem_ui_key = "F9"
-bpy.context.scene.eiem_ui_template = True
 obj.select_set(True)
 basis = obj.shape_key_add(name="Renamed Basis")
 key = obj.shape_key_add(name="Inflate")
@@ -50,28 +49,19 @@ obj = bpy.data.objects["Source"]
 control = obj.data.eiem_shape_controls[0]  # reload invalidates pre-save RNA references
 assert obj.data.eiem_shape_controls[0].shape == "Inflate"
 assert obj.data.eiem_shape_controls[0].label == "衣服鼓起"
-assert bpy.context.scene.eiem_ui_title == "衣服控制"
-assert bpy.context.scene.eiem_ui_key == "F9"
-assert bpy.context.scene.eiem_ui_template
 
 package = output / "package"
 addon.export_package(package, [obj], [])
 ini = (package / "mod.ini").read_text(encoding="utf-8")
 variable = re.search(r"shape\.Inflate=(\$\w+)", ini).group(1)
-assert "[UIMod]" in ini and "key=F9" in ini
-lua = (package / "ui.lua").read_text(encoding="utf-8")
-assert "imgui.SliderFloat" in lua and ('mod.get("%s")' % variable) in lua
-assert "衣服控制" in lua and "衣服鼓起" in lua
-assert "[KeyModUI]" in ini and "scope=both" in ini
-assert '$ui_open=0' in ini and 'mod.get("$ui_open")' in lua
+assert "[UIMod]" not in ini
+assert not (package / "ui.lua").exists()
 assert ("persist %s=0.25" % variable) in ini and "[Constants]" in ini
 payload = addon.read_mesh(next((package / "meshes").glob("*.mesh")))
 assert payload["blend_channels"][0][0] == "Inflate"
 assert payload["blend_weights"] == [100.0]  # NOT the current .25 slider weight
 assert payload["blend_vertices"][0][1] == (0.0, 0.0, 0.5)
 
-# Template generation is optional, independent from shape data and controls.
-bpy.context.scene.eiem_ui_template = False
 addon.export_package(output / "no-ui", [obj], [])
 no_ui_ini = (output / "no-ui/mod.ini").read_text(encoding="utf-8")
 assert "[UIMod]" not in no_ui_ini
@@ -90,12 +80,9 @@ hold_ini = (hold_package / "mod.ini").read_text(encoding="utf-8")
 assert "[KeyShape1]" in hold_ini and "type=hold" in hold_ini
 assert "speed=0.5" in hold_ini and "\n" + variable + "=1\n" in hold_ini
 control.hotkey_increase = ""
-bpy.context.scene.eiem_ui_template = True
-bpy.context.scene.eiem_ui_key = ""
 addon.export_package(output / "always-ui", [obj], [])
 always_ini = (output / "always-ui/mod.ini").read_text(encoding="utf-8")
-assert "[UIMod]" in always_ini and "[KeyModUI]" not in always_ini and "$ui_open" not in always_ini
-bpy.context.scene.eiem_ui_key = "F9"
+assert "[UIMod]" not in always_ini and "[KeyModUI]" not in always_ini
 
 # A switched Mesh stays on the source Renderer; visibility changes its submesh.
 addon.create_switch_group("Cloth", "F6", [obj])
@@ -112,6 +99,8 @@ bpy.context.scene.collection.objects.link(copy)
 controls, bindings, hotkeys = addon.plan_shape_controls([obj, copy])
 assert len(controls) == 1 and bindings[obj] == bindings[copy]
 copy.data = obj.data.copy()
+copy["eiem_render_asset"] = "OtherAsset"
+copy.data["eiem_target_asset"] = "OtherAsset"
 controls, bindings, hotkeys = addon.plan_shape_controls([obj, copy])
 assert len(controls) == 2 and bindings[obj] != bindings[copy]
 copy.data.eiem_shape_controls[0].shape = "Missing"
@@ -130,8 +119,7 @@ assert not (output / "bad/mod.ini").exists()
 obj.data.shape_keys.use_relative = True
 stale_ui = output / "stale-ui"
 addon.export_package(stale_ui, [obj], [])
-assert (stale_ui / "ui.lua").exists()
-bpy.context.scene.eiem_ui_template = False
+assert not (stale_ui / "ui.lua").exists()
 addon.export_package(stale_ui, [obj], [], include_switches=False)
 assert not (stale_ui / "ui.lua").exists()
 assert "[UIMod]" not in (stale_ui / "mod.ini").read_text(encoding="utf-8")

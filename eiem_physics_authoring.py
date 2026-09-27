@@ -334,34 +334,6 @@ def collection(rig, category=None):
     return child
 
 
-def organize_rig(rig):
-    """Move saved helpers from the legacy flat collection into role folders."""
-    root = collection(rig)
-    key = root["eiem_physics_collection_id"]
-    groups = collection(rig, "GROUPS")
-    colliders = collection(rig, "COLLIDERS")
-    visuals = collection(rig, "VISUALS")
-    for obj in list(bpy.data.objects):
-        target = None
-        if obj.get("eiem_physics_visual") and obj.parent and obj.parent.eiem_physics.rig == rig:
-            target = visuals
-        elif hasattr(obj, "eiem_physics") and obj.eiem_physics.rig == rig:
-            if obj.eiem_physics.kind in ("GROUP", "NATIVE_GROUP"):
-                target = groups
-            elif obj.eiem_physics.kind in ("COLLIDER", "NATIVE_COLLIDER"):
-                target = colliders
-        if target is None:
-            continue
-        if obj.name not in target.objects:
-            target.objects.link(obj)
-        for linked in list(obj.users_collection):
-            if linked == target:
-                continue
-            if linked == root or linked.get("eiem_physics_collection_id") == key:
-                linked.objects.unlink(obj)
-    return root
-
-
 def bone_id(bone):
     if not bone.get("eiem_physics_id"):
         bone["eiem_physics_id"] = uuid.uuid4().hex
@@ -1832,9 +1804,8 @@ class EIEM_PT_physics(bpy.types.Panel):
             view.prop(context.scene, "eiem_physics_preview_style", text="样式")
             view.prop(context.scene, "eiem_physics_xray", text="穿透模型")
         file_header, files = layout.panel("eiem_physics_file_tools", default_closed=True)
-        file_header.label(text="文件与整理", icon="FILE_FOLDER")
+        file_header.label(text="文件", icon="FILE_FOLDER")
         if files:
-            files.operator("eiem.organize_physics", text="整理当前 Rig 的物理集合")
             files.operator("eiem.export_physics", text="导出所选物理组")
 
 
@@ -1920,28 +1891,10 @@ class EIEM_PT_physics_object(bpy.types.Panel):
             layout.label(text="引用组：" + ("、".join(users) if users else "无"))
 
 
-class EIEM_OT_physics_organize(bpy.types.Operator):
-    bl_idname = "eiem.organize_physics"
-    bl_label = "整理当前 Rig 的物理集合"
-    bl_options = {"REGISTER", "UNDO"}
-    def execute(self, context):
-        rig = rig_of(context.object)
-        if rig is None:
-            group = group_of(context)
-            rig = group.eiem_physics.rig if group else None
-        if rig is None:
-            self.report({"ERROR"}, "请选择 EIEM Rig、物理组或碰撞体")
-            return {"CANCELLED"}
-        root = organize_rig(rig)
-        native.apply_visibility(context.scene)
-        self.report({"INFO"}, "已整理到 " + root.name + " / Groups / Colliders / Visuals")
-        return {"FINISHED"}
-
-
 CLASSES = (EIEM_PG_physics_node, EIEM_PG_physics_reference, EIEM_PG_physics,
            EIEM_OT_physics_edit, EIEM_OT_physics_parameters,
            EIEM_OT_physics_export, EIEM_OT_physics_import,
-           EIEM_OT_physics_organize, EIEM_MT_physics_create,
+           EIEM_MT_physics_create,
            EIEM_PT_physics, EIEM_PT_physics_object)
 
 

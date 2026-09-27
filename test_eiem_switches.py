@@ -182,7 +182,6 @@ assert top_group["eiem_key"] == "CTRL+ALT+NUMPAD7"
 selected = [obj, top, accessory, variant]
 plan = addon.plan_switch_export(selected)
 package = output / "package"
-bpy.context.scene.eiem_ui_template = True
 stats = addon.export_package(package, selected, [])
 assert stats == {"meshes": 1, "materials": 2, "textures": 0, "skeletons": 0,
                  "physics": 0, "prefabs": 0}, stats
@@ -196,9 +195,6 @@ assert "key=F8" in text and "key=F9" in text
 assert text.count("speed=0.5") == 2
 assert "type=hold" in text and "=" + str(1) in text
 assert "||" in text
-ui = (package / "ui.lua").read_text(encoding="utf-8")
-shape_variable = declarations[0][0]
-assert "imgui.SliderFloat" in ui and ('mod.get("' + shape_variable + '")') in ui
 assert text.count("[Render") == 1
 assert "submesh_visible." in text
 assert "partner." not in text
@@ -221,7 +217,6 @@ assert "[KeySwitch" not in static_ini and "[KeyShape" not in static_ini
 assert "[KeyModUI]" not in static_ini and "$switch_" not in static_ini
 assert "submesh_visible." not in static_ini
 assert "[ShapeControl" in static_ini and "shape." in static_ini
-assert "imgui.SliderFloat" in (static_package / "ui.lua").read_text(encoding="utf-8")
 assert len(addon.plan_switch_export(selected)["groups"]) == 2
 
 # The off option must also allow an intentionally unused/invalid key binding.
@@ -306,8 +301,7 @@ try:
     addon.switch_members = lambda group: []
     addon.switch_states = lambda group: restricted_states
     restricted_context = SimpleNamespace(
-        scene=SimpleNamespace(eiem_ui_template=False,
-                              eiem_switch_active=restricted_group),
+        scene=SimpleNamespace(eiem_switch_active=restricted_group),
         object=None)
     addon.EIEM_PT_switches.draw(
         SimpleNamespace(layout=PanelLayout()), restricted_context)
