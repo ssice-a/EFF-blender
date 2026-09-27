@@ -1,9 +1,9 @@
-# EIEM Blender v0.39.1
+# EIEM Blender v0.39.2
 
-- Fixes user-facing Blender panel text that was stored with the wrong character encoding.
-- Keeps the switch-group Mesh add/remove controls and current-group Mesh list from v0.39.0.
-- Keeps group membership independent, so one Mesh can belong to multiple switch groups.
+- Repairs the remaining user-facing Blender labels and messages that were stored as GBK/UTF-8 mojibake.
+- Fixes text in the mesh, material, texture, switch-group, export, and update panels.
+- Keeps the switch-group Mesh add/remove controls and current-group Mesh list.
 
 **Install**
 
-Download `EIEM_Blender_v0.39.1.zip`, remove the previous EIEM Blender add-on, and install the ZIP from Blender Preferences. Save the current `.blend` project before updating.
+Download `EIEM_Blender_v0.39.2.zip`, remove the previous EIEM Blender add-on, and install the ZIP from Blender Preferences. Restart Blender after updating so the old loaded module is replaced.

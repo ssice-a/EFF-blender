@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EIEM Resource Package",
     "author": "EIEM",
-    "version": (0, 39, 1),
+    "version": (0, 39, 2),
     "blender": (3, 0, 0),
     "location": "File > Import/Export > EIEM package",
     "category": "Import-Export",
@@ -1893,7 +1893,7 @@ def write_merged_mesh(output, objects):
     coordinate = objects[0].data.get("eiem_coordinate_space", "unity-y-up-left-handed")
     for obj in objects:
         if obj.data.get("eiem_coordinate_space", "unity-y-up-left-handed") != coordinate:
-            raise ValueError("鍚堝苟鐨勭綉鏍煎潗鏍囩郴涓嶄竴鑷达細" + obj.name)
+            raise ValueError('合并的网格坐标系不一致：' + obj.name)
     to_source = blender_to_unity if is_unity_left_handed(coordinate) else (lambda value: tuple(value))
 
     parts = []
@@ -2872,7 +2872,7 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
     if not mesh_objects:
         raise ValueError("No EIEM mesh objects selected")
     if bpy.context.mode != "OBJECT":
-        raise ValueError("璇峰洖鍒扮墿浣撴ā寮忓悗瀵煎嚭")
+        raise ValueError('请回到物体模式后导出')
     # Flush edits made through Blender's UI so the depsgraph handler can mark
     # the affected Mesh, Armature, Material, or Shape Key before cache lookup.
     bpy.context.view_layer.update()
@@ -3645,7 +3645,7 @@ def material_property_label(key):
     value = key[5:] if key.startswith("eiem_") else key
     for prefix, suffix in (
         ("texture_scale.", ' 缩放'),
-        ("texture_offset.", " 鍋忕Щ"),
+        ("texture_offset.", ' 偏移'),
         ("texture.", ""),
         ("float.", ""),
         ("int.", ""),
@@ -3658,7 +3658,7 @@ def material_property_label(key):
 
 class EIEM_OT_import_material(ImportHelper, bpy.types.Operator):
     bl_idname = "eiem.import_material"
-    bl_label = "瀵煎叆 EIEM 鏉愯川"
+    bl_label = '导入 EIEM 材质'
     bl_options = {"REGISTER", "UNDO"}
     filter_glob: StringProperty(default="*.mat", options={"HIDDEN"})
 
@@ -3673,7 +3673,7 @@ class EIEM_OT_import_material(ImportHelper, bpy.types.Operator):
 
 
 class EIEM_PT_material_properties(bpy.types.Panel):
-    bl_label = "EIEM 鏉愯川"
+    bl_label = 'EIEM 材质'
     bl_idname = "MATERIAL_PT_eiem_properties"
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"
@@ -3717,7 +3717,7 @@ class EIEM_PT_material_properties(bpy.types.Panel):
             box = layout.box()
             heading = box.row()
             heading.alignment = "LEFT"
-            heading.label(text="璐村浘鍙樻崲")
+            heading.label(text='贴图变换')
             for key in texture_transforms:
                 draw_eiem_property(box, material, key,
                                    material_property_label(key))
@@ -3726,7 +3726,7 @@ class EIEM_PT_material_properties(bpy.types.Panel):
             box = layout.box()
             heading = box.row()
             heading.alignment = "LEFT"
-            heading.label(text="鏉愯川鍙傛暟")
+            heading.label(text='材质参数')
             for key in parameters:
                 draw_eiem_property(box, material, key,
                                    material_property_label(key))
@@ -3735,13 +3735,13 @@ class EIEM_PT_material_properties(bpy.types.Panel):
             box = layout.box()
             heading = box.row()
             heading.alignment = "LEFT"
-            heading.label(text="璧勬簮淇℃伅")
+            heading.label(text='资源信息')
             labels = {
                 "eiem_section": "资源段",
                 "eiem_name": "材质名",
                 "eiem_shader": "Shader",
-                "eiem_version": "鏍煎紡鐗堟湰",
-                "eiem_format": "鏍煎紡",
+                "eiem_version": '格式版本',
+                "eiem_format": '格式',
                 "eiem_version": "格式版本",
                 "eiem_format": "格式",
             }
@@ -3752,8 +3752,8 @@ class EIEM_PT_material_properties(bpy.types.Panel):
 
 class EIEM_PG_shape_control(bpy.types.PropertyGroup):
     shape: StringProperty(name="褰㈡€侀敭")
-    enabled: BoolProperty(name="瀵煎嚭鎺у埗鍙橀噺", default=True)
-    automatic: BoolProperty(name="浣跨敤 Blender 褰撳墠鏉冮噸", default=False)
+    enabled: BoolProperty(name='导出控制变量', default=True)
+    automatic: BoolProperty(name='使用 Blender 当前权重', default=False)
     identity: StringProperty(options={"HIDDEN"})
     label: StringProperty(name='显示名称')
     default: FloatProperty(name="默认值", default=0.0)
@@ -3763,7 +3763,7 @@ class EIEM_PG_shape_control(bpy.types.PropertyGroup):
         name='增大按键', default="",
         description="按住时以设定速度向形态键最大值移动；留空则不生成该按键")
     hotkey_decrease: StringProperty(
-        name="鍑忓皬鎸夐敭", default="",
+        name='减小按键', default="",
         description="按住时以设定速度向形态键最小值移动；留空则不生成该按键")
     hotkey_speed: FloatProperty(
         name="变化速度/秒", default=1.0, min=0.001,
@@ -3830,7 +3830,7 @@ class EIEM_OT_shape_key_record(bpy.types.Operator):
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
         self._object = context.object
-        direction = '增大' if self.direction == "INCREASE" else "鍑忓皬"
+        direction = '增大' if self.direction == "INCREASE" else '减小'
         self._status(context, "录制形态键%s按键：请按一个键或组合键；Esc 取消" % direction)
         context.window_manager.modal_handler_add(self)
         self.report({'INFO'}, "请按下用于%s %s 的游戏快捷键；Esc 取消" %
@@ -3860,7 +3860,7 @@ class EIEM_OT_shape_key_record(bpy.types.Operator):
         self._status(context)
         self.report({'INFO'}, "%s → %s（%s）" % (
             key, control.shape,
-            '增大' if self.direction == "INCREASE" else "鍑忓皬"))
+            '增大' if self.direction == "INCREASE" else '减小'))
         return {'FINISHED'}
 
     def execute(self, context):
@@ -3885,10 +3885,10 @@ def draw_shape_hotkey_rows(layout, control, index):
         row = layout.row(align=True)
         key_value = getattr(control, attribute) or "未设置"
         row.label(text="%s：%s" % (label, key_value), icon=icon)
-        op = row.operator("eiem.shape_key_record", text="褰曞埗", icon="REC")
+        op = row.operator("eiem.shape_key_record", text='录制', icon="REC")
         op.control_index, op.direction = index, direction
         if getattr(control, attribute):
-            op = row.operator("eiem.shape_key_record", text="娓呴櫎", icon="X")
+            op = row.operator("eiem.shape_key_record", text='清除', icon="X")
             op.control_index, op.direction, op.clear = index, direction, True
     if control.hotkey_increase or control.hotkey_decrease:
         draw_eiem_rna_property(layout, control, "hotkey_speed",
@@ -3942,7 +3942,7 @@ class EIEM_PT_shape_controls(bpy.types.Panel):
 
 
 class EIEM_PT_mesh_properties(bpy.types.Panel):
-    bl_label = "EIEM 缃戞牸"
+    bl_label = 'EIEM 网格'
     bl_idname = "DATA_PT_eiem_properties"
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"
@@ -3963,14 +3963,14 @@ class EIEM_PT_mesh_properties(bpy.types.Panel):
 
         # Logical paths and selectors are placed first because they are the
         # only identity fields an author is expected to inspect or change.
-        draw_eiem_property(layout, obj, "eiem_render_asset", "鍛戒腑 Mesh")
+        draw_eiem_property(layout, obj, "eiem_render_asset", '命中 Mesh')
         draw_eiem_property(layout, mesh, "eiem_source", "源 Mesh 路径")
-        draw_eiem_property(layout, mesh, "eiem_asset", "Mesh 鍚嶇О")
+        draw_eiem_property(layout, mesh, "eiem_asset", 'Mesh 名称')
 
         box = layout.box()
         heading = box.row()
         heading.alignment = "LEFT"
-        heading.label(text="璧勬簮淇℃伅")
+        heading.label(text='资源信息')
         for owner, key, label in (
             (mesh, "eiem_section", "Mesh 资源段"),
             (obj, "eiem_prefab_path", "旧版 PFB 路径"),
@@ -3978,7 +3978,7 @@ class EIEM_PT_mesh_properties(bpy.types.Panel):
             (obj, "eiem_render_section", "Render 资源段"),
             (obj, "eiem_render_path", "旧版 Render 路径"),
             (obj, "eiem_skeleton", "骨架资源段"),
-            (mesh, "eiem_coordinate_space", "鍧愭爣绌洪棿"),
+            (mesh, "eiem_coordinate_space", '坐标空间'),
             (mesh, "eiem_coordinate_space", "坐标空间"),
             (mesh, "eiem_target_path", "原 Mesh 路径"),
         ):
@@ -3986,7 +3986,7 @@ class EIEM_PT_mesh_properties(bpy.types.Panel):
 
 
 class EIEM_PT_image_properties(bpy.types.Panel):
-    bl_label = "EIEM 璐村浘"
+    bl_label = 'EIEM 贴图'
     bl_idname = "IMAGE_PT_eiem_properties"
     bl_space_type = "IMAGE_EDITOR"
     bl_region_type = "UI"
@@ -4010,7 +4010,7 @@ class EIEM_PT_image_properties(bpy.types.Panel):
         box = layout.box()
         heading = box.row()
         heading.alignment = "LEFT"
-        heading.label(text="閲囨牱鍙傛暟")
+        heading.label(text='采样参数')
         for key, label in (
             ("eiem_linear", "Linear"),
             ("eiem_mipmaps", "Mipmaps"),
@@ -4024,7 +4024,7 @@ class EIEM_PT_image_properties(bpy.types.Panel):
         box = layout.box()
         heading = box.row()
         heading.alignment = "LEFT"
-        heading.label(text="璧勬簮淇℃伅")
+        heading.label(text='资源信息')
         for key, label in (
             ("eiem_section", "资源段"),
             ("eiem_name", "贴图名"),
@@ -4037,7 +4037,7 @@ class EIEM_OT_switch_create(bpy.types.Operator):
     bl_idname = "eiem.switch_create"
     bl_label = '从所选创建切换组'
     bl_options = {"REGISTER", "UNDO"}
-    group_name: StringProperty(name="缁勫悕", default='部件切换')
+    group_name: StringProperty(name='组名', default='部件切换')
     key: StringProperty(name="游戏快捷键", default="F6")
 
     @classmethod
@@ -4065,7 +4065,7 @@ class EIEM_OT_switch_create(bpy.types.Operator):
 
 class EIEM_OT_switch_key_record(bpy.types.Operator):
     bl_idname = "eiem.switch_key_record"
-    bl_label = "褰曞埗鍒囨崲鎸夐敭"
+    bl_label = '录制切换按键'
     bl_description = "点击后按下键盘按键或组合键；Esc 取消"
     bl_options = {"REGISTER", "UNDO"}
 
@@ -4098,7 +4098,7 @@ class EIEM_OT_switch_key_record(bpy.types.Operator):
         try:
             key = switch_key_from_event(event)
             if not self._target or not self._target.get("eiem_switch_group"):
-                raise ValueError("鍒囨崲缁勫凡鍒犻櫎")
+                raise ValueError('切换组已删除')
             set_switch_group_key(self._target, key, context.scene)
         except ValueError as error:
             self._status(context, "无法录制：%s；请按其他键，Esc 取消" % error)
@@ -4139,7 +4139,7 @@ class EIEM_UL_switch_states(bpy.types.UIList):
 
 class EIEM_OT_switch_state_drag(bpy.types.Operator):
     bl_idname = "eiem.switch_state_drag"
-    bl_label = "鎷栧姩娆惧紡鎺掑簭"
+    bl_label = '拖动款式排序'
     bl_description = "按住并上下拖动，改变该快捷键的循环顺序"
     bl_options = {"REGISTER", "UNDO", "BLOCKING"}
     state_name: StringProperty(options={"HIDDEN"})
@@ -4321,7 +4321,7 @@ class EIEM_OT_switch_state(bpy.types.Operator):
                                        len(states) - 1))
                     state = states[index]
             if self.action == "ADD":
-                state = add_switch_state(group, "娆惧紡 %d" % (len(switch_states(group)) + 1))
+                state = add_switch_state(group, '款式 %d' % (len(switch_states(group)) + 1))
                 capture_switch_state(group, state, context)
                 group.eiem_switch_state_index = len(switch_states(group)) - 1
             elif self.action == "SELECT_MEMBERS":
@@ -4369,7 +4369,7 @@ class EIEM_OT_switch_restore(bpy.types.Operator):
 
 
 class EIEM_PT_switches(bpy.types.Panel):
-    bl_label = "缃戞牸鍒囨崲"
+    bl_label = '网格切换'
     bl_idname = "VIEW3D_PT_eiem_switches"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -4392,12 +4392,12 @@ class EIEM_PT_switches(bpy.types.Panel):
         group = context.scene.eiem_switch_active
         if group and group.get("eiem_switch_group"):
             name_row = layout.row(align=True)
-            draw_eiem_rna_property(name_row, group, "name", "缁勫悕", factor=0.3)
+            draw_eiem_rna_property(name_row, group, "name", '组名', factor=0.3)
             op = name_row.operator("eiem.switch_state", text="删除当前组", icon="TRASH")
             op.action = "DELETE_GROUP"
             key_row = layout.row(align=True)
             key_row.label(text="当前按键：" + str(group.get("eiem_key", "未设置")))
-            key_row.operator("eiem.switch_key_record", text="褰曞埗鎸夐敭", icon="REC")
+            key_row.operator("eiem.switch_key_record", text='录制按键', icon="REC")
             members = switch_members(group)
             row = layout.row(align=True)
             op = row.operator("eiem.switch_state", text='选择组内物体')
@@ -4442,7 +4442,7 @@ class EIEM_PT_switches(bpy.types.Panel):
                 op.action, op.state_name = "PREVIEW", current.name
         layout.operator("eiem.switch_restore_preview", icon="LOOP_BACK")
         name_row = layout.row(align=True)
-        name_row.prop(context.scene, "eiem_export_mod_name", text="Mod 鏂囦欢澶瑰悕")
+        name_row.prop(context.scene, "eiem_export_mod_name", text='Mod 文件夹名')
         layout.label(text='导出时自动创建或刷新该文件夹')
         layout.operator("eiem.export_package", text='导出所选 Mod', icon="EXPORT")
 
@@ -4469,7 +4469,7 @@ def draw_update_status(layout):
 
 
 class EIEM_PT_updates(bpy.types.Panel):
-    bl_label = "EIEM 鏇存柊"
+    bl_label = 'EIEM 更新'
     bl_idname = "VIEW3D_PT_eiem_updates"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -4529,7 +4529,7 @@ class EIEM_OT_export(ExportHelper, bpy.types.Operator):
     directory: StringProperty(subtype="DIR_PATH")
     scope_message: StringProperty(options={"HIDDEN"})
     include_switches: BoolProperty(
-        name="瀵煎嚭鎸夐敭鍒囨崲", default=True,
+        name='导出按键切换', default=True,
         description="导出款式切换及快捷键；取消后只导出默认款式，保留形态键与滑块控制")
     lod_all: BoolProperty(name='导出已发现的全部 LOD', default=True)
     lod0: BoolProperty(name="LOD0", default=True)
@@ -4561,7 +4561,7 @@ class EIEM_OT_export(ExportHelper, bpy.types.Operator):
 
     def draw(self, context):
         self.layout.label(text=self.scope_message)
-        self.layout.prop(context.scene, "eiem_export_mod_name", text="Mod 鏂囦欢澶瑰悕")
+        self.layout.prop(context.scene, "eiem_export_mod_name", text='Mod 文件夹名')
         self.layout.prop(self, "include_switches")
         draw_lod_options(self.layout, self)
         self.layout.label(text="选择父目录，并在文件名中填写 Mod 文件夹名；插件会自动创建该文件夹")
@@ -4637,7 +4637,7 @@ class EIEM_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
     def draw(self, context):
         if self.scope_message:
             self.layout.label(text=self.scope_message)
-        self.layout.prop(context.scene, "eiem_export_mod_name", text="Mod 鏂囦欢澶瑰悕")
+        self.layout.prop(context.scene, "eiem_export_mod_name", text='Mod 文件夹名')
         draw_lod_options(self.layout, self)
 
 
@@ -4698,7 +4698,7 @@ class EIEM_OT_check_update(bpy.types.Operator):
 
 class EIEM_OT_open_update_release(bpy.types.Operator):
     bl_idname = "eiem.open_update_release"
-    bl_label = "鎵撳紑 EIEM Release"
+    bl_label = '打开 EIEM Release'
 
     def execute(self, context):
         if _update_state["status"] != "available":
@@ -4727,7 +4727,7 @@ def menu_import(self, context):
 
 def menu_export(self, context):
     self.layout.operator(EIEM_OT_export.bl_idname, text="EIEM Mod 包")
-    self.layout.operator(EIEM_OT_export_mesh_only.bl_idname, text="EIEM 浠呯綉鏍煎寘")
+    self.layout.operator(EIEM_OT_export_mesh_only.bl_idname, text='EIEM 仅网格包')
 
 
 classes = (
@@ -4768,7 +4768,7 @@ def register():
     physics_authoring.register(globals())
     bpy.types.Mesh.eiem_shape_controls = CollectionProperty(type=EIEM_PG_shape_control)
     bpy.types.Collection.eiem_switch_state_index = IntProperty(
-        name="褰撳墠娆惧紡", default=0, min=0)
+        name='当前款式', default=0, min=0)
     bpy.types.Scene.eiem_switch_active = PointerProperty(
         name="Switch group", type=bpy.types.Collection,
         poll=lambda self, collection: bool(collection.get("eiem_switch_group")))
