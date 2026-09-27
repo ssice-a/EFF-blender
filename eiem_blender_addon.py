@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EIEM Resource Package",
     "author": "EIEM",
-    "version": (0, 37, 0),
+    "version": (0, 38, 0),
     "blender": (3, 0, 0),
     "location": "File > Import/Export > EIEM package",
     "category": "Import-Export",
@@ -3951,7 +3951,9 @@ class EIEM_PT_switches(bpy.types.Panel):
                 op = row.operator("eiem.switch_state", text="预览当前款式", icon="HIDE_OFF")
                 op.action, op.state_name = "PREVIEW", current.name
         layout.operator("eiem.switch_restore_preview", icon="LOOP_BACK")
-        layout.operator("eiem.export_package", text="导出所选 mod", icon="EXPORT")
+        export_row = layout.row(align=True)
+        export_row.operator("eiem.export_package", text="导出所选 Mod", icon="EXPORT")
+        export_row.operator("eiem.export_mesh_only", text="仅导出网格", icon="MESH_DATA")
 
 
 def draw_update_status(layout):

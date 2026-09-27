@@ -44,6 +44,7 @@ for cycle in range(3):
     assert metadata.bl_info == module.bl_info == module.eiem_blender_addon.bl_info
     assert bpy.ops.eiem.import_package.get_rna_type() is not None
     assert bpy.ops.eiem.export_package.get_rna_type() is not None
+    assert bpy.ops.eiem.export_mesh_only.get_rna_type() is not None
     assert bpy.ops.eiem.import_material.get_rna_type() is not None
     assert bpy.ops.eiem.import_physics.get_rna_type() is not None
     assert bpy.ops.eiem.export_physics.get_rna_type() is not None
