@@ -87,6 +87,19 @@ assert addon.set_shape_control_hotkey(
     accessory, shape_control, "F9", "DECREASE") == "F9"
 top_group = addon.create_switch_group("TopSwitch", "F6", [top])
 acc_group = addon.create_switch_group("AccessorySwitch", "F7", [accessory])
+# Group membership is explicit and independent: the same Mesh can be added to
+# two groups, then removed from one without changing the other.
+assert obj not in addon.switch_members(top_group)
+addon.add_switch_members(top_group, [obj], state=addon.switch_states(top_group)[0])
+assert obj in addon.switch_members(top_group)
+assert obj in addon.switch_meshes(addon.switch_states(top_group)[0])
+addon.add_switch_members(acc_group, [obj])
+assert obj in addon.switch_members(acc_group)
+addon.remove_switch_members(top_group, [obj])
+assert obj not in addon.switch_members(top_group)
+assert obj in addon.switch_members(acc_group)
+addon.remove_switch_members(acc_group, [obj])
+assert obj not in addon.switch_members(acc_group)
 shape.value = .8
 accessory.hide_set(True)
 addon.capture_switch_state(acc_group, addon.switch_states(acc_group)[1])
@@ -256,8 +269,18 @@ acc_group["eiem_key"] = "F7"
 acc_group["eiem_key"] = "Ctrl+Ctrl+F7"
 unchanged_on_error()
 acc_group["eiem_key"] = "F7"
+# A Mesh may belong to several switch groups. The overlap is exported as
+# unconditional visibility metadata so the runtime can apply last-operation
+# precedence without creating another Renderer.
 addon.switch_states(acc_group)[0].objects.link(top)
-unchanged_on_error()
+overlap_plan = addon.plan_switch_export(selected)
+assert len(overlap_plan["bindings"][top]) == 2
+overlap_package = output / "overlap"
+addon.export_package(overlap_package, selected, [])
+overlap_text = (overlap_package / "mod.ini").read_text(encoding="utf-8")
+assert "visibility.0.variable=" in overlap_text
+assert "visibility.0.masks=" in overlap_text
+assert "visibility.0.controlled=" in overlap_text
 addon.switch_states(acc_group)[0].objects.unlink(top)
 top["eiem_bone_paths_json"] = '["Root","Missing","Unused"]'
 unchanged_on_error()

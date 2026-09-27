@@ -194,6 +194,12 @@ stats = addon.export_package(
     package, mesh_objects=[first, second], armatures=[], physics_objects=[],
     mesh_only=True, lod_levels=[0, 1])
 assert stats['meshes'] == 1, stats
+# Repeating the same export must reuse the merged binary and still retain its
+# slot metadata; a cache hit cannot lose the information used for Render rules.
+repeat_stats = addon.export_package(
+    package, mesh_objects=[first, second], armatures=[], physics_objects=[],
+    mesh_only=True, lod_levels=[0, 1])
+assert repeat_stats['meshes'] == 1, repeat_stats
 parser = configparser.ConfigParser(interpolation=None, strict=False)
 parser.optionxform = str
 with (package / 'mod.ini').open('r', encoding='utf-8-sig') as stream:

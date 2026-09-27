@@ -1,9 +1,11 @@
-# EIEM Blender v0.38.0
+# EIEM Blender v0.39.0
 
-- 导出切线时仅对临时副本三角化 N-gon，保留源网格、形态键和工程数据不变。
-- 导出路径支持由用户命名 Mod 文件夹：选择父目录并在文件名栏填写 Mod 名称，插件会把 `mod.ini`、网格、材质和贴图写入该文件夹。
-- 保留默认勾选的“导出按键切换”以及形态键滑块导出。
-- 保留 3D 视图中的检查更新入口，并清理已废弃的简单 UI、物理文件整理和切换组快捷入口。
-- 在 EIEM 面板直接提供“仅导出网格”按钮；文件菜单中的完整导出和仅网格导出仍然保留。
+- Adds explicit **???? Mesh** and **???? Mesh** actions for the active outfit-switch group.
+- Shows every Mesh currently controlled by the active group, with a one-click remove action for each entry.
+- Keeps group membership independent, so one Mesh can belong to multiple switch groups.
+- Keeps the existing per-state visibility snapshots and shape-key controls unchanged.
+- Includes the session export-cache module in the release archive.
 
-**安装：**下载 `EIEM_Blender_v0.38.0.zip`，在 Blender 插件设置中选择“从磁盘安装”。更新前先移除旧版并保存当前工程。
+**Install**
+
+Download `EIEM_Blender_v0.39.0.zip`, remove the previous EIEM Blender add-on, and install the ZIP from Blender Preferences. Save the current `.blend` project before updating.

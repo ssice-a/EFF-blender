@@ -11,9 +11,16 @@ spec = importlib.util.spec_from_file_location("eiem_shapes_test", addon_path)
 addon = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(addon)
 addon.register()
+assert hasattr(bpy.types.Scene, "eiem_export_mod_name")
 assert addon.mod_export_directory(output) == output
 assert addon.mod_export_directory(output, output / "custom_mod") == output / "custom_mod"
 assert addon.mod_export_directory("", output / "custom_mod") == output / "custom_mod"
+assert addon.mod_export_directory(output, mod_name="服装测试") == output / "服装测试"
+try:
+    addon.mod_export_directory(output, mod_name="../outside")
+    raise AssertionError("path traversal accepted as Mod folder name")
+except ValueError:
+    pass
 mesh = bpy.data.meshes.new("Source")
 mesh.from_pydata([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [], [(0, 1, 2)])
 mesh["eiem_section"] = "MeshSource"
@@ -124,6 +131,29 @@ assert not (stale_ui / "ui.lua").exists()
 addon.export_package(stale_ui, [obj], [], include_switches=False)
 assert not (stale_ui / "ui.lua").exists()
 assert "[UIMod]" not in (stale_ui / "mod.ini").read_text(encoding="utf-8")
+
+# Repeating one destination reuses the binary Mesh instead of entering the
+# expensive Blender RNA serialization path again.
+cache_probe = output / "cache-probe"
+original_write_mesh = addon.write_mesh
+write_calls = []
+def counted_write_mesh(path, value):
+    write_calls.append(value.name)
+    return original_write_mesh(path, value)
+addon.write_mesh = counted_write_mesh
+try:
+    addon.export_package(cache_probe, [obj], [])
+    first_write_count = len(write_calls)
+    mesh_file = next((cache_probe / "meshes").glob("*.mesh"))
+    (cache_probe / "meshes" / "stale.mesh").write_bytes(b"stale")
+    addon.export_package(cache_probe, [obj], [])
+    assert first_write_count == 1 and len(write_calls) == first_write_count
+    assert not (cache_probe / "meshes" / "stale.mesh").exists()
+    mesh_file.unlink()
+    addon.export_package(cache_probe, [obj], [])
+    assert mesh_file.is_file()
+finally:
+    addon.write_mesh = original_write_mesh
 addon.unregister()
 addon.register()
 assert obj.data.eiem_shape_controls[0].shape == "Inflate"

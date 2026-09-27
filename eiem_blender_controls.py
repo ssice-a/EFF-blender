@@ -379,12 +379,11 @@ def assign_switch_meshes(state, objects, scene=None):
         (group for group in switch_groups(scene)
          if state in switch_states(group)), None) if state else None
     for obj in objects:
-        for group in switch_groups(scene):
-            if target_group is not None and group == target_group:
-                continue
-            if obj.name in group.objects:
-                group.objects.unlink(obj)
-            for previous in switch_states(group):
+        # Membership is independent per switch group. Moving an object to a
+        # different state changes only the selected target group, preserving
+        # snapshots in every other group so overlap remains valid.
+        if target_group is not None:
+            for previous in switch_states(target_group):
                 if obj.name in previous.objects:
                     previous.objects.unlink(obj)
         if target_group is not None:
@@ -394,6 +393,54 @@ def assign_switch_meshes(state, objects, scene=None):
                 state.objects.link(obj)
         if not obj.users_collection:
             scene.collection.objects.link(obj)
+
+
+def add_switch_members(group, objects, scene=None, state=None):
+    """Add selected EIEM Meshes to a group without touching other groups.
+
+    Newly added members are placed in the selected state (or the first state)
+    so the group has a visible, deterministic default for them. Existing
+    state snapshots are left unchanged.
+    """
+    scene = scene or bpy.context.scene
+    if not group or not group.get("eiem_switch_group"):
+        raise ValueError("当前切换组不存在")
+    objects = list(objects)
+    if (not objects
+            or any(obj.type != "MESH" or not obj.data.get("eiem_section")
+                   for obj in objects)):
+        raise ValueError("请在物体模式选择已绑定 EIEM 资源的网格")
+    states = switch_states(group)
+    if not states:
+        raise ValueError("当前切换组没有款式")
+    target = state if state in states else states[0]
+    existing = set(switch_members(group))
+    for obj in objects:
+        if obj not in existing:
+            group.objects.link(obj)
+            target.objects.link(obj)
+        elif obj.name not in group.objects:
+            group.objects.link(obj)
+    return [obj for obj in objects if obj in switch_members(group)]
+
+
+def remove_switch_members(group, objects, scene=None, context=None):
+    """Remove selected Meshes from one group while retaining the Meshes."""
+    scene = scene or bpy.context.scene
+    context = context or bpy.context
+    if not group or not group.get("eiem_switch_group"):
+        raise ValueError("当前切换组不存在")
+    objects = list(objects)
+    if any(obj.type != "MESH" for obj in objects):
+        raise ValueError("只能移出 Mesh")
+    restore_switch_preview(objects, context)
+    for obj in objects:
+        if obj.name in group.objects:
+            group.objects.unlink(obj)
+        for state in switch_states(group):
+            if obj.name in state.objects:
+                state.objects.unlink(obj)
+    return objects
 
 
 def create_switch_group(name, key, objects, scene=None):
@@ -501,13 +548,6 @@ def plan_switch_export(mesh_objects, scene=None, include_switches=True):
         if len(defaults) != 1:
             raise ValueError("请为切换组 %s 指定一个初始状态" % group.name)
         if not include_switches:
-            for obj in switch_members(group):
-                if obj not in selected or obj in hidden:
-                    continue
-                if len(memberships.get(obj, [])) != 1:
-                    raise ValueError("网格 %s 同时属于多个切换组" % obj.name)
-                if obj not in switch_meshes(states[defaults[0]]):
-                    hidden.add(obj)
             continue
         key = validate_switch_key(group.get("eiem_key", ""))
         if key in keys:
@@ -521,14 +561,30 @@ def plan_switch_export(mesh_objects, scene=None, include_switches=True):
         for obj in switch_members(group):
             if obj not in selected or obj in hidden:
                 continue
-            if len(memberships.get(obj, [])) != 1:
-                raise ValueError("网格 %s 同时属于多个切换组" % obj.name)
             visible = tuple(
                 state_values[index]
                 for index, state in enumerate(states)
                 if obj in switch_meshes(state)
             )
-            bindings[obj] = (variable, visible)
+            bindings.setdefault(obj, []).append({
+                "variable": variable,
+                "values": tuple(state_values),
+                "visible": visible,
+            })
+
+    if not include_switches:
+        # A static export has no runtime variables. If a Mesh belongs to
+        # several groups, the last declared group owns its authored default
+        # appearance, matching the deterministic initial precedence.
+        for obj, owned_groups in memberships.items():
+            if obj in hidden or not owned_groups:
+                continue
+            owner = owned_groups[-1]
+            states = switch_states(owner)
+            defaults = [index for index, state in enumerate(states)
+                        if state.get("eiem_default")]
+            if defaults and obj not in switch_meshes(states[defaults[0]]):
+                hidden.add(obj)
 
     grouped = {}
     selectors = {}
