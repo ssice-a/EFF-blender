@@ -1110,17 +1110,25 @@ def mesh_export_tangents(mesh, source_normals, normal_corners, preserve_normals)
         return cosine <= 2.0e-3
 
     point_valid = [usable(value) for value in points] if points else [False] * len(mesh.vertices)
-    if preserve_normals:
+    # Imported/joined meshes often carry an attribute pair filled with zeroes.
+    # Treat that exactly like an absent tangent stream; otherwise the partial
+    # author-data path needlessly validates every corner before regenerating
+    # every tangent anyway.
+    all_missing = not points or not any(point_valid)
+    if preserve_normals and not all_missing:
         # Every corner of a source vertex exports the same authored normal.
         # Validate that frame once per vertex rather than once per face corner.
         point_matches = [valid and matches_normal(value, normal)
                          for valid, value, normal in zip(point_valid, points, source_normals)]
-        missing = [index for index, vertex in enumerate(loop_vertices)
-                   if not point_valid[vertex] or not point_matches[vertex]]
-    else:
+        missing = ([index for index, vertex in enumerate(loop_vertices)
+                    if not point_valid[vertex] or not point_matches[vertex]]
+                   )
+    elif not all_missing:
         missing = [index for index, vertex in enumerate(loop_vertices)
                    if not point_valid[vertex]
                    or not matches_normal(points[vertex], normal_corners[index])]
+    else:
+        missing = range(len(loop_vertices))
     if not missing:
         return points, []
     if mesh.uv_layers.get("UV0") is None:
@@ -1130,9 +1138,14 @@ def mesh_export_tangents(mesh, source_normals, normal_corners, preserve_normals)
         # tangent basis unrelated to any texture coordinates.
         return [], []
 
-    # Derived tangent data is never written into the user's mesh attributes.
-    # Work on a temporary copy so failed exports also leave author data intact.
-    work = mesh.copy()
+    # Blender's tangent cache is derived runtime data, not an authored Mesh
+    # attribute.  For the common triangle/quad path we can calculate it on the
+    # source Mesh directly and avoid copying every vertex, UV and custom
+    # attribute.  The cache is discarded by Blender on the next edit and does
+    # not change the serialized author data.  N-gons still use a temporary
+    # triangulated copy because Blender refuses calc_tangents on them.
+    has_ngons = any(len(polygon.vertices) > 4 for polygon in mesh.polygons)
+    work = mesh.copy() if has_ngons else mesh
     source_loop_indices = list(range(len(mesh.loops)))
     try:
         # Blender refuses calc_tangents on n-gons even though the exporter
@@ -1141,7 +1154,7 @@ def mesh_export_tangents(mesh, source_normals, normal_corners, preserve_normals)
         # attribute so the generated frame can be mapped back to the original
         # loop indices.  The authored Mesh, shape keys and topology remain
         # untouched.
-        if any(len(polygon.vertices) > 4 for polygon in work.polygons):
+        if has_ngons:
             attr_name = "__EIEM_TangentSourceLoop"
             suffix = 1
             while work.attributes.get(attr_name) is not None:
@@ -1175,37 +1188,84 @@ def mesh_export_tangents(mesh, source_normals, normal_corners, preserve_normals)
                 raise ValueError("%s tangent corner provenance is incomplete" % mesh.name)
             work.update()
         work.calc_tangents(uvmap="UV0")
+        # Reading the whole tangent stream through RNA once is substantially
+        # faster than crossing the Python/RNA boundary for every loop on a
+        # large clothing Mesh.  Keep the same source-loop mapping used by the
+        # N-gon path below.
+        tangent_values = [0.0] * (len(work.loops) * 3)
+        tangent_signs = [0.0] * len(work.loops)
+        work.loops.foreach_get("tangent", tangent_values)
+        work.loops.foreach_get("bitangent_sign", tangent_signs)
         handedness = -1 if is_unity_left_handed(
             mesh.get("eiem_coordinate_space", "unity-y-up-left-handed")) else 1
         generated = [
-            (*work.loops[source_loop_indices[index]].tangent,
-             work.loops[source_loop_indices[index]].bitangent_sign * handedness)
+            (tangent_values[source_loop_indices[index] * 3],
+             tangent_values[source_loop_indices[index] * 3 + 1],
+             tangent_values[source_loop_indices[index] * 3 + 2],
+             tangent_signs[source_loop_indices[index]] * handedness)
             for index in range(len(mesh.loops))
         ]
     finally:
-        bpy.data.meshes.remove(work)
-    for loop_index in missing:
-        value = generated[loop_index]
-        if not usable(value):
-            raise ValueError("%s corner %d cannot generate a usable tangent; check UV0 and normals" %
-                             (mesh.name, loop_index))
-        normal = export_normal(loop_index)
-        tangent = Vector(value[:3])
-        # calc_tangents uses Blender's evaluated normals. Orthogonalize against
-        # the exact normal selected for export in case a lossless source-normal
-        # backup differs slightly from Blender's encoded custom-normal result.
-        tangent -= normal * (tangent.dot(normal) / normal.length_squared)
-        if tangent.length_squared == 0.0:
-            raise ValueError("%s corner %d tangent is parallel to its exported normal" %
-                             (mesh.name, loop_index))
-        tangent.normalize()
-        generated[loop_index] = (*tangent, value[3])
+        if has_ngons:
+            bpy.data.meshes.remove(work)
+    # The no-authored-tangent path is by far the common case for newly edited
+    # geometry.  Avoid allocating a mathutils.Vector and calling a helper for
+    # every corner; the scalar form produces the same orthogonalized frame and
+    # is several times cheaper on clothing meshes with hundreds of thousands
+    # of loops.  The general branch below remains for partially authored
+    # tangent attributes.
+    if all_missing:
+        normal_values = source_normals if preserve_normals else normal_corners
+        for loop_index in range(len(mesh.loops)):
+            value = generated[loop_index]
+            tx, ty, tz, sign = value
+            if (not all(math.isfinite(x) for x in value) or
+                    (tx == 0.0 and ty == 0.0 and tz == 0.0) or sign not in (-1, 1)):
+                raise ValueError("%s corner %d cannot generate a usable tangent; check UV0 and normals" %
+                                 (mesh.name, loop_index))
+            vertex = loop_vertices[loop_index]
+            normal = normal_values[vertex] if preserve_normals else normal_values[loop_index]
+            nx, ny, nz = normal
+            normal_length = nx * nx + ny * ny + nz * nz
+            if normal_length == 0.0:
+                raise ValueError("%s corner %d tangent is parallel to its exported normal" %
+                                 (mesh.name, loop_index))
+            dot = (tx * nx + ty * ny + tz * nz) / normal_length
+            tx -= nx * dot
+            ty -= ny * dot
+            tz -= nz * dot
+            tangent_length = tx * tx + ty * ty + tz * tz
+            if tangent_length == 0.0:
+                raise ValueError("%s corner %d tangent is parallel to its exported normal" %
+                                 (mesh.name, loop_index))
+            scale = tangent_length ** -0.5
+            generated[loop_index] = (tx * scale, ty * scale, tz * scale, sign)
+    else:
+        for loop_index in missing:
+            value = generated[loop_index]
+            if not usable(value):
+                raise ValueError("%s corner %d cannot generate a usable tangent; check UV0 and normals" %
+                                 (mesh.name, loop_index))
+            normal = export_normal(loop_index)
+            tangent = Vector(value[:3])
+            # calc_tangents uses Blender's evaluated normals. Orthogonalize against
+            # the exact normal selected for export in case a lossless source-normal
+            # backup differs slightly from Blender's encoded custom-normal result.
+            tangent -= normal * (tangent.dot(normal) / normal.length_squared)
+            if tangent.length_squared == 0.0:
+                raise ValueError("%s corner %d tangent is parallel to its exported normal" %
+                                 (mesh.name, loop_index))
+            tangent.normalize()
+            generated[loop_index] = (*tangent, value[3])
     # Unreferenced loose vertices have no face/UV derivative. Keep valid source
     # data there, or a zero sentinel rather than inventing a direction.
     points = [points[i] if point_valid[i] else (0., 0., 0., 0.) for i in range(len(mesh.vertices))]
-    missing_set = set(missing)
-    corners = [generated[index] if index in missing_set else points[vertex]
-               for index, vertex in enumerate(loop_vertices)]
+    if all_missing:
+        corners = generated
+    else:
+        missing_set = set(missing)
+        corners = [generated[index] if index in missing_set else points[vertex]
+                   for index, vertex in enumerate(loop_vertices)]
     print("[EIEM] %s: tangents retained on %d corners; generated %d corners from UV0" %
           (mesh.name, len(mesh.loops) - len(missing), len(missing)))
     return points, corners
