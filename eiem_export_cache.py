@@ -39,12 +39,16 @@ class ResourceCache:
             destination_path = self.destination / relative
             # A cache hit does not need to be copied twice.  The existing
             # package file is already the desired bytes; only materialize the
-            # cached file when the destination was removed or is incomplete.
+            # cached file when the destination was removed, truncated, or
+            # touched by another process.  Size alone is not enough: an
+            # externally edited file can retain the same length.
             destination_complete = False
             if destination_path.is_file():
                 try:
                     destination_complete = (
-                        destination_path.stat().st_size == cache_path.stat().st_size)
+                        destination_path.stat().st_size == cache_path.stat().st_size
+                        and destination_path.stat().st_mtime_ns ==
+                        cache_path.stat().st_mtime_ns)
                 except OSError:
                     destination_complete = False
             if not destination_complete:
