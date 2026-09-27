@@ -227,6 +227,17 @@ addon.export_package(package, selected, [])
 after_skin = addon.read_mesh(cached_mesh)["skin"]
 assert before_skin != after_skin
 
+# Shape-key coordinates are serialized into the same Mesh resource.  They
+# need their own content fingerprint because changing a key can leave the
+# owning ID's revision unchanged in Blender.
+before_shape_bytes = cached_mesh.read_bytes()
+shape_block = accessory.data.shape_keys.key_blocks["StockingBlend"]
+shape_block.data[0].co.z += .125
+addon.export_package(package, selected, [])
+after_shape_bytes = cached_mesh.read_bytes()
+assert before_shape_bytes != after_shape_bytes
+shape_block.data[0].co.z -= .125
+
 # Export checkbox off keeps the authored default appearance and shape sliders,
 # without exporting any key bindings. It does not change the saved project.
 static_package = output / "without-switches"

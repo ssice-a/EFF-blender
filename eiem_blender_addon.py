@@ -113,25 +113,91 @@ def _vertex_group_digest(obj):
     return digest.hexdigest()
 
 
+def _shape_key_digest(mesh):
+    """Fingerprint shape-key payloads serialized into a Mesh resource."""
+    shape_keys = getattr(mesh, "shape_keys", None)
+    if shape_keys is None:
+        return ""
+    digest = hashlib.sha1()
+    blocks = list(getattr(shape_keys, "key_blocks", ()))
+    digest.update(struct.pack("<I", len(blocks)))
+    for block in blocks:
+        for value in (
+                str(block.name),
+                str(block.relative_key.name if block.relative_key else ""),
+                str(block.vertex_group)):
+            encoded = value.encode("utf-8", "replace")
+            digest.update(struct.pack("<I", len(encoded)))
+            digest.update(encoded)
+        points = list(block.data)
+        digest.update(struct.pack("<I", len(points)))
+        for point in points:
+            digest.update(struct.pack(
+                "<3f", float(point.co.x), float(point.co.y), float(point.co.z)))
+    return digest.hexdigest()
+
+
+def _mesh_slot_digest(obj):
+    """Fingerprint material slots and polygon assignments used by write_mesh."""
+    mesh = getattr(obj, "data", None)
+    if mesh is None:
+        return ""
+    digest = hashlib.sha1()
+    materials = list(mesh.materials)
+    digest.update(struct.pack("<I", len(materials)))
+    for material in materials:
+        digest.update(struct.pack(
+            "<Q", int(material.as_pointer()) if material else 0))
+        encoded = str(material.name if material else "").encode(
+            "utf-8", "replace")
+        digest.update(struct.pack("<I", len(encoded)))
+        digest.update(encoded)
+    polygons = list(mesh.polygons)
+    digest.update(struct.pack("<I", len(polygons)))
+    for polygon in polygons:
+        digest.update(struct.pack("<I", int(polygon.material_index)))
+    return digest.hexdigest()
+
+
 def _mesh_resource_token(obj):
     mesh = getattr(obj, "data", None)
     armature = next((modifier.object for modifier in obj.modifiers
                      if modifier.type == "ARMATURE" and modifier.object), None)
     shape_keys = getattr(mesh, "shape_keys", None)
     return (
-        "mesh-v2",
+        "mesh-v3",
         _owner_revision(obj),
         _owner_revision(mesh),
         _owner_revision(shape_keys),
         _owner_revision(armature),
         _owner_revision(getattr(armature, "data", None)),
         _vertex_group_digest(obj),
+        _shape_key_digest(mesh),
+        _mesh_slot_digest(obj),
     )
 
 
+def _skeleton_content_digest(armature):
+    """Fingerprint the authored node records serialized to a skeleton file."""
+    if armature is None:
+        return ""
+    digest = hashlib.sha1()
+    for _bone, record, source in skeleton_author_nodes(armature):
+        path, parent, position, rotation, scale = record
+        encoded = str(path).encode("utf-8", "replace")
+        digest.update(struct.pack("<I", len(encoded)))
+        digest.update(encoded)
+        digest.update(struct.pack("<iB", int(parent), int(bool(source))))
+        digest.update(struct.pack(
+            "<10f", *(float(value) for value in
+                       (*position, *rotation, *scale))))
+    return digest.hexdigest()
+
+
 def _skeleton_resource_token(armature):
-    return ("skeleton-v1", _owner_revision(armature),
-            _owner_revision(getattr(armature, "data", None)))
+    return ("skeleton-v2", _owner_revision(armature),
+            _owner_revision(getattr(armature, "data", None)),
+            _skeleton_content_digest(armature))
 
 
 def _material_resource_token(material):
@@ -3413,13 +3479,14 @@ def write_export_package(root, plan, armatures, physics_objects=None,
             (root / filename).write_bytes(
                 physics_authoring.document.encode(payload))
         else:
+            payload_bytes = physics_authoring.document.encode(payload)
             export_cache.materialize(
                 filename,
-                ("physics-v1", _owner_revision(rig),
-                 tuple(_owner_revision(group) for group in groups)),
+                ("physics-v2", _owner_revision(rig),
+                 tuple(_owner_revision(group) for group in groups),
+                 hashlib.sha1(payload_bytes).hexdigest()),
                 root / filename,
-                lambda path: path.write_bytes(
-                    physics_authoring.document.encode(payload)))
+                lambda path: path.write_bytes(payload_bytes))
         resource_lines.extend(["[" + section + "]", "path=" + filename, ""])
 
     if mesh_objects:

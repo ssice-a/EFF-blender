@@ -83,6 +83,13 @@ class ResourceCache:
                         path.rmdir()
                     except OSError:
                         pass
+            # ``Path.rglob`` does not yield its root.  Remove the generated
+            # top-level directory too when the current export no longer owns
+            # any resource in it.
+            try:
+                base.rmdir()
+            except OSError:
+                pass
 
     def prune_cache(self):
         """Drop cached binaries for resources removed from this package."""
