@@ -1,4 +1,4 @@
-﻿# EIEM Blender 插件
+# EIEM Blender 插件
 
 EIEM Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以在 Blender 中编辑网格、材质、贴图、款式切换和形态键，然后导出可放入 EIEM `plugin/mods` 的 Mod 文件夹。
 
@@ -22,7 +22,7 @@ EIEM Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可�
 3. 编辑模型、材质和贴图。需要款式切换时，在 **3D 视图 → N → EIEM → 网格切换**中创建切换组并设置默认状态。
 4. 需要形态键时，在网格数据属性的 **EIEM 形态键控制**中点击“接管当前形态键”。这会把已有的 Blender 形态键登记为导出滑块；它不会修改顶点，也不会自动创建游戏快捷键。快捷键需要在同一面板中单独录制。
 5. 选择要导出的 EIEM 网格，使用 **文件 → 导出 → EIEM Mod 包**。导出窗口中的“导出按键切换”默认勾选；取消后只导出默认款式，不导出款式和形态键快捷键，但仍保留形态键及其滑块。
-6. 选择一个输出父目录。插件会自动创建 `mod/`，并把 `mod.ini`、`meshes/`、`materials/`、`textures/`、`skeletons/` 和 `physics/` 放在其中。将这个 `mod` 文件夹复制到游戏的 `plugin/mods/`。
+6. 选择或新建一个 Mod 文件夹并按需命名。插件会把 `mod.ini`、`meshes/`、`materials/`、`textures/`、`skeletons/` 和 `physics/` 直接写入这个文件夹，然后将它复制到游戏的 `plugin/mods/`。
 7. 进入游戏后按 F10 刷新 Mod。
 
 导出只处理当前选择的资源。请保留 AnimeStudio 源包和 `.blend` 工程，避免覆盖源资源。

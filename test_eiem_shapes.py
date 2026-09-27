@@ -11,8 +11,8 @@ spec = importlib.util.spec_from_file_location("eiem_shapes_test", addon_path)
 addon = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(addon)
 addon.register()
-assert addon.mod_export_directory(output) == output / "mod"
-assert addon.mod_export_directory(output / "mod") == output / "mod"
+assert addon.mod_export_directory(output) == output
+assert addon.mod_export_directory(output / "custom_mod") == output / "custom_mod"
 mesh = bpy.data.meshes.new("Source")
 mesh.from_pydata([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [], [(0, 1, 2)])
 mesh["eiem_section"] = "MeshSource"

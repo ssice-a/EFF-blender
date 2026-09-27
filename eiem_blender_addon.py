@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EIEM Resource Package",
     "author": "EIEM",
-    "version": (0, 35, 0),
+    "version": (0, 36, 0),
     "blender": (3, 0, 0),
     "location": "File > Import/Export > EIEM package",
     "category": "Import-Export",
@@ -2291,15 +2291,14 @@ def prepare_export_root(root):
 
 
 def mod_export_directory(directory):
-    """Return the package directory used by the file-browser exporters.
+    """Return the user-selected directory as the Mod package root.
 
-    The file browser selects a parent directory; every export gets one stable
-    ``mod`` child so meshes, materials, textures and ``mod.ini`` never spill
-    into the user's working folder.  Selecting an existing ``mod`` directory
-    keeps that explicit choice without creating ``mod/mod``.
+    The file browser already lets the author choose or create the package
+    folder. Keep that name instead of inventing a nested ``mod`` directory;
+    the exporter writes ``mod.ini`` and resource subdirectories directly into
+    the selected folder.
     """
-    selected = Path(directory or os.getcwd()).expanduser().resolve()
-    return selected if selected.name.lower() == "mod" else selected / "mod"
+    return Path(directory or os.getcwd()).expanduser().resolve()
 
 
 def visible_eiem_resources(context=None):
@@ -4012,7 +4011,7 @@ class EIEM_OT_export(ExportHelper, bpy.types.Operator):
         self.layout.label(text=self.scope_message)
         self.layout.prop(self, "include_switches")
         draw_lod_options(self.layout, self)
-        self.layout.label(text="只处理所选资源；导出结果会写入所选目录下的 mod 文件夹")
+        self.layout.label(text="只处理所选资源；导出结果直接写入当前选中的文件夹")
 
     def execute(self, context):
         try:
