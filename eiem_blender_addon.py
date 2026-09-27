@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EIEM Resource Package",
     "author": "EIEM",
-    "version": (0, 39, 0),
+    "version": (0, 39, 1),
     "blender": (3, 0, 0),
     "location": "File > Import/Export > EIEM package",
     "category": "Import-Export",
@@ -327,7 +327,7 @@ def import_material_file(path, obj):
     """Import an EIEM material + package texture declarations into one slot."""
     path = Path(path).resolve()
     if obj is None or obj.type != "MESH":
-        raise ValueError("璇峰厛閫夋嫨瑕佹寚瀹氭潗璐ㄧ殑缃戞牸")
+        raise ValueError('请先选择要指定材质的网格')
     values = read_flat_properties(path)
     if values.get("format") != "EIEMMAT" or values.get("version") != "1" or not values.get("source", "").strip():
         raise ValueError("请选择 EIEM 导出的 .mat（EIEMMAT version=1，包含 source），不是 Unity YAML 或节点材质")
@@ -1702,7 +1702,7 @@ def export_skin_binding(obj, armature, source_vertices):
                               if 0 <= group_index < len(group_names)
                               else "<invalid>")
                 raise ValueError(
-                    "%s ?? %d ???? %s ?????????" %
+                    "%s \u9876\u70b9 %d \u7684\u9876\u70b9\u7ec4 %s \u5728\u5171\u4eab\u9aa8\u67b6\u4e2d\u4e0d\u5b58\u5728" %
                     (obj.name, vertex.index, group_name))
             influences.append((float(group.weight), influence_slot))
         if not influences and vertex.index in used:
@@ -2162,7 +2162,7 @@ def write_merged_mesh(output, objects):
                 frame_index = first_frame + local_index
                 if frame_index >= len(local_frames):
                     raise ValueError(
-                        "鍚堝苟缃戞牸鐨勫舰鎬侀敭甯у紩鐢ㄦ棤鏁堬細" + part["obj"].name)
+                        '合并网格的形态键帧引用无效：' + part["obj"].name)
                 frame_name, _, _, has_normals, has_tangents, has_additional = \
                     local_frames[frame_index]
                 weight = (float(local_weights[frame_index])
@@ -3135,7 +3135,7 @@ def _visibility_entries_overlap(entries):
     masks = []
     for binding, start, end in entries:
         if start < 0 or end > 32 or start >= end:
-            raise ValueError("鎸夐敭鎺у埗鐨勫悎骞?Mesh 蹇呴』鍖呭惈 1 鍒?32 涓?submesh")
+            raise ValueError('按键控制的合并 Mesh 必须包含 1 到 32 个 submesh')
         mask = ((1 << (end - start)) - 1) << start
         if any(mask & other for other in masks):
             return True
@@ -3644,7 +3644,7 @@ def material_property_groups(material):
 def material_property_label(key):
     value = key[5:] if key.startswith("eiem_") else key
     for prefix, suffix in (
-        ("texture_scale.", " 缂╂斁"),
+        ("texture_scale.", ' 缩放'),
         ("texture_offset.", " 鍋忕Щ"),
         ("texture.", ""),
         ("float.", ""),
@@ -3755,12 +3755,12 @@ class EIEM_PG_shape_control(bpy.types.PropertyGroup):
     enabled: BoolProperty(name="瀵煎嚭鎺у埗鍙橀噺", default=True)
     automatic: BoolProperty(name="浣跨敤 Blender 褰撳墠鏉冮噸", default=False)
     identity: StringProperty(options={"HIDDEN"})
-    label: StringProperty(name="鏄剧ず鍚嶇О")
+    label: StringProperty(name='显示名称')
     default: FloatProperty(name="默认值", default=0.0)
     minimum: FloatProperty(name="最小值", default=0.0)
     maximum: FloatProperty(name="最大值", default=1.0)
     hotkey_increase: StringProperty(
-        name="澧炲ぇ鎸夐敭", default="",
+        name='增大按键', default="",
         description="按住时以设定速度向形态键最大值移动；留空则不生成该按键")
     hotkey_decrease: StringProperty(
         name="鍑忓皬鎸夐敭", default="",
@@ -3830,7 +3830,7 @@ class EIEM_OT_shape_key_record(bpy.types.Operator):
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
         self._object = context.object
-        direction = "澧炲ぇ" if self.direction == "INCREASE" else "鍑忓皬"
+        direction = '增大' if self.direction == "INCREASE" else "鍑忓皬"
         self._status(context, "录制形态键%s按键：请按一个键或组合键；Esc 取消" % direction)
         context.window_manager.modal_handler_add(self)
         self.report({'INFO'}, "请按下用于%s %s 的游戏快捷键；Esc 取消" %
@@ -3860,7 +3860,7 @@ class EIEM_OT_shape_key_record(bpy.types.Operator):
         self._status(context)
         self.report({'INFO'}, "%s → %s（%s）" % (
             key, control.shape,
-            "澧炲ぇ" if self.direction == "INCREASE" else "鍑忓皬"))
+            '增大' if self.direction == "INCREASE" else "鍑忓皬"))
         return {'FINISHED'}
 
     def execute(self, context):
@@ -4035,9 +4035,9 @@ class EIEM_PT_image_properties(bpy.types.Panel):
 
 class EIEM_OT_switch_create(bpy.types.Operator):
     bl_idname = "eiem.switch_create"
-    bl_label = "浠庢墍閫夊垱寤哄垏鎹㈢粍"
+    bl_label = '从所选创建切换组'
     bl_options = {"REGISTER", "UNDO"}
-    group_name: StringProperty(name="缁勫悕", default="閮ㄤ欢鍒囨崲")
+    group_name: StringProperty(name="缁勫悕", default='部件切换')
     key: StringProperty(name="游戏快捷键", default="F6")
 
     @classmethod
@@ -4339,7 +4339,7 @@ class EIEM_OT_switch_state(bpy.types.Operator):
                 preview_switch(group, state, context)
             elif self.action in {"REMOVE", "REMOVE_ACTIVE"}:
                 if len(switch_states(group)) <= 2:
-                    raise ValueError("鑷冲皯淇濈暀涓や釜娆惧紡")
+                    raise ValueError('至少保留两个款式')
                 if state.children:
                     raise ValueError("请先移出状态的子集合再删除状态")
                 restore_switch_preview(switch_members(group), context)
@@ -4400,17 +4400,17 @@ class EIEM_PT_switches(bpy.types.Panel):
             key_row.operator("eiem.switch_key_record", text="褰曞埗鎸夐敭", icon="REC")
             members = switch_members(group)
             row = layout.row(align=True)
-            op = row.operator("eiem.switch_state", text="閫夋嫨缁勫唴鐗╀綋")
+            op = row.operator("eiem.switch_state", text='选择组内物体')
             op.action = "SELECT_MEMBERS"
             layout.label(text="%d 个受控网格；调整眼睛显隐后记录款式" % len(members),
                          icon="INFO")
-            row.operator("eiem.switch_member_add", text="???? Mesh", icon="ADD")
+            row.operator("eiem.switch_member_add", text="\u52a0\u5165\u6240\u9009 Mesh", icon="ADD")
             row.operator("eiem.switch_member_remove_selected",
-                         text="???? Mesh", icon="REMOVE")
-            layout.label(text="???? Mesh?%d ??????????????" % len(members),
+                         text="\u79fb\u51fa\u6240\u9009 Mesh", icon="REMOVE")
+            layout.label(text="\u5f53\u524d\u7ec4\u5185 Mesh\uff1a%d \u4e2a\uff1b\u6b3e\u5f0f\u4e2d\u7684\u663e\u9690\u4ecd\u53ef\u5355\u72ec\u8bb0\u5f55" % len(members),
                          icon="INFO")
             member_box = layout.box()
-            member_box.label(text="???? Mesh", icon="MESH_DATA")
+            member_box.label(text="\u5f53\u524d\u7ec4\u5185 Mesh", icon="MESH_DATA")
             if members:
                 for member in sorted(members,
                                      key=lambda item: item.name.casefold()):
@@ -4420,7 +4420,7 @@ class EIEM_PT_switches(bpy.types.Panel):
                         "eiem.switch_member_remove", text="", icon="X")
                     remove.object_name = member.name
             else:
-                member_box.label(text="?? Mesh???? Mesh ???????? Mesh?")
+                member_box.label(text="\u6682\u65e0 Mesh\uff1b\u5148\u9009\u62e9 Mesh \u5e76\u70b9\u51fb\u2018\u52a0\u5165\u6240\u9009 Mesh\u2019")
             states = switch_states(group)
             if states:
                 active_index = max(
@@ -4443,8 +4443,8 @@ class EIEM_PT_switches(bpy.types.Panel):
         layout.operator("eiem.switch_restore_preview", icon="LOOP_BACK")
         name_row = layout.row(align=True)
         name_row.prop(context.scene, "eiem_export_mod_name", text="Mod 鏂囦欢澶瑰悕")
-        layout.label(text="瀵煎嚭鏃惰嚜鍔ㄥ垱寤烘垨鍒锋柊璇ユ枃浠跺す")
-        layout.operator("eiem.export_package", text="瀵煎嚭鎵€閫?Mod", icon="EXPORT")
+        layout.label(text='导出时自动创建或刷新该文件夹')
+        layout.operator("eiem.export_package", text='导出所选 Mod', icon="EXPORT")
 
 
 def draw_update_status(layout):
@@ -4459,7 +4459,7 @@ def draw_update_status(layout):
     elif status == "available":
         layout.label(text="发现新版本 " + _update_state["tag"])
         row = layout.row(align=True)
-        row.operator("eiem.open_update_release", text="鏌ョ湅 Release", icon="URL")
+        row.operator("eiem.open_update_release", text='查看 Release', icon="URL")
         row.operator("eiem.open_update_release", text="查看 Release", icon="URL")
     elif status == "ignored":
         layout.label(text="已忽略 " + _update_state["tag"])
@@ -4531,7 +4531,7 @@ class EIEM_OT_export(ExportHelper, bpy.types.Operator):
     include_switches: BoolProperty(
         name="瀵煎嚭鎸夐敭鍒囨崲", default=True,
         description="导出款式切换及快捷键；取消后只导出默认款式，保留形态键与滑块控制")
-    lod_all: BoolProperty(name="瀵煎嚭宸插彂鐜扮殑鍏ㄩ儴 LOD", default=True)
+    lod_all: BoolProperty(name='导出已发现的全部 LOD', default=True)
     lod0: BoolProperty(name="LOD0", default=True)
     lod1: BoolProperty(name="LOD1", default=False)
     lod2: BoolProperty(name="LOD2", default=False)
@@ -4596,7 +4596,7 @@ class EIEM_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
     filename_ext = ""
     directory: StringProperty(subtype="DIR_PATH")
     scope_message: StringProperty(options={"HIDDEN"})
-    lod_all: BoolProperty(name="瀵煎嚭宸插彂鐜扮殑鍏ㄩ儴 LOD", default=True)
+    lod_all: BoolProperty(name='导出已发现的全部 LOD', default=True)
     lod0: BoolProperty(name="LOD0", default=True)
     lod1: BoolProperty(name="LOD1", default=False)
     lod2: BoolProperty(name="LOD2", default=False)
