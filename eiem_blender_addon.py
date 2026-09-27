@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EIEM Resource Package",
     "author": "EIEM",
-    "version": (0, 36, 0),
+    "version": (0, 37, 0),
     "blender": (3, 0, 0),
     "location": "File > Import/Export > EIEM package",
     "category": "Import-Export",
@@ -25,6 +25,7 @@ from pathlib import Path
 from collections import defaultdict
 
 import bpy
+import bmesh
 from bpy.props import StringProperty, BoolProperty, PointerProperty, FloatProperty, IntProperty, CollectionProperty
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 from mathutils import Matrix, Quaternion, Vector
@@ -1132,11 +1133,55 @@ def mesh_export_tangents(mesh, source_normals, normal_corners, preserve_normals)
     # Derived tangent data is never written into the user's mesh attributes.
     # Work on a temporary copy so failed exports also leave author data intact.
     work = mesh.copy()
+    source_loop_indices = list(range(len(mesh.loops)))
     try:
+        # Blender refuses calc_tangents on n-gons even though the exporter
+        # already serializes every face through loop_triangles.  Triangulate
+        # only this temporary tangent mesh and retain a corner provenance
+        # attribute so the generated frame can be mapped back to the original
+        # loop indices.  The authored Mesh, shape keys and topology remain
+        # untouched.
+        if any(len(polygon.vertices) > 4 for polygon in work.polygons):
+            attr_name = "__EIEM_TangentSourceLoop"
+            suffix = 1
+            while work.attributes.get(attr_name) is not None:
+                attr_name = "__EIEM_TangentSourceLoop.%d" % suffix
+                suffix += 1
+            source_attr = work.attributes.new(
+                name=attr_name, type="INT", domain="CORNER")
+            for index, item in enumerate(source_attr.data):
+                item.value = index
+            bmesh_data = bmesh.new()
+            try:
+                bmesh_data.from_mesh(work)
+                bmesh.ops.triangulate(
+                    bmesh_data,
+                    faces=[face for face in bmesh_data.faces if len(face.verts) > 4],
+                    quad_method="BEAUTY",
+                    ngon_method="BEAUTY")
+                bmesh_data.to_mesh(work)
+            finally:
+                bmesh_data.free()
+            source_attr = work.attributes.get(attr_name)
+            source_loop_indices = [None] * len(mesh.loops)
+            for index, item in enumerate(source_attr.data):
+                source_index = int(item.value)
+                if 0 <= source_index < len(source_loop_indices):
+                    # An n-gon corner can occur in more than one generated
+                    # triangle. Any copy has the same source vertex/UV frame.
+                    if source_loop_indices[source_index] is None:
+                        source_loop_indices[source_index] = index
+            if any(index is None for index in source_loop_indices):
+                raise ValueError("%s tangent corner provenance is incomplete" % mesh.name)
+            work.update()
         work.calc_tangents(uvmap="UV0")
         handedness = -1 if is_unity_left_handed(
             mesh.get("eiem_coordinate_space", "unity-y-up-left-handed")) else 1
-        generated = [(*loop.tangent, loop.bitangent_sign * handedness) for loop in work.loops]
+        generated = [
+            (*work.loops[source_loop_indices[index]].tangent,
+             work.loops[source_loop_indices[index]].bitangent_sign * handedness)
+            for index in range(len(mesh.loops))
+        ]
     finally:
         bpy.data.meshes.remove(work)
     for loop_index in missing:
@@ -2290,15 +2335,29 @@ def prepare_export_root(root):
     return root
 
 
-def mod_export_directory(directory):
-    """Return the user-selected directory as the Mod package root.
+def mod_export_directory(directory, filepath=None):
+    """Resolve the package root from the export dialog.
 
-    The file browser already lets the author choose or create the package
-    folder. Keep that name instead of inventing a nested ``mod`` directory;
-    the exporter writes ``mod.ini`` and resource subdirectories directly into
-    the selected folder.
+    Blender's file browser supplies both the current directory and the text in
+    its filename field. Treat that filename as the user-chosen Mod folder
+    name, so an export never scatters generated files into the parent folder.
+    Callers that use the Python API without a filename keep the selected
+    directory as the package root.
     """
-    return Path(directory or os.getcwd()).expanduser().resolve()
+    raw_filepath = str(filepath or "").strip()
+    selected = Path(
+        directory or (os.path.dirname(raw_filepath) if raw_filepath else "")
+        or os.getcwd()).expanduser().resolve()
+    if not raw_filepath:
+        return selected
+    candidate = Path(bpy.path.abspath(os.path.expandvars(raw_filepath))).expanduser().resolve()
+    if candidate == selected:
+        return selected
+    if candidate.name and candidate.parent == selected:
+        return candidate
+    if not directory and candidate.name:
+        return candidate
+    return selected
 
 
 def visible_eiem_resources(context=None):
@@ -4011,14 +4070,15 @@ class EIEM_OT_export(ExportHelper, bpy.types.Operator):
         self.layout.label(text=self.scope_message)
         self.layout.prop(self, "include_switches")
         draw_lod_options(self.layout, self)
-        self.layout.label(text="只处理所选资源；导出结果直接写入当前选中的文件夹")
+        self.layout.label(text="选择父目录，并在文件名中填写 Mod 文件夹名；插件会自动创建该文件夹")
 
     def execute(self, context):
         try:
             meshes, rigs = selected_eiem_resources(context)
             levels = self._lod_levels(meshes)
             stats = export_package(
-                mod_export_directory(self.directory or os.path.dirname(self.filepath)),
+                mod_export_directory(
+                    self.directory or os.path.dirname(self.filepath), self.filepath),
                 mesh_objects=meshes,
                 armatures=rigs,
                 physics_objects=selected_eiem_physics(context),
@@ -4066,7 +4126,8 @@ class EIEM_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
             meshes, _ = selected_eiem_resources(context)
             levels = self._lod_levels(meshes)
             stats = export_package(
-                mod_export_directory(self.directory or os.path.dirname(self.filepath)),
+                mod_export_directory(
+                    self.directory or os.path.dirname(self.filepath), self.filepath),
                 mesh_objects=meshes, armatures=[], physics_objects=[],
                 mesh_only=True, lod_levels=levels)
             self.report(

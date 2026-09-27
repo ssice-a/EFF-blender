@@ -35,6 +35,21 @@ def make_object(name, uv=True):
     return obj
 
 
+def make_ngon_object(name):
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(
+        [(0, 0, 0), (1, 0, 0), (1.5, .8, 0), (.5, 1.4, 0), (-.3, .8, 0)],
+        [], [(0, 1, 2, 3, 4)])
+    mesh['eiem_coordinate_space'] = 'unity-y-up-left-handed'
+    for layer_name in ('UV0', 'UV2'):
+        layer = mesh.uv_layers.new(name=layer_name)
+        for i, value in enumerate(((0,0), (1,0), (1,1), (.5,1), (0,1))):
+            layer.data[i].uv = value
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    return obj
+
+
 def export(obj, name):
     mesh = obj.data
     before = (len(bpy.data.meshes),
@@ -97,6 +112,14 @@ for corner, index in enumerate(indices):
     assert (tangent - Vector((-1 if corner < 3 else 1, 0, 0))).length < 1e-6
     assert (sign * normal.cross(tangent) - Vector((0,1,0))).length < 1e-6
 assert result['tangents'][5*4:6*4] == [0,0,0,0], 'Invented tangent on a loose vertex'
+
+# N-gons are legal Blender authoring input. Tangent generation triangulates
+# only its temporary working Mesh and leaves the source topology unchanged.
+ngon = make_ngon_object('NgonGeometry')
+before_ngon = (len(ngon.data.polygons), tuple(len(p.vertices) for p in ngon.data.polygons))
+ngon_result = export(ngon, 'ngon')
+assert len(ngon_result['tangents']) == ngon_result['vertex_count'] * 4
+assert before_ngon == (len(ngon.data.polygons), tuple(len(p.vertices) for p in ngon.data.polygons))
 
 # Import/re-export of generated data also remains byte-exact.
 round_mesh = addon.make_mesh('GeneratedRoundTrip', result)
