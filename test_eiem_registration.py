@@ -56,11 +56,11 @@ for cycle in range(3):
     assert bpy.ops.eiem.switch_member_remove.get_rna_type() is not None
     assert bpy.ops.eiem.switch_member_remove_selected.get_rna_type() is not None
     assert bpy.ops.eiem.shape_key_record.get_rna_type() is not None
-    assert hasattr(bpy.types, "EIEM_UL_switch_states")
+    assert hasattr(bpy.types, "EFF_UL_switch_states")
     assert hasattr(bpy.types, "VIEW3D_PT_eiem_updates")
     assert hasattr(bpy.types, "OBJECT_PT_eiem_physics")
-    assert hasattr(bpy.types, "EIEM_MT_physics_create")
-    assert not hasattr(bpy.types, "EIEM_MT_physics_copy")
+    assert hasattr(bpy.types, "EFF_MT_physics_create")
+    assert not hasattr(bpy.types, "EFF_MT_physics_copy")
     assert hasattr(bpy.types.Object, "eiem_physics")
     assert hasattr(bpy.types.Object, "eiem_native_physics")
     assert hasattr(bpy.types.Scene, "eiem_physics_visibility")
@@ -100,8 +100,8 @@ for cycle in range(3):
     assert not hasattr(bpy.types.Scene, "eiem_physics_preview_style")
     assert not hasattr(bpy.types.Scene, "eiem_physics_xray")
     assert not hasattr(bpy.types, "OBJECT_PT_eiem_physics")
-    assert not hasattr(bpy.types, "EIEM_MT_physics_create")
-    assert not hasattr(bpy.types, "EIEM_MT_physics_copy")
+    assert not hasattr(bpy.types, "EFF_MT_physics_create")
+    assert not hasattr(bpy.types, "EFF_MT_physics_copy")
     assert not [handler for handler in bpy.app.handlers.depsgraph_update_post
                 if handler.__module__ == module_name + ".eiem_physics_authoring"]
     assert not [handler for handler in bpy.app.handlers.depsgraph_update_post
@@ -114,4 +114,4 @@ for cycle in range(3):
         if name == module_name or name.startswith(module_name + "."):
             del sys.modules[name]
 
-print("EIEM_REGISTRATION_OK: discovery; import/export; 3 reload cycles; scene unchanged")
+print("EFF_REGISTRATION_OK: discovery; import/export; 3 reload cycles; scene unchanged")

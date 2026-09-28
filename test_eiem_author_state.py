@@ -74,7 +74,7 @@ def package(name):
     image.filepath_raw=str(root/"textures/shared.png");image.file_format="PNG";image.save()
     bpy.data.images.remove(image)
     (root/"mod.ini").write_text("[MaterialSame]\npath=materials/shared.mat\n[TextureSame]\npath=textures/shared.png\nlinear=true\n",encoding="utf-8")
-    (root/"materials/shared.mat").write_text("format=EIEMMAT\nversion=1\nsource=assets/test/"+name+".mat\nshader=TestShader\nfloat._Gloss=.4\ntexture._BaseMap=TextureSame\n",encoding="utf-8")
+    (root/"materials/shared.mat").write_text("format=EFFMAT\nversion=1\nsource=assets/test/"+name+".mat\nshader=TestShader\nfloat._Gloss=.4\ntexture._BaseMap=TextureSame\n",encoding="utf-8")
     return root/"materials/shared.mat"
 
 a=package("role-a");b=package("role-b")
@@ -85,7 +85,7 @@ assert ma["eiem_source"]!=mb["eiem_source"] and ma["eiem_texture._BaseMap"]!=mb[
 assert mb["eiem_shader"]=="TestShader" and mb["eiem_float._Gloss"]==".4"
 # Unknown formats and missing references leave existing slot and data untouched.
 before=(len(bpy.data.materials),len(bpy.data.images));broken=output/"broken.mat"
-for text in ("%YAML 1.1\n", "format=EIEMMAT\nversion=1\nsource=assets/test/a.mat\ntexture._BaseMap=TextureMissing\n"):
+for text in ("%YAML 1.1\n", "format=EFFMAT\nversion=1\nsource=assets/test/a.mat\ntexture._BaseMap=TextureMissing\n"):
     broken.write_text(text,encoding="utf-8")
     try: addon.import_material_file(broken,obj);raise AssertionError("bad import accepted")
     except ValueError: pass
@@ -119,4 +119,4 @@ try: addon.import_material_file(bad_package,obj);raise AssertionError("bad image
 except (RuntimeError,ValueError): pass
 assert obj.active_material==previous and before==(len(bpy.data.materials),len(bpy.data.images))
 addon.unregister()
-print("EIEM_AUTHOR_STATE_OK")
+print("EFF_AUTHOR_STATE_OK")

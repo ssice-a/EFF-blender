@@ -1,4 +1,4 @@
-"""Real Blender corner seams -> EIEM point streams, without changing author data."""
+"""Real Blender corner seams -> EFF point streams, without changing author data."""
 import importlib.util
 import json
 import struct
@@ -32,11 +32,11 @@ def make_object(name):
         layer = mesh.uv_layers.new(name="UV%d" % channel)
         for loop in mesh.loops:
             layer.data[loop.index].uv = (loop.vertex_index * .125, channel * .125)
-    addon.set_point_attribute(mesh, "EIEM_UV2_ZW", "FLOAT2",
+    addon.set_point_attribute(mesh, "EFF_UV2_ZW", "FLOAT2",
                               [(i * .125, -i * .25) for i in range(5)], "vector")
-    addon.set_point_attribute(mesh, "EIEM_Tangent", "FLOAT_VECTOR",
+    addon.set_point_attribute(mesh, "EFF_Tangent", "FLOAT_VECTOR",
                               [(1, i * .125, -0.0) for i in range(5)], "vector")
-    addon.set_point_attribute(mesh, "EIEM_TangentSign", "FLOAT", [1, -1, 1, -1, 1], "value")
+    addon.set_point_attribute(mesh, "EFF_TangentSign", "FLOAT", [1, -1, 1, -1, 1], "value")
     mesh.polygons[1].material_index = 2  # Slot 1 must remain empty.
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.scene.collection.objects.link(obj)
@@ -72,10 +72,10 @@ def assert_corners(obj, result, check_source_tangents=True):
             for channel, dimension in ((0, 2), (2, 4)):
                 expected = tuple(m.uv_layers['UV%d' % channel].data[loop_index].uv)
                 if dimension == 4:
-                    expected += tuple(m.attributes['EIEM_UV2_ZW'].data[source].vector)
+                    expected += tuple(m.attributes['EFF_UV2_ZW'].data[source].vector)
                 assert floats(result["uvs"][channel][target * dimension:(target + 1) * dimension]) == floats(expected)
-            tangent = m.attributes['EIEM_Tangent'].data[source].vector
-            sign = m.attributes['EIEM_TangentSign'].data[source].value
+            tangent = m.attributes['EFF_Tangent'].data[source].vector
+            sign = m.attributes['EFF_TangentSign'].data[source].value
             if check_source_tangents:
                 assert floats(result['tangents'][target * 4:(target + 1) * 4]) == floats((*addon.blender_to_unity(tangent), sign))
             if "Color" in m.color_attributes:
@@ -189,4 +189,4 @@ for channel in ('vertices','normals','tangents','colors'):
 for channel in range(8):
     assert floats(roundtrip['uvs'][channel]) == floats(raw['uvs'][channel]), channel
 addon.unregister()
-print('EIEM_CORNER_EXPORT_OK')
+print('EFF_CORNER_EXPORT_OK')

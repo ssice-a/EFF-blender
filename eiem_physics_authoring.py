@@ -228,7 +228,7 @@ def load_author_radius(obj, radius):
         owned = (action.get(AUTHOR_CURVE_ACTION_MARKER) == obj.eiem_physics.identity or
                  hasattr(obj, "eiem_native_physics") and
                  action.get(native.CURVE_ACTION_MARKER) == obj.eiem_native_physics.source_key)
-        document.require(owned, "该物理组已有非 EIEM 动画，请先移除或转移该 Action")
+        document.require(owned, "该物理组已有非 EFF 动画，请先移除或转移该 Action")
         native.remove_curve_projection(obj)
         obj.animation_data_clear()
     if AUTHOR_RADIUS_PROPERTY in obj:
@@ -341,7 +341,7 @@ def bone_id(bone):
 
 
 def bones(rig):
-    document.require(rig and rig.type == "ARMATURE" and rig.get("eiem_section"), "请选择 EIEM 共享骨架")
+    document.require(rig and rig.type == "ARMATURE" and rig.get("eiem_section"), "请选择 EFF 共享骨架")
     result = {}
     for bone, record, source in API["skeleton_author_nodes"](rig):
         key = bone.get("eiem_physics_id")
@@ -714,12 +714,12 @@ def ensure_author_native_fields(obj):
 
 
 def clear_author_parameter_action(obj):
-    """Remove only an EIEM-owned legacy/full curve projection from an author Empty."""
+    """Remove only an EFF-owned legacy/full curve projection from an author Empty."""
     action = obj.animation_data.action if obj and obj.animation_data else None
     if action is not None:
         owned = (action.get(AUTHOR_CURVE_ACTION_MARKER) == obj.eiem_physics.identity or
                  action.get(native.CURVE_ACTION_MARKER) == obj.eiem_native_physics.source_key)
-        document.require(owned, "该物理组已有非 EIEM 动画，请先移除或转移该 Action")
+        document.require(owned, "该物理组已有非 EFF 动画，请先移除或转移该 Action")
         native.remove_curve_projection(obj)
         obj.animation_data_clear()
     if AUTHOR_RADIUS_PROPERTY in obj:
@@ -1121,8 +1121,8 @@ def native_world(rig, wanted):
 def bind_collider(obj, bone):
     rig = obj.eiem_physics.rig
     obj.eiem_physics.bone_id = bone_id(bone)
-    constraint = obj.constraints.get("EIEM Physics bone") or obj.constraints.new("CHILD_OF")
-    constraint.name = "EIEM Physics bone"
+    constraint = obj.constraints.get("EFF Physics bone") or obj.constraints.new("CHILD_OF")
+    constraint.name = "EFF Physics bone"
     constraint.target, constraint.subtarget = rig, bone.name
     constraint.inverse_matrix = bone.matrix_local.inverted() @ native_world(rig, bone)
 
@@ -1404,26 +1404,26 @@ def skeleton_equal(records, payload):
     return True
 
 
-class EIEM_PG_physics_node(bpy.types.PropertyGroup):
+class EFF_PG_physics_node(bpy.types.PropertyGroup):
     bone_id: StringProperty()
     role: EnumProperty(name="节点角色", items=[("FIXED", "固定", ""), ("MOVE", "运动", ""), ("IGNORE", "忽略", "")],
                        update=node_role_updated)
 
 
-class EIEM_PG_physics_reference(bpy.types.PropertyGroup):
+class EFF_PG_physics_reference(bpy.types.PropertyGroup):
     object: PointerProperty(type=bpy.types.Object,
         poll=lambda self, obj: obj.eiem_physics.kind in ("COLLIDER", "NATIVE_COLLIDER"))
 
 
-class EIEM_PG_physics(bpy.types.PropertyGroup):
+class EFF_PG_physics(bpy.types.PropertyGroup):
     kind: EnumProperty(items=[("NONE", "无", ""), ("GROUP", "物理组", ""), ("COLLIDER", "碰撞体", ""),
                               ("NATIVE_GROUP", "源物理组", ""), ("NATIVE_COLLIDER", "源碰撞体", "")])
     identity: StringProperty()
     label: StringProperty(name="名称")
     rig: PointerProperty(type=bpy.types.Object, poll=lambda self, obj: obj.type == "ARMATURE")
     bone_id: StringProperty()
-    nodes: CollectionProperty(type=EIEM_PG_physics_node)
-    colliders: CollectionProperty(type=EIEM_PG_physics_reference)
+    nodes: CollectionProperty(type=EFF_PG_physics_node)
+    colliders: CollectionProperty(type=EFF_PG_physics_reference)
     collider_candidate: PointerProperty(
         name="添加已有碰撞体", type=bpy.types.Object, poll=collider_candidate_poll)
     visual: PointerProperty(type=bpy.types.Object)
@@ -1457,7 +1457,7 @@ class EIEM_PG_physics(bpy.types.PropertyGroup):
     show_structure: bpy.props.BoolProperty(name="结构编辑", default=False)
 
 
-class EIEM_OT_physics_edit(bpy.types.Operator):
+class EFF_OT_physics_edit(bpy.types.Operator):
     bl_idname = "eiem.physics_edit"
     bl_label = "编辑物理"
     bl_options = {"REGISTER", "UNDO"}
@@ -1618,7 +1618,7 @@ class EIEM_OT_physics_edit(bpy.types.Operator):
             return {"CANCELLED"}
 
 
-class EIEM_OT_physics_export(ExportHelper, bpy.types.Operator):
+class EFF_OT_physics_export(ExportHelper, bpy.types.Operator):
     bl_idname = "eiem.export_physics"
     bl_label = "导出 Physics 作者包"
     filename_ext = ".physics"
@@ -1639,7 +1639,7 @@ class EIEM_OT_physics_export(ExportHelper, bpy.types.Operator):
             return {"CANCELLED"}
 
 
-class EIEM_OT_physics_import(ImportHelper, bpy.types.Operator):
+class EFF_OT_physics_import(ImportHelper, bpy.types.Operator):
     bl_idname = "eiem.import_physics"
     bl_label = "导入 Physics 作者包"
     filename_ext = ".physics"
@@ -1655,7 +1655,7 @@ class EIEM_OT_physics_import(ImportHelper, bpy.types.Operator):
             return {"CANCELLED"}
 
 
-class EIEM_OT_physics_parameters(bpy.types.Operator):
+class EFF_OT_physics_parameters(bpy.types.Operator):
     bl_idname = "eiem.physics_parameters"
     bl_label = "复制或粘贴物理参数"
     bl_options = {"REGISTER", "UNDO"}
@@ -1692,9 +1692,9 @@ class EIEM_OT_physics_parameters(bpy.types.Operator):
             return {"CANCELLED"}
 
 
-class EIEM_MT_physics_create(bpy.types.Menu):
+class EFF_MT_physics_create(bpy.types.Menu):
     bl_label = "创建 / 导入"
-    bl_idname = "EIEM_MT_physics_create"
+    bl_idname = "EFF_MT_physics_create"
 
     def draw(self, context):
         layout = self.layout
@@ -1763,22 +1763,22 @@ def draw_active_group_node(layout, context, group):
         box.label(text="此链位置已有关键点")
 
 
-class EIEM_PT_physics(bpy.types.Panel):
+class EFF_PT_physics(bpy.types.Panel):
     bl_label = "物理骨骼"
-    bl_idname = "EIEM_PT_physics"
-    bl_space_type, bl_region_type, bl_category = "VIEW_3D", "UI", "EIEM"
+    bl_idname = "EFF_PT_physics"
+    bl_space_type, bl_region_type, bl_category = "VIEW_3D", "UI", "EFF"
 
     def draw(self, context):
         layout = self.layout
         layout.prop(context.scene, "eiem_physics_group", text="当前组")
         row = layout.row(align=True)
-        row.menu("EIEM_MT_physics_create", text="新建", icon="ADD")
+        row.menu("EFF_MT_physics_create", text="新建", icon="ADD")
         group = group_of(context)
         if group:
             op = row.operator("eiem.physics_parameters", text="复制参数", icon="COPYDOWN"); op.action = "COPY"
             op = row.operator("eiem.physics_parameters", text="粘贴参数", icon="PASTEDOWN"); op.action = "PASTE"
             row.operator("eiem.physics_edit", text="查看", icon="RESTRICT_VIEW_OFF").action = "FOCUS_GROUP"
-            layout.label(text="参数：选中 Empty → 对象属性 → EIEM 物理参数", icon="INFO")
+            layout.label(text="参数：选中 Empty → 对象属性 → EFF 物理参数", icon="INFO")
             draw_active_group_node(layout, context, group)
         structure_header, structure = layout.panel("eiem_physics_structure_tools", default_closed=True)
         structure_header.label(text="链与碰撞体", icon="BONE_DATA")
@@ -1809,8 +1809,8 @@ class EIEM_PT_physics(bpy.types.Panel):
             files.operator("eiem.export_physics", text="导出所选物理组")
 
 
-class EIEM_PT_physics_object(bpy.types.Panel):
-    bl_label = "EIEM 物理参数"
+class EFF_PT_physics_object(bpy.types.Panel):
+    bl_label = "EFF 物理参数"
     bl_idname = "OBJECT_PT_eiem_physics"
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"
@@ -1891,18 +1891,18 @@ class EIEM_PT_physics_object(bpy.types.Panel):
             layout.label(text="引用组：" + ("、".join(users) if users else "无"))
 
 
-CLASSES = (EIEM_PG_physics_node, EIEM_PG_physics_reference, EIEM_PG_physics,
-           EIEM_OT_physics_edit, EIEM_OT_physics_parameters,
-           EIEM_OT_physics_export, EIEM_OT_physics_import,
-           EIEM_MT_physics_create,
-           EIEM_PT_physics, EIEM_PT_physics_object)
+CLASSES = (EFF_PG_physics_node, EFF_PG_physics_reference, EFF_PG_physics,
+           EFF_OT_physics_edit, EFF_OT_physics_parameters,
+           EFF_OT_physics_export, EFF_OT_physics_import,
+           EFF_MT_physics_create,
+           EFF_PT_physics, EFF_PT_physics_object)
 
 
 def register(api):
     API.update(api)
     for cls in CLASSES:
         bpy.utils.register_class(cls)
-    bpy.types.Object.eiem_physics = PointerProperty(type=EIEM_PG_physics)
+    bpy.types.Object.eiem_physics = PointerProperty(type=EFF_PG_physics)
     bpy.types.Scene.eiem_physics_group = PointerProperty(type=bpy.types.Object,
         poll=lambda self, obj: obj.eiem_physics.kind in ("GROUP", "NATIVE_GROUP"),
         update=physics_group_updated)

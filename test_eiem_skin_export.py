@@ -117,4 +117,4 @@ try:
 except ValueError as ex:
     assert 'MissingBone' in str(ex), str(ex)
 assert file.read_bytes()==first
-print('EIEM_SKIN_EXPORT_OK')
+print('EFF_SKIN_EXPORT_OK')

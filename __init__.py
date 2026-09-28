@@ -3,11 +3,11 @@
 # Blender reads this literal without importing the implementation. Keep it in
 # sync with the standalone entry; test_eiem_registration.py checks both.
 bl_info = {
-    "name": "EIEM Resource Package",
-    "author": "EIEM",
+    "name": "EFF Resource Package",
+    "author": "EFF",
     "version": (0, 39, 2),
     "blender": (3, 0, 0),
-    "location": "File > Import/Export > EIEM package",
+    "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
 }
 

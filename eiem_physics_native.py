@@ -82,7 +82,7 @@ CURVE_FRAME_SCALE = 100.0
 CURVE_PROPERTY_PREFIX = "物理曲线 "
 CURVE_ACTION_MARKER = "eiem_native_physics_curves"
 CURVE_ACTION_SIGNATURE = "eiem_native_physics_curve_signature"
-CURVE_GROUP_NAME = "EIEM 物理参数曲线"
+CURVE_GROUP_NAME = "EFF 物理参数曲线"
 COLLIDER_VISUAL_FIELDS = (
     "center.x", "center.y", "center.z", "size.x", "size.y", "size.z",
     "direction", "reverseDirection", "radiusSeparation", "alignedOnCenter",
@@ -308,7 +308,7 @@ def make_visual(owner, paths, color, label, width=.0008, native_coordinates=True
         spline.use_cyclic_u = cyclic
     obj = bpy.data.objects.new(label, curve)
     finish_visual(owner, obj, color)
-    mat_name = "EIEM Physics " + str(color)
+    mat_name = "EFF Physics " + str(color)
     mat = bpy.data.materials.get(mat_name) or bpy.data.materials.new(mat_name)
     mat.diffuse_color = color; curve.materials.append(mat)
     return obj
@@ -333,7 +333,7 @@ def preview_style():
 
 def preview_material(color, alpha, label):
     rgba = (color[0], color[1], color[2], alpha)
-    name = "EIEM Physics %s %.3f %.3f %.3f %.3f" % ((label,) + rgba)
+    name = "EFF Physics %s %.3f %.3f %.3f %.3f" % ((label,) + rgba)
     material = bpy.data.materials.get(name) or bpy.data.materials.new(name)
     material.diffuse_color = rgba
     if hasattr(material, "surface_render_method"):
@@ -604,7 +604,7 @@ def curve_mapping_tree(obj, create=False):
         return tree
     if not create:
         return None
-    name = ".EIEM 物理曲线 " + (obj.eiem_physics.identity or obj.name_full)
+    name = ".EFF 物理曲线 " + (obj.eiem_physics.identity or obj.name_full)
     tree = bpy.data.node_groups.new(name=name, type="ShaderNodeTree")
     tree[CURVE_MAPPING_TREE_MARKER] = obj.eiem_physics.identity or obj.name_full
     state.curve_mapping_tree = tree
@@ -621,7 +621,7 @@ def curve_mapping_node(obj, parameter, create=False):
         index = CURVE_PARAMETER_INDEX.get(parameter, 0)
         label = CURVE_PARAMETERS[index][1] if parameter in CURVE_PARAMETER_INDEX else parameter
         node = tree.nodes.new("ShaderNodeFloatCurve")
-        node.name = "EIEM_CURVE_%02d" % index
+        node.name = "EFF_CURVE_%02d" % index
         node.label = label
         node[CURVE_MAPPING_PARAMETER] = parameter
     return node
@@ -923,7 +923,7 @@ def build_curve_projection(obj):
     source.require(is_parameter_group(obj), "请选择含完整参数的物理组")
     action = obj.animation_data.action if obj.animation_data else None
     source.require(action is None or action.get(CURVE_ACTION_MARKER) == obj.eiem_native_physics.source_key,
-                   "该物理组已有非 EIEM 动画，请先移除或转移该 Action")
+                   "该物理组已有非 EFF 动画，请先移除或转移该 Action")
     remove_curve_projection(obj)
     for index, (parameter, label) in enumerate(CURVE_PARAMETERS):
         fields, keys = source_curve_keys(obj, parameter)
@@ -965,7 +965,7 @@ def build_curve_projection(obj):
         curve.update()
     action = obj.animation_data.action
     action[CURVE_ACTION_MARKER] = obj.eiem_native_physics.source_key
-    action.name = "EIEM 物理曲线 " + obj.eiem_physics.label
+    action.name = "EFF 物理曲线 " + obj.eiem_physics.label
     action[CURVE_ACTION_SIGNATURE] = curve_projection_signature(obj)
     schedule_group_preview(obj)
     return action
@@ -1549,7 +1549,7 @@ def context_enabled_set(self, value):
         set_native_number(self.id_data, path, bool(value))
 
 
-class EIEM_PG_native_field(bpy.types.PropertyGroup):
+class EFF_PG_native_field(bpy.types.PropertyGroup):
     path: StringProperty()
     label: StringProperty()
     original: StringProperty()
@@ -1558,10 +1558,10 @@ class EIEM_PG_native_field(bpy.types.PropertyGroup):
     integer: StringProperty(update=edited)
 
 
-class EIEM_PG_native_physics(bpy.types.PropertyGroup):
+class EFF_PG_native_physics(bpy.types.PropertyGroup):
     source_text: PointerProperty(type=bpy.types.Text)
     source_key: StringProperty()
-    fields: CollectionProperty(type=EIEM_PG_native_field)
+    fields: CollectionProperty(type=EFF_PG_native_field)
     curve_mapping_tree: PointerProperty(type=bpy.types.NodeTree, options={"HIDDEN"})
     active_curve: EnumProperty(name="变化参数", items=CURVE_PARAMETER_ITEMS, default="0")
     show_curve_keys: BoolProperty(
@@ -1721,7 +1721,7 @@ def preview_style_updated(self, context):
     apply_visibility(context.scene)
 
 
-class EIEM_OT_native_parameter_page(bpy.types.Operator):
+class EFF_OT_native_parameter_page(bpy.types.Operator):
     bl_idname = "eiem.native_physics_parameter_page"
     bl_label = "切换原生参数页"
     delta: IntProperty(default=0)
@@ -1740,7 +1740,7 @@ class EIEM_OT_native_parameter_page(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class EIEM_OT_native_focus(bpy.types.Operator):
+class EFF_OT_native_focus(bpy.types.Operator):
     bl_idname = "eiem.focus_native_physics"
     bl_label = "仅显示当前物理组"
     bl_options = {"REGISTER", "UNDO"}
@@ -1761,7 +1761,7 @@ class EIEM_OT_native_focus(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class EIEM_OT_native_bones(bpy.types.Operator):
+class EFF_OT_native_bones(bpy.types.Operator):
     bl_idname = "eiem.select_native_physics_bones"
     bl_label = "选择源物理骨骼"
     bl_options = {"REGISTER", "UNDO"}
@@ -1802,7 +1802,7 @@ def commit_curve_mapping(obj, parameter):
         node[CURVE_MAPPING_SIGNATURE] = curve_mapping_signature(node)
 
 
-class EIEM_OT_native_curve_key(bpy.types.Operator):
+class EFF_OT_native_curve_key(bpy.types.Operator):
     bl_idname = "eiem.physics_curve_key"
     bl_label = "编辑物理曲线"
     bl_options = {"REGISTER", "UNDO"}
@@ -1867,7 +1867,7 @@ def import_source(filename, rig=None):
         if existing_rig and filename.suffix == ".physics":
             source.require(AUTHOR.skeleton_equal(API["skeleton_author_nodes"](rig), skeleton), "当前 Rig 与 Physics 骨架依赖不一致")
         lookup = rig_paths(rig)
-        text = bpy.data.texts.new("EIEM Physics Source " + payload["id"])
+        text = bpy.data.texts.new("EFF Physics Source " + payload["id"])
         # Blender Text insertion has quadratic cost for a multi-megabyte line.
         # Keep the retained tree formatted into ordinary-sized source lines.
         text.from_string(json.dumps(payload, ensure_ascii=False, allow_nan=False, indent=1))
@@ -1973,7 +1973,7 @@ def export_source(filename, objects):
             "colliders": sum(c["type"] != "BeyondBoneCloth" for c in value["components"]), "skeletons": 1}
 
 
-class EIEM_OT_native_import(ImportHelper, bpy.types.Operator):
+class EFF_OT_native_import(ImportHelper, bpy.types.Operator):
     bl_idname = "eiem.import_native_physics"
     bl_label = "导入源物理"
     bl_options = {"REGISTER", "UNDO"}
@@ -1987,7 +1987,7 @@ class EIEM_OT_native_import(ImportHelper, bpy.types.Operator):
             self.report({"ERROR"}, str(error)); return {"CANCELLED"}
 
 
-class EIEM_OT_native_select(bpy.types.Operator):
+class EFF_OT_native_select(bpy.types.Operator):
     bl_idname = "eiem.select_native_physics"
     bl_label = "选择关联物理"
     bl_options = {"REGISTER", "UNDO"}
@@ -2194,17 +2194,17 @@ def draw(layout, context, obj):
                           allow_refresh=c["type"] == "BeyondBoneCloth", include_disabled=True)
 
 
-CLASSES = (EIEM_PG_native_field, EIEM_PG_native_physics, EIEM_OT_native_import,
-           EIEM_OT_native_select,
-           EIEM_OT_native_parameter_page,
-           EIEM_OT_native_focus, EIEM_OT_native_bones, EIEM_OT_native_curve_key)
+CLASSES = (EFF_PG_native_field, EFF_PG_native_physics, EFF_OT_native_import,
+           EFF_OT_native_select,
+           EFF_OT_native_parameter_page,
+           EFF_OT_native_focus, EFF_OT_native_bones, EFF_OT_native_curve_key)
 
 
 def register(author, api):
     global AUTHOR
     AUTHOR = author; API.update(api)
     for cls in CLASSES: bpy.utils.register_class(cls)
-    bpy.types.Object.eiem_native_physics = PointerProperty(type=EIEM_PG_native_physics)
+    bpy.types.Object.eiem_native_physics = PointerProperty(type=EFF_PG_native_physics)
     bpy.types.Scene.eiem_physics_visibility = EnumProperty(
         name="视图范围",
         items=(("CURRENT", "当前组", "显示当前物理组及它引用的碰撞体"),

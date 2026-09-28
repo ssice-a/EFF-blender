@@ -82,7 +82,7 @@ def corner_indices(payload):
 # current-normal export. A visible direction edit must trigger it.
 normal_probe = make_object('NormalEncodingProbe')
 source_normals = [(0, 0, 1)] * len(normal_probe.data.vertices)
-addon.set_point_attribute(normal_probe.data, 'EIEM_SourceNormal', 'FLOAT_VECTOR',
+addon.set_point_attribute(normal_probe.data, 'EFF_SourceNormal', 'FLOAT_VECTOR',
                           source_normals, 'vector')
 assert addon.normal_state_matches_source(normal_probe.data, source_normals)
 for polygon in normal_probe.data.polygons:
@@ -134,8 +134,8 @@ assert result['indices'] == roundtrip['indices']
 native = make_object('Native')
 values = [(1, .125*i, -0.0) for i in range(6)]
 signs = [1,-1,1,-1,1,-1]
-addon.set_point_attribute(native.data, 'EIEM_Tangent', 'FLOAT_VECTOR', values, 'vector')
-addon.set_point_attribute(native.data, 'EIEM_TangentSign', 'FLOAT', signs, 'value')
+addon.set_point_attribute(native.data, 'EFF_Tangent', 'FLOAT_VECTOR', values, 'vector')
+addon.set_point_attribute(native.data, 'EFF_TangentSign', 'FLOAT', signs, 'value')
 native_result = export(native, 'native')
 assert native_result['vertex_count'] == 6
 expected = [v for tangent,sign in zip(values, signs) for v in (*addon.blender_to_unity(tangent),sign)]
@@ -146,8 +146,8 @@ assert bits(native_result['tangents']) == bits(expected)
 mixed = make_object('Mixed')
 mixed_values = [values[i] if i in (1,2) else (0,0,0) for i in range(6)]
 mixed_signs = [signs[i] if i in (1,2) else 0 for i in range(6)]
-addon.set_point_attribute(mixed.data, 'EIEM_Tangent', 'FLOAT_VECTOR', mixed_values, 'vector')
-addon.set_point_attribute(mixed.data, 'EIEM_TangentSign', 'FLOAT', mixed_signs, 'value')
+addon.set_point_attribute(mixed.data, 'EFF_Tangent', 'FLOAT_VECTOR', mixed_values, 'vector')
+addon.set_point_attribute(mixed.data, 'EFF_TangentSign', 'FLOAT', mixed_signs, 'value')
 mixed_result = export(mixed, 'mixed')
 for corner, index in enumerate(corner_indices(mixed_result)):
     source = mixed.data.loops[corner].vertex_index
@@ -161,9 +161,9 @@ for corner, index in enumerate(corner_indices(mixed_result)):
 # A non-zero imported tangent can still be unusable after a join or a custom
 # normal edit. It must be regenerated against the normal that is serialized.
 parallel = make_object('ParallelTangent')
-addon.set_point_attribute(parallel.data, 'EIEM_Tangent', 'FLOAT_VECTOR',
+addon.set_point_attribute(parallel.data, 'EFF_Tangent', 'FLOAT_VECTOR',
                           [(0,0,1)] * 6, 'vector')
-addon.set_point_attribute(parallel.data, 'EIEM_TangentSign', 'FLOAT', [1] * 6, 'value')
+addon.set_point_attribute(parallel.data, 'EFF_TangentSign', 'FLOAT', [1] * 6, 'value')
 parallel_result = export(parallel, 'parallel')
 for index in corner_indices(parallel_result):
     normal = Vector(parallel_result['normals'][index*3:index*3+3])
@@ -196,11 +196,11 @@ except ValueError as error:
     assert 'no UV0' in str(error)
 
 # A malformed authored attribute is an error, not an excuse to discard it.
-native.data.attributes.remove(native.data.attributes['EIEM_TangentSign'])
+native.data.attributes.remove(native.data.attributes['EFF_TangentSign'])
 try:
     addon.write_mesh(output / 'invalid.mesh', native)
     raise AssertionError('Incomplete source attributes were silently replaced')
 except ValueError as error:
     assert 'both be present' in str(error)
 
-print('EIEM_TANGENT_EXPORT_OK')
+print('EFF_TANGENT_EXPORT_OK')

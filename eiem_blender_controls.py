@@ -373,7 +373,7 @@ def assign_switch_meshes(state, objects, scene=None):
     if (not objects
             or any(obj.type != "MESH" or not obj.data.get("eiem_section")
                    for obj in objects)):
-        raise ValueError("请在物体模式选择已绑定 EIEM 源资源的网格")
+        raise ValueError("请在物体模式选择已绑定 EFF 源资源的网格")
     restore_switch_preview(objects)
     target_group = next(
         (group for group in switch_groups(scene)
@@ -396,7 +396,7 @@ def assign_switch_meshes(state, objects, scene=None):
 
 
 def add_switch_members(group, objects, scene=None, state=None):
-    """Add selected EIEM Meshes to a group without touching other groups.
+    """Add selected EFF Meshes to a group without touching other groups.
 
     Newly added members are placed in the selected state (or the first state)
     so the group has a visible, deterministic default for them. Existing
@@ -409,7 +409,7 @@ def add_switch_members(group, objects, scene=None, state=None):
     if (not objects
             or any(obj.type != "MESH" or not obj.data.get("eiem_section")
                    for obj in objects)):
-        raise ValueError("请在物体模式选择已绑定 EIEM 资源的网格")
+        raise ValueError("请在物体模式选择已绑定 EFF 资源的网格")
     states = switch_states(group)
     if not states:
         raise ValueError("当前切换组没有款式")
@@ -450,7 +450,7 @@ def create_switch_group(name, key, objects, scene=None):
     if (not objects
             or any(obj.type != "MESH" or not obj.data.get("eiem_section")
                    for obj in objects)):
-        raise ValueError("请先选择 EIEM 网格部件")
+        raise ValueError("请先选择 EFF 网格部件")
     if any(validate_switch_key(group.get("eiem_key", "")) == key
            for group in switch_groups(scene)):
         raise ValueError("已有切换组使用快捷键 " + key)
@@ -463,7 +463,7 @@ def create_switch_group(name, key, objects, scene=None):
         (collection for collection in scene.collection.children
          if collection.get("eiem_switch_root")), None)
     if root is None:
-        root = bpy.data.collections.new("EIEM 切换")
+        root = bpy.data.collections.new("EFF 切换")
         root["eiem_switch_root"] = True
         scene.collection.children.link(root)
     group = bpy.data.collections.new(name or "切换组")
@@ -515,10 +515,10 @@ def plan_switch_export(mesh_objects, scene=None, include_switches=True):
     scene = scene or bpy.context.scene
     selected = set(mesh_objects)
     if not selected:
-        raise ValueError("No EIEM mesh objects selected")
+        raise ValueError("No EFF mesh objects selected")
     if any(obj.type != "MESH" or not obj.data.get("eiem_section")
            for obj in selected):
-        raise ValueError("所选包含未绑定 EIEM 的网格")
+        raise ValueError("所选包含未绑定 EFF 的网格")
     sources = {obj: mesh_source_identity(obj) for obj in selected}
     hidden = {obj for obj in selected if obj.hide_render}
     for obj in selected:

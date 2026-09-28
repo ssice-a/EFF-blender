@@ -20,7 +20,7 @@ def parse_version(tag):
 def check_release(current, ignored_tag="", force=False, opener=urlopen):
     request = Request(API_URL, headers={
         "Accept": "application/vnd.github+json",
-        "User-Agent": "EIEM-Blender-UpdateCheck/1.0",
+        "User-Agent": "EFF-Blender-UpdateCheck/1.0",
     })
     with opener(request, timeout=5) as response:
         data = json.load(response)

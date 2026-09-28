@@ -1,4 +1,4 @@
-"""Blender-side regression checks for an EIEM package round trip.
+"""Blender-side regression checks for an EFF package round trip.
 
 Run in background Blender with ``-- ADDON SOURCE_PACKAGE NEW_OUTPUT``.
 Existing output directories are refused, never cleared.
@@ -55,7 +55,7 @@ for section in parser.sections():
         prefab_values[section] = dict(values)
 
 addon.import_package(package, clean=True)
-collection = bpy.data.collections["EIEM"]
+collection = bpy.data.collections["EFF"]
 objects = list(collection.all_objects)
 armatures = [obj for obj in objects if obj.type == "ARMATURE"]
 assert len(armatures) == len(skeleton_keys), (
@@ -89,13 +89,13 @@ for section, payload in mesh_payloads.items():
     assert len(obj.data.uv_layers) == sum(value >= 2 for value in dimensions)
     for channel, dimension in enumerate(dimensions):
         if dimension > 2:
-            assert f"EIEM_UV{channel}_ZW" in obj.data.attributes
+            assert f"EFF_UV{channel}_ZW" in obj.data.attributes
     if payload["normals"]:
         assert all(polygon.use_smooth for polygon in obj.data.polygons), (
             section, "source normals require smooth faces"
         )
-        assert "EIEM_SourceNormal" in obj.data.attributes, (section, "normal backup")
-        assert "EIEM_Normal" not in obj.data.attributes, (section, "legacy fake normal")
+        assert "EFF_SourceNormal" in obj.data.attributes, (section, "normal backup")
+        assert "EFF_Normal" not in obj.data.attributes, (section, "legacy fake normal")
         assert obj.data.get("eiem_normal_baseline_crc") == addon.normal_state_crc(obj.data), (
             section, "normal baseline"
         )
@@ -117,8 +117,8 @@ for section, payload in mesh_payloads.items():
                     section, "custom normal", loop.index, alignment
                 )
     if payload["tangents"]:
-        assert "EIEM_Tangent" in obj.data.attributes
-        assert "EIEM_TangentSign" in obj.data.attributes
+        assert "EFF_Tangent" in obj.data.attributes
+        assert "EFF_TangentSign" in obj.data.attributes
     if payload["colors"]:
         assert "Color" in obj.data.color_attributes
     expected_shapes = sum(channel[3] for channel in payload["blend_channels"])
@@ -254,8 +254,8 @@ probe_source["blend_frames"] = []
 probe_source["blend_channels"] = []
 probe_source["blend_weights"] = []
 probe_source["additional"] = []
-probe_mesh = addon.make_mesh("EIEMColorProbe", probe_source)
-probe_object = bpy.data.objects.new("EIEMColorProbe", probe_mesh)
+probe_mesh = addon.make_mesh("EFFColorProbe", probe_source)
+probe_object = bpy.data.objects.new("EFFColorProbe", probe_mesh)
 collection.objects.link(probe_object)
 probe_path = output / "meshes" / "color_probe.mesh"
 addon.write_mesh(probe_path, probe_object)
@@ -264,7 +264,7 @@ assert_close(probe_target["colors"], probe_source["colors"], "probe", "colors")
 bpy.data.objects.remove(probe_object, do_unlink=True)
 
 print(
-    f"EIEM round trip OK: meshes={len(mesh_payloads)} "
+    f"EFF round trip OK: meshes={len(mesh_payloads)} "
     f"skeleton_resources={len(skeleton_keys)} materials={len(material_values)} "
     f"textures={len(texture_values)}"
 )

@@ -1,4 +1,4 @@
-"""Session-scoped binary resource cache for the EIEM Blender exporter."""
+"""Session-scoped binary resource cache for the EFF Blender exporter."""
 
 import hashlib
 import shutil
@@ -18,7 +18,7 @@ class ResourceCache:
         self.destination = Path(destination).resolve()
         digest = hashlib.sha256(
             str(self.destination).casefold().encode("utf-8")).hexdigest()
-        self.root = Path(tempfile.gettempdir()) / "EIEM-Blender-Export-Cache" / digest
+        self.root = Path(tempfile.gettempdir()) / "EFF-Blender-Export-Cache" / digest
         self.files = self.root / "files"
         self.entries = {}
         self.metadata = {}

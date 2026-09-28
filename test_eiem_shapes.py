@@ -50,7 +50,7 @@ class Layout:
             if name == "prop": assert hasattr(args[0], args[1])
             return self
         return call
-addon.EIEM_PT_shape_controls.draw(SimpleNamespace(layout=Layout()), bpy.context)
+addon.EFF_PT_shape_controls.draw(SimpleNamespace(layout=Layout()), bpy.context)
 bpy.ops.wm.save_as_mainfile(filepath=str(output / "author.blend"))
 bpy.ops.wm.open_mainfile(filepath=str(output / "author.blend"))
 obj = bpy.data.objects["Source"]
@@ -158,4 +158,4 @@ addon.unregister()
 addon.register()
 assert obj.data.eiem_shape_controls[0].shape == "Inflate"
 addon.unregister()
-print("EIEM_SHAPES_OK")
+print("EFF_SHAPES_OK")

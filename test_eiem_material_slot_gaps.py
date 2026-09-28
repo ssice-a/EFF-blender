@@ -82,4 +82,4 @@ with tempfile.TemporaryDirectory(prefix="eiem-slot-gap-") as temp:
     assert len(imported.polygons) == 1
     assert imported.polygons[0].material_index == 1
 
-print("EIEM_MATERIAL_SLOT_GAPS_OK")
+print("EFF_MATERIAL_SLOT_GAPS_OK")

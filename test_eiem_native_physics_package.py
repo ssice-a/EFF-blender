@@ -58,7 +58,7 @@ try:
     assert first_objects.isdisjoint(set(second.all_objects))
     assert {c.get("eiem_collection_role") for c in second.children} >= {"MESHES", "SKELETONS"}
     print(
-        "EIEM_NORMAL_PACKAGE_PHYSICS_OK "
+        "EFF_NORMAL_PACKAGE_PHYSICS_OK "
         f"meshes={mesh_count} rigs={len(rigs)} groups={len(groups)} "
         f"colliders={len(colliders)} required_transforms={len(required)}",
         flush=True,

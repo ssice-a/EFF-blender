@@ -374,7 +374,7 @@ assert not list((output / "mesh-only").rglob("*.physics"))
 
 # Native v2 remains an authoring/reference graph and cannot enter a runtime Mod.
 # Reject it before changing the destination; standalone author export remains.
-modifier = obj.modifiers.new("EIEM Armature", "ARMATURE"); modifier.object = rig
+modifier = obj.modifiers.new("EFF Armature", "ARMATURE"); modifier.object = rig
 root_bone = native.rig_paths(rig)[""]
 obj.vertex_groups.new(name=root_bone.name).add([0,1,2],1.0,"REPLACE")
 obj["eiem_bone_paths_json"] = json.dumps([""])
@@ -539,4 +539,4 @@ author_roundtrip = addon.physics_authoring.document.decode(
 assert len(author_roundtrip["groups"][0]["nativeParameters"]) == 249
 addon.unregister()
 faulthandler.cancel_dump_traceback_later()
-print("EIEM_NATIVE_PHYSICS_OK: 11 groups; 27 shaped colliders; parameters; physical Transform selection; safe new-chain clone; incremental source export; Mesh only")
+print("EFF_NATIVE_PHYSICS_OK: 11 groups; 27 shaped colliders; parameters; physical Transform selection; safe new-chain clone; incremental source export; Mesh only")

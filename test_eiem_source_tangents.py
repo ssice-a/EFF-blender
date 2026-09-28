@@ -1,7 +1,7 @@
 """Source-aware channel regression, in a separate background Blender process.
 
 Run with -- ADDON PROBE_OUTPUT, after tests/EndfieldTangentProbe.
-Checks real-parser arrays -> production EIEM file -> Blender -> output.
+Checks real-parser arrays -> production EFF file -> Blender -> output.
 This is NOT an animation, runtime GPU, or full skeleton round-trip test.
 """
 import importlib.util
@@ -63,4 +63,4 @@ with tempfile.TemporaryDirectory(prefix="eiem-source-tangent-") as temp:
         bpy.data.objects.remove(obj, do_unlink=True)
         bpy.data.meshes.remove(mesh)
 assert tested > 0
-print(f"EIEM_SOURCE_BLENDER_TANGENTS_OK meshes={tested} vertices={vertices} float32_exact=True")
+print(f"EFF_SOURCE_BLENDER_TANGENTS_OK meshes={tested} vertices={vertices} float32_exact=True")

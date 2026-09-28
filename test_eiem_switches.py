@@ -346,7 +346,7 @@ try:
     restricted_context = SimpleNamespace(
         scene=SimpleNamespace(eiem_switch_active=restricted_group),
         object=None)
-    addon.EIEM_PT_switches.draw(
+    addon.EFF_PT_switches.draw(
         SimpleNamespace(layout=PanelLayout()), restricted_context)
 finally:
     addon.switch_groups, addon.switch_members, addon.switch_states = saved_functions
@@ -363,8 +363,8 @@ addon.unregister()
 addon.register()
 assert len(addon.plan_switch_export(selected)["groups"]) == 1
 
-# Exported switch conditions are executable EIEM syntax rather than ordinary
+# Exported switch conditions are executable EFF syntax rather than ordinary
 # INI keys.  They must not prevent the same package from being imported again.
 assert addon.import_package(package, clean=True) == 1
 addon.unregister()
-print("EIEM_SWITCHES_OK", stats)
+print("EFF_SWITCHES_OK", stats)

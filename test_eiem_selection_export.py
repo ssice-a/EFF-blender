@@ -40,7 +40,7 @@ unselected = make_object("Unselected")
 sibling = make_object("UnselectedSibling", "Visible")
 hidden.hide_render = True
 # Hidden and unselected objects must not drag unusable resource dependencies in.
-invalid_material = bpy.data.materials.new("Not an EIEM material")
+invalid_material = bpy.data.materials.new("Not an EFF material")
 hidden.data.materials.append(invalid_material)
 unselected.data.materials.append(invalid_material)
 sibling.data.materials.append(invalid_material)
@@ -137,4 +137,4 @@ bpy.ops.wm.open_mainfile(filepath=str(output / "visibility.blend"))
 assert bpy.data.objects["Hidden"].hide_render
 assert not bpy.data.objects["Visible"].hide_render
 addon.unregister()
-print("EIEM_SELECTION_EXPORT_OK")
+print("EFF_SELECTION_EXPORT_OK")

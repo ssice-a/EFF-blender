@@ -270,4 +270,4 @@ bpy.ops.object.mode_set(mode="OBJECT")
 
 # No native API calls, preferences, installed add-ons or game files are used.
 addon.unregister()
-print("EIEM_PHYSICS_AUTHORING_OK")
+print("EFF_PHYSICS_AUTHORING_OK")

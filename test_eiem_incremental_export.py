@@ -57,7 +57,7 @@ texture_paths, texture_transforms, parameters, resource = \
     addon.material_property_groups(material)
 assert texture_paths and all(key.startswith("eiem_texture.")
                              for key in texture_paths), texture_paths
-assert not any(key in addon.EIEM_INTERNAL_MATERIAL_PROPERTIES
+assert not any(key in addon.EFF_INTERNAL_MATERIAL_PROPERTIES
                for group in (texture_paths, texture_transforms, parameters, resource)
                for key in group)
 
@@ -218,4 +218,4 @@ assert not any(path.name == duplicate_path.name
                if path.name != replacement_png.name)
 shutil.rmtree(duplicate_root)
 addon.unregister()
-print("EIEM_INCREMENTAL_EXPORT_OK", stats)
+print("EFF_INCREMENTAL_EXPORT_OK", stats)

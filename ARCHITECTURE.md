@@ -1,6 +1,6 @@
 # Blender 侧架构
 
-EIEM Blender 是三端管线的作者端：AnimeStudio 生成 EIEM 源包，Blender 编辑并生成 Mod，EIEM DLL 在游戏中加载 Mod。
+EFF Blender 是三端管线的作者端：AnimeStudio 生成 EFF 源包，Blender 编辑并生成 Mod，EFF DLL 在游戏中加载 Mod。
 
 ## 模块
 
@@ -15,7 +15,7 @@ EIEM Blender 是三端管线的作者端：AnimeStudio 生成 EIEM 源包，Blen
 
 ## 约束
 
-- 导出只处理用户选中的 EIEM 网格及其依赖，不隐式扩大到其他源资源。
+- 导出只处理用户选中的 EFF 网格及其依赖，不隐式扩大到其他源资源。
 - 同一源 Mesh 的多个部件共享形态键变量；合并 Mesh 保留形态键数据和顶点偏移。
 - 蒙皮槽同时导出 `bonePaths`（作者信息）和 `boneSourceCandidates`（源 Renderer 的 Mesh/槽位候选）。普通运行时绑定只使用候选表，不依赖 Blender 显示名称、rootBone 或运行时层级索引。
 - `bone_index_paths` 仍随 v6 输出，仅供显式 Mod-owned Skeleton 接口和往返编辑使用；普通 Mesh 替换不会读取它。

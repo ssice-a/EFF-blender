@@ -239,4 +239,4 @@ try:
 except ValueError as ex: assert '源骨骼绑定姿态已改变' in str(ex),str(ex)
 assert reloaded_skeleton.read_bytes()==original_skeleton
 addon.unregister()
-print('EIEM_SKELETON_EXPORT_OK')
+print('EFF_SKELETON_EXPORT_OK')

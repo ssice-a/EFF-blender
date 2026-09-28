@@ -1,9 +1,9 @@
 bl_info = {
-    "name": "EIEM Resource Package",
-    "author": "EIEM",
+    "name": "EFF Resource Package",
+    "author": "EFF",
     "version": (0, 39, 2),
     "blender": (3, 0, 0),
-    "location": "File > Import/Export > EIEM package",
+    "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
 }
 
@@ -419,13 +419,13 @@ def load_material(root, section, values, textures=None):
 
 
 def import_material_file(path, obj):
-    """Import an EIEM material + package texture declarations into one slot."""
+    """Import an EFF material + package texture declarations into one slot."""
     path = Path(path).resolve()
     if obj is None or obj.type != "MESH":
         raise ValueError('请先选择要指定材质的网格')
     values = read_flat_properties(path)
-    if values.get("format") != "EIEMMAT" or values.get("version") != "1" or not values.get("source", "").strip():
-        raise ValueError("请选择 EIEM 导出的 .mat（EIEMMAT version=1，包含 source），不是 Unity YAML 或节点材质")
+    if values.get("format") != "EFFMAT" or values.get("version") != "1" or not values.get("source", "").strip():
+        raise ValueError("请选择 EFF 导出的 .mat（EFFMAT version=1，包含 source），不是 Unity YAML 或节点材质")
     # Only use an enclosing package that actually declares this file.
     resources, root = {}, path.parent
     for parent in path.parents:
@@ -627,10 +627,10 @@ def import_blend_shapes(obj, payload):
             normal_attribute = ""
             tangent_attribute = ""
             if has_normals:
-                normal_attribute = "EIEM_MorphNormal_%03d" % frame_serial
+                normal_attribute = "EFF_MorphNormal_%03d" % frame_serial
                 set_point_attribute(obj.data, normal_attribute, "FLOAT_VECTOR", normal_values, "vector")
             if has_tangents:
-                tangent_attribute = "EIEM_MorphTangent_%03d" % frame_serial
+                tangent_attribute = "EFF_MorphTangent_%03d" % frame_serial
                 set_point_attribute(obj.data, tangent_attribute, "FLOAT_VECTOR", tangent_values, "vector")
             channel_metadata["frames"].append({
                 "key": key_name,
@@ -680,7 +680,7 @@ def make_mesh(section, payload):
     mesh["eiem_source"] = payload["source"]
     mesh["eiem_coordinate_space"] = payload["coordinate"]
     mesh["eiem_asset"] = payload["name"]
-    # EIEM meshes store one authored normal per vertex. Put those values into
+    # EFF meshes store one authored normal per vertex. Put those values into
     # Blender's native custom split-normal channel so the viewport, modifiers
     # and normal-editing tools use the game normals rather than a hidden copy.
     # Smooth faces are required for custom normals to drive shading.
@@ -697,7 +697,7 @@ def make_mesh(section, payload):
         mesh.update()
         # Lossless round-trip backup only. Viewport shading and normal-editing
         # tools use the native custom split normals set above.
-        set_point_attribute(mesh, "EIEM_SourceNormal", "FLOAT_VECTOR", normals, "vector")
+        set_point_attribute(mesh, "EFF_SourceNormal", "FLOAT_VECTOR", normals, "vector")
     if len(payload["tangents"]) == count * 4:
         tangents = []
         signs = []
@@ -707,8 +707,8 @@ def make_mesh(section, payload):
                 tangent = unity_to_blender(tangent)
             tangents.append(tangent)
             signs.append(float(payload["tangents"][index * 4 + 3]))
-        set_point_attribute(mesh, "EIEM_Tangent", "FLOAT_VECTOR", tangents, "vector")
-        set_point_attribute(mesh, "EIEM_TangentSign", "FLOAT", signs, "value")
+        set_point_attribute(mesh, "EFF_Tangent", "FLOAT_VECTOR", tangents, "vector")
+        set_point_attribute(mesh, "EFF_TangentSign", "FLOAT", signs, "value")
 
     uv_dimensions = []
     for channel, values in enumerate(payload["uvs"]):
@@ -737,7 +737,7 @@ def make_mesh(section, payload):
                 start = vertex * dimension
                 extras.append((float(values[start + 2]),
                                float(values[start + 3]) if dimension == 4 else 0.0))
-            set_point_attribute(mesh, "EIEM_UV%d_ZW" % channel, "FLOAT2", extras, "vector")
+            set_point_attribute(mesh, "EFF_UV%d_ZW" % channel, "FLOAT2", extras, "vector")
     while len(uv_dimensions) < 8:
         uv_dimensions.append(0)
     mesh["eiem_uv_dimensions_json"] = json.dumps(uv_dimensions, separators=(",", ":"))
@@ -756,7 +756,7 @@ def make_mesh(section, payload):
     else:
         for polygon, submesh in zip(mesh.polygons, face_submesh):
             polygon.material_index = submesh
-    if "EIEM_SourceNormal" in mesh.attributes:
+    if "EFF_SourceNormal" in mesh.attributes:
         mesh["eiem_normal_baseline_crc"] = normal_state_crc(mesh)
     return mesh
 
@@ -826,7 +826,7 @@ def resolve_mesh_bone_palette(payload, armature, legacy_palette=None):
 
 
 def bind_mesh_weights(obj, payload, armature, palette):
-    """Create Blender vertex groups from the EIEM bone-index palette."""
+    """Create Blender vertex groups from the EFF bone-index palette."""
     if not obj or not armature or not payload.get("skin"):
         return
     bones = list(armature.data.bones)
@@ -919,7 +919,7 @@ def remove_collection_tree(collection):
 
 
 def clear_eiem_imports(collection):
-    """Clear imported package trees while retaining the stable EIEM root."""
+    """Clear imported package trees while retaining the stable EFF root."""
     clear_collection_objects(collection)
     for child in list(collection.children):
         remove_collection_tree(child)
@@ -936,10 +936,10 @@ def import_child_collection(parent, label, role, import_id):
 def package_import_collection(root_collection, root):
     source = str(Path(root).resolve())
     label = Path(root).name
-    if label.lower().endswith(".eiem"):
+    if label.lower().endswith(".eff"):
         label = label[:-5]
     import_id = uuid.uuid4().hex
-    package = bpy.data.collections.new("EIEM " + (label or "Package"))
+    package = bpy.data.collections.new("EFF " + (label or "Package"))
     package.color_tag = "COLOR_04"
     package["eiem_collection_role"] = "PACKAGE"
     package["eiem_author_package"] = source
@@ -962,7 +962,7 @@ def mesh_resource_collection(root_collection, section, payload):
 
 def import_package(root, clean=False, include_physics=False, physics_file=""):
     parser = parse_ini(root)
-    collection = bpy.data.collections.get("EIEM") or bpy.data.collections.new("EIEM")
+    collection = bpy.data.collections.get("EFF") or bpy.data.collections.new("EFF")
     if collection.name not in bpy.context.scene.collection.children:
         bpy.context.scene.collection.children.link(collection)
     if clean:
@@ -1112,7 +1112,7 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
             paths = [str(skeleton.data.bones[index].get("eiem_path", skeleton.data.bones[index].name))
                      for index in palette]
             obj["eiem_bone_paths_json"] = json.dumps(paths, separators=(",", ":"))
-            modifier = obj.modifiers.get("EIEM Armature") or obj.modifiers.new("EIEM Armature", "ARMATURE")
+            modifier = obj.modifiers.get("EFF Armature") or obj.modifiers.new("EFF Armature", "ARMATURE")
             modifier.object = skeleton
             bind_mesh_weights(obj, mesh_payloads.get(values["mesh"], {}), skeleton, palette)
         for key, material_section in values.items():
@@ -1253,9 +1253,9 @@ def mesh_export_uv_channels(mesh):
             xy = [tuple(item.uv) for item in layer.data]
         zw = None
         if dimension > 2:
-            zw = get_point_attribute(mesh, "EIEM_UV%d_ZW" % channel, "vector")
+            zw = get_point_attribute(mesh, "EFF_UV%d_ZW" % channel, "vector")
             if zw is None:
-                raise ValueError("UV%d is %dD but its EIEM_UV%d_ZW attribute is missing" %
+                raise ValueError("UV%d is %dD but its EFF_UV%d_ZW attribute is missing" %
                                  (channel, dimension, channel))
         output.append((dimension, xy, zw))
     return output
@@ -1287,17 +1287,17 @@ def mesh_export_tangents(mesh, source_normals, normal_corners, preserve_normals)
     Corner frames participate in serialization splitting (mirrored UVs can
     disagree even at corners with identical position, normal and UV).
     """
-    tangent_attr = mesh.attributes.get("EIEM_Tangent")
-    sign_attr = mesh.attributes.get("EIEM_TangentSign")
+    tangent_attr = mesh.attributes.get("EFF_Tangent")
+    sign_attr = mesh.attributes.get("EFF_TangentSign")
     points = []
     if tangent_attr is not None or sign_attr is not None:
         if tangent_attr is None or sign_attr is None:
-            raise ValueError("EIEM_Tangent and EIEM_TangentSign must both be present")
+            raise ValueError("EFF_Tangent and EFF_TangentSign must both be present")
         if (tangent_attr.domain != "POINT" or tangent_attr.data_type != "FLOAT_VECTOR"
                 or sign_attr.domain != "POINT" or sign_attr.data_type != "FLOAT"):
-            raise ValueError("EIEM_Tangent/TangentSign must be POINT vector/float attributes")
-        vectors = get_point_attribute(mesh, "EIEM_Tangent", "vector")
-        signs = get_point_attribute(mesh, "EIEM_TangentSign", "value")
+            raise ValueError("EFF_Tangent/TangentSign must be POINT vector/float attributes")
+        vectors = get_point_attribute(mesh, "EFF_Tangent", "vector")
+        signs = get_point_attribute(mesh, "EFF_TangentSign", "value")
         points = [(*vector, sign) for vector, sign in zip(vectors, signs)]
 
     def usable(value):
@@ -1371,10 +1371,10 @@ def mesh_export_tangents(mesh, source_normals, normal_corners, preserve_normals)
         # loop indices.  The authored Mesh, shape keys and topology remain
         # untouched.
         if has_ngons:
-            attr_name = "__EIEM_TangentSourceLoop"
+            attr_name = "__EFF_TangentSourceLoop"
             suffix = 1
             while work.attributes.get(attr_name) is not None:
-                attr_name = "__EIEM_TangentSourceLoop.%d" % suffix
+                attr_name = "__EFF_TangentSourceLoop.%d" % suffix
                 suffix += 1
             source_attr = work.attributes.new(
                 name=attr_name, type="INT", domain="CORNER")
@@ -1482,7 +1482,7 @@ def mesh_export_tangents(mesh, source_normals, normal_corners, preserve_normals)
         missing_set = set(missing)
         corners = [generated[index] if index in missing_set else points[vertex]
                    for index, vertex in enumerate(loop_vertices)]
-    print("[EIEM] %s: tangents retained on %d corners; generated %d corners from UV0" %
+    print("[EFF] %s: tangents retained on %d corners; generated %d corners from UV0" %
           (mesh.name, len(mesh.loops) - len(missing), len(missing)))
     return points, corners
 
@@ -1494,7 +1494,7 @@ def export_blend_shapes(obj, to_source, source_vertices):
         return [], [], [], [], []
     basis = shape_keys.reference_key
     if not shape_keys.use_relative:
-        raise ValueError("EIEM 暂不支持绝对形态键，请使用相对 Basis 的形态键")
+        raise ValueError("EFF 暂不支持绝对形态键，请使用相对 Basis 的形态键")
     for key in shape_keys.key_blocks:
         if key != basis and (key.relative_key != basis or key.vertex_group):
             raise ValueError("形态键 %s 必须相对 Basis，且不能使用顶点组遮罩" % key.name)
@@ -1827,7 +1827,7 @@ def export_skin_binding(obj, armature, source_vertices):
         influences += [(0.,0)] * (4-len(influences))
         skin_by_vertex.append((tuple(w for w,i in influences),tuple(i for w,i in influences)))
     if reduced:
-        print("[EIEM] %s: %d vertices reduced to the four strongest normalized skin influences" % (obj.name,reduced))
+        print("[EFF] %s: %d vertices reduced to the four strongest normalized skin influences" % (obj.name,reduced))
     catalog = shared_bone_source_candidates(armature)
     authored_nodes = {
         record[0]: bool(source)
@@ -1863,11 +1863,11 @@ def write_mesh(path, obj):
     mesh.calc_loop_triangles()
     coordinate = mesh.get("eiem_coordinate_space", "unity-y-up-left-handed")
     to_source = blender_to_unity if is_unity_left_handed(coordinate) else (lambda value: tuple(value))
-    # EIEM stores one normal per vertex, whereas Blender evaluates custom
+    # EFF stores one normal per vertex, whereas Blender evaluates custom
     # normals per face corner. Keep the original float32 values for a lossless
     # untouched round trip; after a native Blender normal edit, export the
     # evaluated state instead of silently falling back to that backup.
-    source_normals = get_point_attribute(mesh, "EIEM_SourceNormal", "vector")
+    source_normals = get_point_attribute(mesh, "EFF_SourceNormal", "vector")
     baseline_crc = str(mesh.get("eiem_normal_baseline_crc", ""))
     preserve_normals = (source_normals is not None and baseline_crc and
                         (normal_state_crc(mesh) == baseline_crc or
@@ -2020,7 +2020,7 @@ def write_merged_mesh(output, objects):
     for obj in objects:
         mesh = obj.data
         mesh.calc_loop_triangles()
-        source_normals = get_point_attribute(mesh, "EIEM_SourceNormal", "vector")
+        source_normals = get_point_attribute(mesh, "EFF_SourceNormal", "vector")
         baseline_crc = str(mesh.get("eiem_normal_baseline_crc", ""))
         preserve_normals = (source_normals is not None and baseline_crc and
                             (normal_state_crc(mesh) == baseline_crc or
@@ -2627,7 +2627,7 @@ def resolve_material_texture(material, property_name, value, images_by_section,
 
 
 def prepare_export_root(root, incremental=False):
-    """Prepare an EIEM export root; incremental mode keeps reusable files.
+    """Prepare an EFF export root; incremental mode keeps reusable files.
 
     A normal export removes stale generated directories; incremental export
     lets the session cache prune them after materialization.
@@ -2637,7 +2637,7 @@ def prepare_export_root(root, incremental=False):
     generated = False
     if marker.is_file():
         first_line = marker.read_text(encoding="utf-8-sig", errors="replace").splitlines()[:1]
-        generated = first_line == ["; Generated by EIEM Blender add-on"]
+        generated = first_line == ["; Generated by EFF Blender add-on"]
         if generated and not incremental:
             for directory in ("meshes", "materials", "textures", "skeletons", "physics"):
                 candidate = (root / directory).resolve()
@@ -2659,11 +2659,11 @@ def _validated_mod_folder_name(value):
     """Validate the user-facing Mod folder name before joining it to a root."""
     name = str(value or "").strip()
     if not name:
-        raise ValueError("EIEM export validation failed")
+        raise ValueError("EFF export validation failed")
     if name in {".", ".."} or any(ord(char) < 32 for char in name):
-        raise ValueError("EIEM export validation failed")
+        raise ValueError("EFF export validation failed")
     if any(char in name for char in '<>:"/\\|?*') or name.rstrip(" .") != name:
-        raise ValueError("EIEM export validation failed")
+        raise ValueError("EFF export validation failed")
     return name
 
 
@@ -2693,9 +2693,9 @@ def mod_export_directory(directory, filepath=None, mod_name=None):
 
 
 def visible_eiem_resources(context=None):
-    """Return only the EIEM meshes visible in the current Blender view.
+    """Return only the EFF meshes visible in the current Blender view.
 
-    Every visible EIEM mesh is part of this temporary validation export,
+    Every visible EFF mesh is part of this temporary validation export,
     including a source mesh that the user edited in place.  Hidden meshes are
     intentionally omitted. Armatures and physics are deliberately excluded;
     this entry point is for the current mesh-only validation export.
@@ -2727,7 +2727,7 @@ def selected_eiem_resources(context=None):
         key=lambda obj: str(obj.get("eiem_section", "")),
     )
     if not meshes:
-        raise ValueError("No EIEM mesh objects selected")
+        raise ValueError("No EFF mesh objects selected")
     return meshes, armatures
 
 
@@ -2740,10 +2740,10 @@ def plan_mesh_only_export(mesh_objects):
     """
     selected = list(mesh_objects)
     if not selected:
-        raise ValueError("No EIEM mesh objects selected")
+        raise ValueError("No EFF mesh objects selected")
     if any(obj.type != "MESH" or not obj.data.get("eiem_section")
            for obj in selected):
-        raise ValueError("Selected objects contain a non-EIEM Mesh")
+        raise ValueError("Selected objects contain a non-EFF Mesh")
     sources = {obj: mesh_source_identity(obj) for obj in selected}
     for obj in selected:
         if not sources[obj][2]:
@@ -2771,8 +2771,8 @@ def selected_eiem_physics(context=None):
     context = context or bpy.context
     return sorted(
         (obj for obj in context.selected_objects
-         if obj.eiem_physics.kind == "GROUP"),
-        key=lambda obj: str(obj.eiem_physics.identity),
+         if obj.eff_physics.kind == "GROUP"),
+        key=lambda obj: str(obj.eff_physics.identity),
     )
 
 
@@ -2858,7 +2858,7 @@ def material_override_payload(material, images_by_section, force=False):
         return None, set()
 
     values = [
-        "format=EIEMMAT",
+        "format=EFFMAT",
         "version=1",
         "overrides=true",
         "source=" + source,
@@ -2921,7 +2921,7 @@ def package_physics_dependencies(plan, armatures, physics_objects):
     for obj in physics_objects or []:
         if not obj or physics_authoring.native.is_native(obj):
             raise ValueError("原生 Physics v2 目前只可作为导入、编辑和独立作者导出来源")
-        if obj.eiem_physics.kind != "GROUP":
+        if obj.eff_physics.kind != "GROUP":
             raise ValueError("组合 Mod 只能包含新增作者物理组")
         identity = obj.as_pointer()
         if identity in seen_groups:
@@ -2940,12 +2940,12 @@ def package_physics_dependencies(plan, armatures, physics_objects):
             positive_weighted_bone_names(obj))
 
     for obj in bpy.data.objects:
-        if not hasattr(obj, "eiem_physics") or obj.eiem_physics.kind != "GROUP":
+        if not hasattr(obj, "eiem_physics") or obj.eff_physics.kind != "GROUP":
             continue
-        rig = obj.eiem_physics.rig
+        rig = obj.eff_physics.rig
         if rig not in visible_rigs or obj.as_pointer() in seen_groups:
             continue
-        node_ids = {node.bone_id for node in obj.eiem_physics.nodes}
+        node_ids = {node.bone_id for node in obj.eff_physics.nodes}
         node_names = {
             bone.name for bone in rig.data.bones
             if str(bone.get("eiem_physics_id", "")) in node_ids
@@ -2956,11 +2956,11 @@ def package_physics_dependencies(plan, armatures, physics_objects):
 
     by_rig = {}
     for group in groups:
-        rig = group.eiem_physics.rig
+        rig = group.eff_physics.rig
         if not rig or rig.type != "ARMATURE":
             raise ValueError("物理组缺少共享 Rig：" + group.name)
         if not rig.get("eiem_section"):
-            raise ValueError("物理组的共享 Rig 不是 EIEM Skeleton：" + rig.name)
+            raise ValueError("物理组的共享 Rig 不是 EFF Skeleton：" + rig.name)
         if rig not in visible_rigs:
             raise ValueError("物理组没有同 Rig 的所选可见 Mesh：" + group.name)
         by_rig.setdefault(rig, []).append(group)
@@ -2968,7 +2968,7 @@ def package_physics_dependencies(plan, armatures, physics_objects):
             seen_armatures.add(rig.as_pointer())
             result_armatures.append(rig)
     for selected in by_rig.values():
-        selected.sort(key=lambda obj: obj.eiem_physics.identity)
+        selected.sort(key=lambda obj: obj.eff_physics.identity)
     return result_armatures, by_rig
 
 
@@ -2988,7 +2988,7 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
         armatures = []
         physics_objects = []
     if not mesh_objects:
-        raise ValueError("No EIEM mesh objects selected")
+        raise ValueError("No EFF mesh objects selected")
     if bpy.context.mode != "OBJECT":
         raise ValueError('请回到物体模式后导出')
     # Flush edits made through Blender's UI so the depsgraph handler can mark
@@ -3039,7 +3039,7 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
                 export_cache=export_cache)
             root, was_generated = prepare_export_root(destination, incremental=True)
             # A cache hit can leave its existing resource file in place.  Only
-            # remove stale files when this is an EIEM package we own; a newly
+            # remove stale files when this is an EFF package we own; a newly
             # selected arbitrary directory must not have its contents pruned.
             if was_generated:
                 export_cache.prune_destination()
@@ -3050,7 +3050,7 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
                 elif item.name != "mod.ini":
                     shutil.copy2(item, root / item.name)
             shutil.copy2(staging / "mod.ini", root / "mod.ini")
-            print("[EIEM] export cache: %d hits, %d misses" %
+            print("[EFF] export cache: %d hits, %d misses" %
                   (export_cache.hits, export_cache.misses))
             export_cache.hits = 0
             export_cache.misses = 0
@@ -3069,9 +3069,9 @@ def export_visible_package(root, context=None):
     """Export the current visible mesh view without rig, physics or switches."""
     meshes = visible_eiem_resources(context)
     if not meshes:
-        raise ValueError("No visible EIEM mesh objects found")
-    previous_rig = os.environ.get("EIEM_DISABLE_RIG_EXPORT")
-    os.environ["EIEM_DISABLE_RIG_EXPORT"] = "1"
+        raise ValueError("No visible EFF mesh objects found")
+    previous_rig = os.environ.get("EFF_DISABLE_RIG_EXPORT")
+    os.environ["EFF_DISABLE_RIG_EXPORT"] = "1"
     try:
         return export_package(
             root,
@@ -3082,9 +3082,9 @@ def export_visible_package(root, context=None):
         )
     finally:
         if previous_rig is None:
-            os.environ.pop("EIEM_DISABLE_RIG_EXPORT", None)
+            os.environ.pop("EFF_DISABLE_RIG_EXPORT", None)
         else:
-            os.environ["EIEM_DISABLE_RIG_EXPORT"] = previous_rig
+            os.environ["EFF_DISABLE_RIG_EXPORT"] = previous_rig
 
 
 def merged_source_keys(mesh_objects, plan):
@@ -3106,7 +3106,7 @@ def merged_source_keys(mesh_objects, plan):
 
 def rig_export_enabled():
     """Whether Skeleton/Physics resource files are emitted by this export."""
-    return os.environ.get("EIEM_DISABLE_RIG_EXPORT", "").strip() not in (
+    return os.environ.get("EFF_DISABLE_RIG_EXPORT", "").strip() not in (
         "1", "true", "yes")
 
 
@@ -3375,7 +3375,7 @@ def write_export_package(root, plan, armatures, physics_objects=None,
             original_section = str(material.get("eiem_section", ""))
             if not original_section:
                 raise ValueError(
-                    "Mesh %s material slot %d is not an EIEM material" %
+                    "Mesh %s material slot %d is not an EFF material" %
                     (obj.name, slot))
             if material not in material_sections:
                 material_sections[material] = unique_export_section(
@@ -3400,7 +3400,7 @@ def write_export_package(root, plan, armatures, physics_objects=None,
         material_payloads[section] = (material, values)
         referenced_images.update(images)
 
-    resource_lines = ["; Generated by EIEM Blender add-on", ""]
+    resource_lines = ["; Generated by EFF Blender add-on", ""]
     render_lines = []
     seen_render_sections = set()
     object_actions = {}
@@ -3698,7 +3698,7 @@ def write_export_package(root, plan, armatures, physics_objects=None,
     }
 
 
-EIEM_INTERNAL_MATERIAL_PROPERTIES = {
+EFF_INTERNAL_MATERIAL_PROPERTIES = {
     "eiem_baseline_json",
     "eiem_texture_sections_json",
     "eiem_material_file",
@@ -3738,7 +3738,7 @@ def material_property_groups(material):
     """Return stable, user-facing groups without exposing bookkeeping JSON."""
     keys = [key for key in material.keys()
             if key.startswith("eiem_") and
-            key not in EIEM_INTERNAL_MATERIAL_PROPERTIES]
+            key not in EFF_INTERNAL_MATERIAL_PROPERTIES]
     texture_paths = [key for key in keys if key.startswith("eiem_texture.")]
     texture_transforms = [
         key for key in keys
@@ -3775,9 +3775,9 @@ def material_property_label(key):
     return value
 
 
-class EIEM_OT_import_material(ImportHelper, bpy.types.Operator):
+class EFF_OT_import_material(ImportHelper, bpy.types.Operator):
     bl_idname = "eiem.import_material"
-    bl_label = '导入 EIEM 材质'
+    bl_label = '导入 EFF 材质'
     bl_options = {"REGISTER", "UNDO"}
     filter_glob: StringProperty(default="*.mat", options={"HIDDEN"})
 
@@ -3791,8 +3791,8 @@ class EIEM_OT_import_material(ImportHelper, bpy.types.Operator):
             return {"CANCELLED"}
 
 
-class EIEM_PT_material_properties(bpy.types.Panel):
-    bl_label = 'EIEM 材质'
+class EFF_PT_material_properties(bpy.types.Panel):
+    bl_label = 'EFF 材质'
     bl_idname = "MATERIAL_PT_eiem_properties"
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"
@@ -3869,7 +3869,7 @@ class EIEM_PT_material_properties(bpy.types.Panel):
                                    labels.get(key, material_property_label(key)))
 
 
-class EIEM_PG_shape_control(bpy.types.PropertyGroup):
+class EFF_PG_shape_control(bpy.types.PropertyGroup):
     shape: StringProperty(name="褰㈡€侀敭")
     enabled: BoolProperty(name='导出控制变量', default=True)
     automatic: BoolProperty(name='使用 Blender 当前权重', default=False)
@@ -3889,7 +3889,7 @@ class EIEM_PG_shape_control(bpy.types.PropertyGroup):
         description="形态键实际权重每秒向按键指定的目标变化多少")
 
 
-class EIEM_OT_shape_control(bpy.types.Operator):
+class EFF_OT_shape_control(bpy.types.Operator):
     bl_idname = "eiem.shape_control"
     bl_label = "接管当前形态键"
     bl_options = {"REGISTER", "UNDO"}
@@ -3902,7 +3902,7 @@ class EIEM_OT_shape_control(bpy.types.Operator):
             if self.sync:
                 sync_new_shape_controls(obj)
             elif self.remove_index >= 0:
-                obj.data.eiem_shape_controls.remove(self.remove_index)
+                obj.data.eff_shape_controls.remove(self.remove_index)
             else:
                 key = obj.active_shape_key
                 add_shape_control(obj, key.name if key else "")
@@ -3912,7 +3912,7 @@ class EIEM_OT_shape_control(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class EIEM_OT_shape_key_record(bpy.types.Operator):
+class EFF_OT_shape_key_record(bpy.types.Operator):
     bl_idname = "eiem.shape_key_record"
     bl_label = "褰曞埗褰㈡€侀敭鎸夐敭"
     bl_description = "为增大或减小动作录制独立按键；Esc 取消"
@@ -3933,7 +3933,7 @@ class EIEM_OT_shape_key_record(bpy.types.Operator):
             workspace.status_text_set(text=text)
 
     def _control(self, context):
-        controls = context.object.data.eiem_shape_controls
+        controls = context.object.data.eff_shape_controls
         if not 0 <= self.control_index < len(controls):
             raise ValueError("形态键控制已改变，请重新操作")
         if self.direction not in {"INCREASE", "DECREASE"}:
@@ -4015,8 +4015,8 @@ def draw_shape_hotkey_rows(layout, control, index):
         layout.label(text="增大键只到最大值；减小键只到最小值")
 
 
-class EIEM_PT_shape_controls(bpy.types.Panel):
-    bl_label = "EIEM 褰㈡€侀敭鎺у埗"
+class EFF_PT_shape_controls(bpy.types.Panel):
+    bl_label = "EFF 褰㈡€侀敭鎺у埗"
     bl_idname = "DATA_PT_eiem_shape_controls"
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"
@@ -4034,7 +4034,7 @@ class EIEM_PT_shape_controls(bpy.types.Panel):
         obj = context.object
         layout.operator("eiem.shape_control", icon="ADD")
         layout.operator("eiem.shape_control", text="刷新新增形态键列表", icon="FILE_REFRESH").sync = True
-        for index, control in enumerate(obj.data.eiem_shape_controls):
+        for index, control in enumerate(obj.data.eff_shape_controls):
             box = layout.box()
             row = box.row(align=True)
             row.prop(control, "enabled")
@@ -4060,8 +4060,8 @@ class EIEM_PT_shape_controls(bpy.types.Panel):
         layout.label(text="新增形态键会自动导出为滑块；快捷键按需设置")
 
 
-class EIEM_PT_mesh_properties(bpy.types.Panel):
-    bl_label = 'EIEM 网格'
+class EFF_PT_mesh_properties(bpy.types.Panel):
+    bl_label = 'EFF 网格'
     bl_idname = "DATA_PT_eiem_properties"
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"
@@ -4104,12 +4104,12 @@ class EIEM_PT_mesh_properties(bpy.types.Panel):
             draw_eiem_property(box, owner, key, label)
 
 
-class EIEM_PT_image_properties(bpy.types.Panel):
-    bl_label = 'EIEM 贴图'
+class EFF_PT_image_properties(bpy.types.Panel):
+    bl_label = 'EFF 贴图'
     bl_idname = "IMAGE_PT_eiem_properties"
     bl_space_type = "IMAGE_EDITOR"
     bl_region_type = "UI"
-    bl_category = "EIEM"
+    bl_category = "EFF"
 
     @classmethod
     def poll(cls, context):
@@ -4152,7 +4152,7 @@ class EIEM_PT_image_properties(bpy.types.Panel):
             draw_eiem_property(box, image, key, label)
 
 
-class EIEM_OT_switch_create(bpy.types.Operator):
+class EFF_OT_switch_create(bpy.types.Operator):
     bl_idname = "eiem.switch_create"
     bl_label = '从所选创建切换组'
     bl_options = {"REGISTER", "UNDO"}
@@ -4182,7 +4182,7 @@ class EIEM_OT_switch_create(bpy.types.Operator):
             return {'CANCELLED'}
 
 
-class EIEM_OT_switch_key_record(bpy.types.Operator):
+class EFF_OT_switch_key_record(bpy.types.Operator):
     bl_idname = "eiem.switch_key_record"
     bl_label = '录制切换按键'
     bl_description = "点击后按下键盘按键或组合键；Esc 取消"
@@ -4190,7 +4190,7 @@ class EIEM_OT_switch_key_record(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        group = context.scene.eiem_switch_active
+        group = context.scene.eff_switch_active
         return bool(group and group.get("eiem_switch_group"))
 
     def _status(self, context, text=None):
@@ -4199,7 +4199,7 @@ class EIEM_OT_switch_key_record(bpy.types.Operator):
             workspace.status_text_set(text=text)
 
     def invoke(self, context, event):
-        self._target = context.scene.eiem_switch_active
+        self._target = context.scene.eff_switch_active
         self._status(context, "录制切换按键：请按一个键或组合键；Esc 取消")
         context.window_manager.modal_handler_add(self)
         self.report({'INFO'}, "请按下要用于 %s 的游戏快捷键；Esc 取消" % self._target.name)
@@ -4231,7 +4231,7 @@ class EIEM_OT_switch_key_record(bpy.types.Operator):
         self._status(context)
 
 
-class EIEM_UL_switch_states(bpy.types.UIList):
+class EFF_UL_switch_states(bpy.types.UIList):
     """Compact, ordered outfit-state list."""
 
     def draw_item(self, context, layout, data, item, icon, active_data,
@@ -4256,7 +4256,7 @@ class EIEM_UL_switch_states(bpy.types.UIList):
         preview.action, preview.state_name = "PREVIEW", item.name
 
 
-class EIEM_OT_switch_state_drag(bpy.types.Operator):
+class EFF_OT_switch_state_drag(bpy.types.Operator):
     bl_idname = "eiem.switch_state_drag"
     bl_label = '拖动款式排序'
     bl_description = "按住并上下拖动，改变该快捷键的循环顺序"
@@ -4269,7 +4269,7 @@ class EIEM_OT_switch_state_drag(bpy.types.Operator):
             workspace.status_text_set(text=text)
 
     def invoke(self, context, event):
-        group = context.scene.eiem_switch_active
+        group = context.scene.eff_switch_active
         state = next((candidate for candidate in switch_states(group)
                       if candidate.name == self.state_name), None) if group else None
         if state is None:
@@ -4289,7 +4289,7 @@ class EIEM_OT_switch_state_drag(bpy.types.Operator):
         if event.type in {"ESC", "RIGHTMOUSE"}:
             try:
                 set_switch_state_order(self._group, self._original)
-                self._group.eiem_switch_state_index = self._original.index(
+                self._group.eff_switch_state_index = self._original.index(
                     self._state)
             except (ReferenceError, ValueError):
                 pass
@@ -4316,7 +4316,7 @@ class EIEM_OT_switch_state_drag(bpy.types.Operator):
                     self._group, self._state, current + 1)
                 self._anchor_y -= self._step
                 delta = event.mouse_y - self._anchor_y
-            self._group.eiem_switch_state_index = current
+            self._group.eff_switch_state_index = current
         except (ReferenceError, ValueError) as error:
             self._status(context)
             self.report({'ERROR'}, str(error))
@@ -4329,10 +4329,10 @@ class EIEM_OT_switch_state_drag(bpy.types.Operator):
         self._status(context)
 
 
-class EIEM_OT_switch_member_add(bpy.types.Operator):
+class EFF_OT_switch_member_add(bpy.types.Operator):
     bl_idname = "eiem.switch_member_add"
     bl_label = "加入当前组"
-    bl_description = "将当前选中的 EIEM Mesh 加入当前切换组，并放入当前款式"
+    bl_description = "将当前选中的 EFF Mesh 加入当前切换组，并放入当前款式"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -4342,10 +4342,10 @@ class EIEM_OT_switch_member_add(bpy.types.Operator):
                     context.mode == "OBJECT" and context.selected_objects)
 
     def execute(self, context):
-        group = context.scene.eiem_switch_active
+        group = context.scene.eff_switch_active
         states = switch_states(group)
         try:
-            active = states[max(0, min(group.eiem_switch_state_index,
+            active = states[max(0, min(group.eff_switch_state_index,
                                       len(states) - 1))] if states else None
             added = add_switch_members(group, context.selected_objects,
                                        context.scene, active)
@@ -4356,7 +4356,7 @@ class EIEM_OT_switch_member_add(bpy.types.Operator):
             return {"CANCELLED"}
 
 
-class EIEM_OT_switch_member_remove(bpy.types.Operator):
+class EFF_OT_switch_member_remove(bpy.types.Operator):
     bl_idname = "eiem.switch_member_remove"
     bl_label = "移出当前组"
     bl_description = "从当前切换组移出 Mesh，不删除 Blender 对象"
@@ -4369,7 +4369,7 @@ class EIEM_OT_switch_member_remove(bpy.types.Operator):
         return bool(group and group.get("eiem_switch_group"))
 
     def execute(self, context):
-        group = context.scene.eiem_switch_active
+        group = context.scene.eff_switch_active
         member = next((obj for obj in switch_members(group)
                        if obj.name == self.object_name), None)
         if member is None:
@@ -4384,7 +4384,7 @@ class EIEM_OT_switch_member_remove(bpy.types.Operator):
             return {"CANCELLED"}
 
 
-class EIEM_OT_switch_member_remove_selected(bpy.types.Operator):
+class EFF_OT_switch_member_remove_selected(bpy.types.Operator):
     bl_idname = "eiem.switch_member_remove_selected"
     bl_label = "移出所选 Mesh"
     bl_description = "从当前切换组移出当前选中的组内 Mesh"
@@ -4397,7 +4397,7 @@ class EIEM_OT_switch_member_remove_selected(bpy.types.Operator):
                     context.mode == "OBJECT" and context.selected_objects)
 
     def execute(self, context):
-        group = context.scene.eiem_switch_active
+        group = context.scene.eff_switch_active
         members = set(switch_members(group))
         selected = [obj for obj in context.selected_objects if obj in members]
         if not selected:
@@ -4412,7 +4412,7 @@ class EIEM_OT_switch_member_remove_selected(bpy.types.Operator):
             return {"CANCELLED"}
 
 
-class EIEM_OT_switch_state(bpy.types.Operator):
+class EFF_OT_switch_state(bpy.types.Operator):
     bl_idname = "eiem.switch_state"
     bl_label = "编辑切换状态"
     bl_options = {"REGISTER", "UNDO"}
@@ -4420,7 +4420,7 @@ class EIEM_OT_switch_state(bpy.types.Operator):
     state_name: StringProperty()
 
     def execute(self, context):
-        group = context.scene.eiem_switch_active
+        group = context.scene.eff_switch_active
         if not group or not group.get("eiem_switch_group"):
             return {'CANCELLED'}
         try:
@@ -4429,20 +4429,20 @@ class EIEM_OT_switch_state(bpy.types.Operator):
                 return {'FINISHED'}
             states = switch_states(group)
             if self.action == "REMOVE_ACTIVE" and states:
-                index = max(0, min(group.eiem_switch_state_index,
+                index = max(0, min(group.eff_switch_state_index,
                                    len(states) - 1))
                 state = states[index]
             else:
                 state = next((s for s in states
                               if s.name == self.state_name), None)
                 if state is None and states and not self.state_name:
-                    index = max(0, min(group.eiem_switch_state_index,
+                    index = max(0, min(group.eff_switch_state_index,
                                        len(states) - 1))
                     state = states[index]
             if self.action == "ADD":
                 state = add_switch_state(group, '款式 %d' % (len(switch_states(group)) + 1))
                 capture_switch_state(group, state, context)
-                group.eiem_switch_state_index = len(switch_states(group)) - 1
+                group.eff_switch_state_index = len(switch_states(group)) - 1
             elif self.action == "SELECT_MEMBERS":
                 bpy.ops.object.select_all(action="DESELECT")
                 for obj in switch_members(group):
@@ -4468,8 +4468,8 @@ class EIEM_OT_switch_state(bpy.types.Operator):
                 bpy.data.collections.remove(state)
                 if was_default:
                     set_switch_default(group, switch_states(group)[0])
-                group.eiem_switch_state_index = min(
-                    group.eiem_switch_state_index,
+                group.eff_switch_state_index = min(
+                    group.eff_switch_state_index,
                     len(switch_states(group)) - 1)
             return {'FINISHED'}
         except ValueError as error:
@@ -4477,7 +4477,7 @@ class EIEM_OT_switch_state(bpy.types.Operator):
             return {'CANCELLED'}
 
 
-class EIEM_OT_switch_restore(bpy.types.Operator):
+class EFF_OT_switch_restore(bpy.types.Operator):
     bl_idname = "eiem.switch_restore_preview"
     bl_label = "恢复预览前状态"
     bl_options = {"REGISTER", "UNDO"}
@@ -4487,12 +4487,12 @@ class EIEM_OT_switch_restore(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class EIEM_PT_switches(bpy.types.Panel):
+class EFF_PT_switches(bpy.types.Panel):
     bl_label = '网格切换'
     bl_idname = "VIEW3D_PT_eiem_switches"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "EIEM"
+    bl_category = "EFF"
 
     def draw(self, context):
         layout = self.layout
@@ -4508,7 +4508,7 @@ class EIEM_PT_switches(bpy.types.Panel):
                 for candidate in groups:
                     mapping.label(text="%s  →  %s" % (
                         candidate.get("eiem_key", "未设置"), candidate.name))
-        group = context.scene.eiem_switch_active
+        group = context.scene.eff_switch_active
         if group and group.get("eiem_switch_group"):
             name_row = layout.row(align=True)
             draw_eiem_rna_property(name_row, group, "name", '组名', factor=0.3)
@@ -4543,10 +4543,10 @@ class EIEM_PT_switches(bpy.types.Panel):
             states = switch_states(group)
             if states:
                 active_index = max(
-                    0, min(group.eiem_switch_state_index, len(states) - 1))
+                    0, min(group.eff_switch_state_index, len(states) - 1))
                 row = layout.row()
                 row.template_list(
-                    "EIEM_UL_switch_states", "", group, "children", group,
+                    "EFF_UL_switch_states", "", group, "children", group,
                     "eiem_switch_state_index", rows=max(3, min(7, len(states))))
                 buttons = row.column(align=True)
                 buttons.operator("eiem.switch_state", text="", icon="ADD").action = "ADD"
@@ -4587,12 +4587,12 @@ def draw_update_status(layout):
         layout.label(text="妫€鏌ュけ璐ワ細" + _update_state["message"], icon="ERROR")
 
 
-class EIEM_PT_updates(bpy.types.Panel):
-    bl_label = 'EIEM 更新'
+class EFF_PT_updates(bpy.types.Panel):
+    bl_label = 'EFF 更新'
     bl_idname = "VIEW3D_PT_eiem_updates"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "EIEM"
+    bl_category = "EFF"
 
     def draw(self, context):
         draw_update_status(self.layout)
@@ -4614,12 +4614,12 @@ def draw_lod_options(layout, operator):
         row.prop(operator, prop)
 
 
-class EIEM_OT_import(ImportHelper, bpy.types.Operator):
+class EFF_OT_import(ImportHelper, bpy.types.Operator):
     bl_idname = "eiem.import_package"
-    bl_label = "Import EIEM package"
+    bl_label = "Import EFF package"
     directory: StringProperty(subtype="DIR_PATH")
     filter_glob: StringProperty(default="mod.ini", options={"HIDDEN"})
-    clean: BoolProperty(name="Clear EIEM collection", default=False)
+    clean: BoolProperty(name="Clear EFF collection", default=False)
     include_physics: BoolProperty(name="导入物理骨骼与碰撞体", default=False,
                                  description="可选；物理数据不影响只导出 Mesh")
     physics_file: StringProperty(name="物理源文件", subtype="FILE_PATH",
@@ -4635,15 +4635,15 @@ class EIEM_OT_import(ImportHelper, bpy.types.Operator):
         try:
             root = self.directory or os.path.dirname(self.filepath)
             count = import_package(root, self.clean, self.include_physics, self.physics_file)
-            self.report({'INFO'}, "Imported %d EIEM mesh resource(s)" % count)
+            self.report({'INFO'}, "Imported %d EFF mesh resource(s)" % count)
             return {'FINISHED'}
         except Exception as error:
             self.report({'ERROR'}, str(error)); return {'CANCELLED'}
 
 
-class EIEM_OT_export(ExportHelper, bpy.types.Operator):
+class EFF_OT_export(ExportHelper, bpy.types.Operator):
     bl_idname = "eiem.export_package"
-    bl_label = "Export EIEM package"
+    bl_label = "Export EFF package"
     filename_ext = ""
     directory: StringProperty(subtype="DIR_PATH")
     scope_message: StringProperty(options={"HIDDEN"})
@@ -4692,7 +4692,7 @@ class EIEM_OT_export(ExportHelper, bpy.types.Operator):
             stats = export_package(
                 mod_export_directory(
                     self.directory or os.path.dirname(self.filepath), self.filepath,
-                    context.scene.eiem_export_mod_name),
+                    context.scene.eff_export_mod_name),
                 mesh_objects=meshes,
                 armatures=rigs,
                 physics_objects=selected_eiem_physics(context),
@@ -4708,8 +4708,8 @@ class EIEM_OT_export(ExportHelper, bpy.types.Operator):
             self.report({'ERROR'}, str(error)); return {'CANCELLED'}
 
 
-class EIEM_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
-    """Export selected EIEM meshes without Skeleton/Physics resources."""
+class EFF_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
+    """Export selected EFF meshes without Skeleton/Physics resources."""
     bl_idname = "eiem.export_mesh_only"
     bl_label = "Export Mesh Only"
     filename_ext = ""
@@ -4742,7 +4742,7 @@ class EIEM_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
             stats = export_package(
                 mod_export_directory(
                     self.directory or os.path.dirname(self.filepath), self.filepath,
-                    context.scene.eiem_export_mod_name),
+                    context.scene.eff_export_mod_name),
                 mesh_objects=meshes, armatures=[], physics_objects=[],
                 mesh_only=True, lod_levels=levels)
             self.report(
@@ -4770,7 +4770,7 @@ def _addon_preferences(context):
     return addon.preferences if addon else None
 
 
-class EIEM_AddonPreferences(bpy.types.AddonPreferences):
+class EFF_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = (__package__ or __name__).split(".")[0]
 
     ignored_release_tag: StringProperty(name="Ignored release", default="")
@@ -4779,9 +4779,9 @@ class EIEM_AddonPreferences(bpy.types.AddonPreferences):
         draw_update_status(self.layout)
 
 
-class EIEM_OT_check_update(bpy.types.Operator):
+class EFF_OT_check_update(bpy.types.Operator):
     bl_idname = "eiem.check_update"
-    bl_label = "检查 EIEM 更新"
+    bl_label = "检查 EFF 更新"
     force: BoolProperty(default=False)
 
     def execute(self, context):
@@ -4800,7 +4800,7 @@ class EIEM_OT_check_update(bpy.types.Operator):
             except Exception as error:
                 _update_state.update(status="error", message=str(error)[:120])
 
-        _update_worker = threading.Thread(target=work, name="EIEM release check", daemon=True)
+        _update_worker = threading.Thread(target=work, name="EFF release check", daemon=True)
         _update_worker.start()
 
         def redraw_when_done():
@@ -4815,9 +4815,9 @@ class EIEM_OT_check_update(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class EIEM_OT_open_update_release(bpy.types.Operator):
+class EFF_OT_open_update_release(bpy.types.Operator):
     bl_idname = "eiem.open_update_release"
-    bl_label = '打开 EIEM Release'
+    bl_label = '打开 EFF Release'
 
     def execute(self, context):
         if _update_state["status"] != "available":
@@ -4826,9 +4826,9 @@ class EIEM_OT_open_update_release(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class EIEM_OT_ignore_update_release(bpy.types.Operator):
+class EFF_OT_ignore_update_release(bpy.types.Operator):
     bl_idname = "eiem.ignore_update_release"
-    bl_label = "忽略此 EIEM 版本"
+    bl_label = "忽略此 EFF 版本"
 
     def execute(self, context):
         prefs = _addon_preferences(context)
@@ -4841,41 +4841,41 @@ class EIEM_OT_ignore_update_release(bpy.types.Operator):
 
 
 def menu_import(self, context):
-    self.layout.operator(EIEM_OT_import.bl_idname, text="EIEM Mod 包")
+    self.layout.operator(EFF_OT_import.bl_idname, text="EFF Mod 包")
 
 
 def menu_export(self, context):
-    self.layout.operator(EIEM_OT_export.bl_idname, text="EIEM Mod 包")
-    self.layout.operator(EIEM_OT_export_mesh_only.bl_idname, text='EIEM 仅网格包')
+    self.layout.operator(EFF_OT_export.bl_idname, text="EFF Mod 包")
+    self.layout.operator(EFF_OT_export_mesh_only.bl_idname, text='EFF 仅网格包')
 
 
 classes = (
-    EIEM_AddonPreferences,
-    EIEM_OT_check_update,
-    EIEM_OT_open_update_release,
-    EIEM_OT_ignore_update_release,
-    EIEM_OT_import_material,
-    EIEM_PG_shape_control,
-    EIEM_OT_shape_control,
-    EIEM_OT_shape_key_record,
-    EIEM_PT_shape_controls,
-    EIEM_OT_switch_create,
-    EIEM_OT_switch_key_record,
-    EIEM_UL_switch_states,
-    EIEM_OT_switch_state_drag,
-    EIEM_OT_switch_member_add,
-    EIEM_OT_switch_member_remove,
-    EIEM_OT_switch_member_remove_selected,
-    EIEM_OT_switch_state,
-    EIEM_OT_switch_restore,
-    EIEM_PT_switches,
-    EIEM_PT_updates,
-    EIEM_OT_import,
-    EIEM_OT_export,
-    EIEM_OT_export_mesh_only,
-    EIEM_PT_material_properties,
-    EIEM_PT_mesh_properties,
-    EIEM_PT_image_properties,
+    EFF_AddonPreferences,
+    EFF_OT_check_update,
+    EFF_OT_open_update_release,
+    EFF_OT_ignore_update_release,
+    EFF_OT_import_material,
+    EFF_PG_shape_control,
+    EFF_OT_shape_control,
+    EFF_OT_shape_key_record,
+    EFF_PT_shape_controls,
+    EFF_OT_switch_create,
+    EFF_OT_switch_key_record,
+    EFF_UL_switch_states,
+    EFF_OT_switch_state_drag,
+    EFF_OT_switch_member_add,
+    EFF_OT_switch_member_remove,
+    EFF_OT_switch_member_remove_selected,
+    EFF_OT_switch_state,
+    EFF_OT_switch_restore,
+    EFF_PT_switches,
+    EFF_PT_updates,
+    EFF_OT_import,
+    EFF_OT_export,
+    EFF_OT_export_mesh_only,
+    EFF_PT_material_properties,
+    EFF_PT_mesh_properties,
+    EFF_PT_image_properties,
 )
 
 
@@ -4885,13 +4885,13 @@ def register():
             _eiem_export_cache_depsgraph_update)
     for cls in classes: bpy.utils.register_class(cls)
     physics_authoring.register(globals())
-    bpy.types.Mesh.eiem_shape_controls = CollectionProperty(type=EIEM_PG_shape_control)
-    bpy.types.Collection.eiem_switch_state_index = IntProperty(
+    bpy.types.Mesh.eff_shape_controls = CollectionProperty(type=EFF_PG_shape_control)
+    bpy.types.Collection.eff_switch_state_index = IntProperty(
         name='当前款式', default=0, min=0)
-    bpy.types.Scene.eiem_switch_active = PointerProperty(
+    bpy.types.Scene.eff_switch_active = PointerProperty(
         name="Switch group", type=bpy.types.Collection,
         poll=lambda self, collection: bool(collection.get("eiem_switch_group")))
-    bpy.types.Scene.eiem_export_mod_name = StringProperty(
+    bpy.types.Scene.eff_export_mod_name = StringProperty(
         name="Mod folder name", default="",
         description="Create or refresh the selected Mod folder")
     bpy.types.TOPBAR_MT_file_import.append(menu_import)
@@ -4905,10 +4905,10 @@ def unregister():
     physics_authoring.unregister()
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_export)
-    del bpy.types.Scene.eiem_switch_active
-    del bpy.types.Scene.eiem_export_mod_name
-    del bpy.types.Collection.eiem_switch_state_index
-    del bpy.types.Mesh.eiem_shape_controls
+    del bpy.types.Scene.eff_switch_active
+    del bpy.types.Scene.eff_export_mod_name
+    del bpy.types.Collection.eff_switch_state_index
+    del bpy.types.Mesh.eff_shape_controls
     for cls in reversed(classes): bpy.utils.unregister_class(cls)
 
 

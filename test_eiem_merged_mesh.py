@@ -228,5 +228,5 @@ try:
 except ValueError as ex:
     assert '坐标系' in str(ex), str(ex)
 
-print('EIEM_MERGE_EXPORT_OK')
+print('EFF_MERGE_EXPORT_OK')
 addon.unregister()

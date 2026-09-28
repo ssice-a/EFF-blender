@@ -11,7 +11,7 @@ import math
 import struct
 from pathlib import Path
 
-MAGIC = b"EIEPHYS\0"
+MAGIC = b"EFFPHYS\0"
 LIMIT = 16 * 1024 * 1024
 TYPES = ("BeyondBoneCloth", "BeyondBoneSphereCollider", "BeyondBoneCapsuleCollider", "BeyondBonePlaneCollider")
 COLLIDER_REFERENCE = "$.serializeData.colliderCollisionConstraint.colliderList["

@@ -105,4 +105,4 @@ assert {parser[section]["asset"] for section in parser.sections()
         if section.lower().startswith("render")} == {"S_actor_test_lod1"}
 
 addon.unregister()
-print("EIEM_LOD_EXPORT_OK")
+print("EFF_LOD_EXPORT_OK")

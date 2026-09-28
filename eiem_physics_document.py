@@ -1,4 +1,4 @@
-"""EIEM Physics authoring interchange; contains no live native identifiers.
+"""EFF Physics authoring interchange; contains no live native identifiers.
 
 Capsule span is the distance between cap centres. Native SetSize length is
 therefore span + start radius + end radius.
@@ -8,7 +8,7 @@ import re
 import struct
 from pathlib import Path
 
-MAGIC = b"EIEPHYS\0"
+MAGIC = b"EFFPHYS\0"
 VERSION = 5  # Version 2 belongs to the native source-graph format.
 COORDINATE = "unity-y-up-left-handed"
 PARAMETERS = ("gravity", "stablizationTimeAfterReset", "gravityFalloff",

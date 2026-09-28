@@ -1,4 +1,4 @@
-"""Pure EIEM package format readers, writers, and path validation.
+"""Pure EFF package format readers, writers, and path validation.
 
 This module deliberately has no Blender dependency so protocol behavior can be
 tested and reused without starting Blender.
@@ -9,8 +9,8 @@ import math
 import struct
 from pathlib import Path
 
-MAGIC_MESH = b"EIEMESH\0"
-MAGIC_SKEL = b"EIESKEL\0"
+MAGIC_MESH = b"EFFMESH\0"
+MAGIC_SKEL = b"EFFSKEL\0"
 
 class Reader:
     def __init__(self, data):
@@ -19,7 +19,7 @@ class Reader:
 
     def take(self, size):
         if size < 0 or self.pos + size > len(self.data):
-            raise ValueError("truncated EIEM file")
+            raise ValueError("truncated EFF file")
         value = self.data[self.pos:self.pos + size]
         self.pos += size
         return value
@@ -46,20 +46,20 @@ class Reader:
                 break
             shift += 7
             if shift > 28:
-                raise ValueError("invalid EIEM string length")
+                raise ValueError("invalid EFF string length")
         return self.take(value).decode("utf-8", "replace")
 
     def floats(self):
         count = self.i32()
         if count < 0 or count > 100000000:
-            raise ValueError("invalid EIEM array length")
+            raise ValueError("invalid EFF array length")
         return self.array("f", count)
 
     def array(self, code, count):
         """Read a homogeneous block with one bounds check and unpack."""
         size = struct.calcsize("<" + code) * count
         if count < 0 or self.pos + size > len(self.data):
-            raise ValueError("truncated EIEM file")
+            raise ValueError("truncated EFF file")
         values = list(struct.unpack_from("<%d%s" % (count, code), self.data, self.pos))
         self.pos += size
         return values
@@ -69,7 +69,7 @@ class Reader:
         record = struct.Struct(layout)
         size = record.size * count
         if count < 0 or self.pos + size > len(self.data):
-            raise ValueError("truncated EIEM file")
+            raise ValueError("truncated EFF file")
         view = memoryview(self.data)[self.pos:self.pos + size]
         self.pos += size
         return record.iter_unpack(view)
@@ -123,7 +123,7 @@ class Writer:
 
 
 def parse_ini(root):
-    # Runtime Render sections may contain EIEM's conditional program syntax.
+    # Runtime Render sections may contain EFF's conditional program syntax.
     # ConfigParser accepts the indented assignments inside those blocks, but
     # bare ``if``/``endif`` statements are not INI options and make an
     # exported package impossible to import back into Blender.  The importer
@@ -183,17 +183,17 @@ def safe_path(root, relative):
     path = (Path(root) / relative).resolve()
     root = Path(root).resolve()
     if path != root and root not in path.parents:
-        raise ValueError("EIEM path escapes package directory")
+        raise ValueError("EFF path escapes package directory")
     return path
 
 
 def read_mesh(path):
     reader = Reader(path.read_bytes())
     if reader.take(8) != MAGIC_MESH:
-        raise ValueError("not an EIEM mesh")
+        raise ValueError("not an EFF mesh")
     version = reader.i32()
     if version != 6:
-        raise ValueError(f"unsupported EIEM mesh version {version}; re-export with the current AnimeStudio")
+        raise ValueError(f"unsupported EFF mesh version {version}; re-export with the current AnimeStudio")
     coordinate = reader.string()
     source = reader.string()
     name = reader.string()
@@ -264,17 +264,17 @@ def read_mesh(path):
     if len(blend_weights) != len(blend_frames):
         raise ValueError("mesh BlendShape weights do not match its frames")
     if reader.pos != len(reader.data):
-        raise ValueError("unexpected trailing EIEM mesh data")
+        raise ValueError("unexpected trailing EFF mesh data")
     return locals()
 
 
 def read_skeleton(path):
     reader = Reader(path.read_bytes())
     if reader.take(8) != MAGIC_SKEL:
-        raise ValueError("not an EIEM skeleton")
+        raise ValueError("not an EFF skeleton")
     version = reader.i32()
     if version != 2:
-        raise ValueError("unsupported EIEM skeleton version")
+        raise ValueError("unsupported EFF skeleton version")
     coordinate = reader.string()
     count = reader.i32()
     if coordinate != "unity-y-up-left-handed" or not 0 < count <= 16384:
@@ -297,7 +297,7 @@ def read_skeleton(path):
         raise ValueError("invalid skeleton provenance")
     source_nodes = [bool(flag) for flag in flags]
     if reader.pos != len(reader.data):
-        raise ValueError("unexpected trailing EIEM skeleton data")
+        raise ValueError("unexpected trailing EFF skeleton data")
     validate_skeleton_nodes(nodes, source_nodes)
     return locals()
 
