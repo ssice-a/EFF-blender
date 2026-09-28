@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 39, 2),
+    "version": (0, 39, 3),
     "blender": (3, 0, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
