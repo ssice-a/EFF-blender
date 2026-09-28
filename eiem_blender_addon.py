@@ -1818,15 +1818,20 @@ def export_skin_binding(obj, armature, source_vertices):
     if reduced:
         print("[EIEM] %s: %d vertices reduced to the four strongest normalized skin influences" % (obj.name,reduced))
     catalog = shared_bone_source_candidates(armature)
+    authored_nodes = {
+        record[0]: bool(source)
+        for _bone, record, source in skeleton_author_nodes(armature)
+    }
     source_candidates = []
     for path in paths:
         candidates = list(catalog.get(path, []))
-        if not candidates:
+        if not candidates and authored_nodes.get(path, True):
             raise ValueError(
                 "%s 骨骼 %s 没有任何原生 Mesh 供体槽；当前 Mesh 阶段不能伪造槽号"
                 % (obj.name, path))
         source_candidates.append(candidates)
-    sources = [candidates[0] for candidates in source_candidates]
+    sources = [candidates[0] if candidates else ("", "", 0)
+               for candidates in source_candidates]
     return ([skin_by_vertex[i] for i in source_vertices],
             [matrices[p] for p in paths], hashes, paths,
             armature_bone_index_paths(armature, paths), sources,
@@ -2145,9 +2150,7 @@ def write_merged_mesh(output, objects):
                 if candidate not in source_candidates[union_slot]:
                     source_candidates[union_slot].append(candidate)
     for slot, candidates in enumerate(source_candidates):
-        if not candidates:
-            raise ValueError("merged palette is missing bone source candidates")
-        sources[slot] = candidates[0]
+        sources[slot] = candidates[0] if candidates else ("", "", 0)
     if any(value is None for value in sources):
         raise ValueError("merged palette is missing bone source slots")
     channels = {part["channels"] for part in parts}

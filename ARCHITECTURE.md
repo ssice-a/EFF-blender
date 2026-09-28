@@ -1,4 +1,4 @@
-﻿# Blender 侧架构
+# Blender 侧架构
 
 EIEM Blender 是三端管线的作者端：AnimeStudio 生成 EIEM 源包，Blender 编辑并生成 Mod，EIEM DLL 在游戏中加载 Mod。
 
@@ -17,7 +17,8 @@ EIEM Blender 是三端管线的作者端：AnimeStudio 生成 EIEM 源包，Blen
 
 - 导出只处理用户选中的 EIEM 网格及其依赖，不隐式扩大到其他源资源。
 - 同一源 Mesh 的多个部件共享形态键变量；合并 Mesh 保留形态键数据和顶点偏移。
-- 骨骼路径和绑定矩阵来自资源身份，不依赖 Blender 显示名称。
+- 蒙皮槽同时导出 `bonePaths`（作者信息）和必需的 `bone_index_paths`（运行时结构身份）；运行时不依赖 Blender 显示名称。
+- 没有原生供体的新增 Rig 骨骼可以通过 Skeleton 依赖导出；普通 Mesh 导出不会伪造源槽位。
 - 导出窗口负责把包写入所选父目录的 `mod/` 子目录。
 - 更新检查只读取 GitHub Release，不自动改写插件文件。
 

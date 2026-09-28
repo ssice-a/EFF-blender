@@ -225,8 +225,8 @@ def read_mesh(path):
     bone_source_candidates = []
     for _ in range(candidate_slots):
         candidate_count = reader.i32()
-        if candidate_count <= 0 or candidate_count > 1024:
-            raise ValueError("mesh bone source slot has no candidates")
+        if candidate_count < 0 or candidate_count > 1024:
+            raise ValueError("invalid mesh bone source candidate count")
         bone_source_candidates.append([
             (reader.string(), reader.string(), reader.u32())
             for _ in range(candidate_count)
