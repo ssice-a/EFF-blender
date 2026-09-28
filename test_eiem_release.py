@@ -8,7 +8,7 @@ import eiem_release
 class ReleaseCheckTests(unittest.TestCase):
     def test_new_latest_and_ignored(self):
         payload = {"tag_name": "v0.35.0", "html_url":
-                   "https://github.com/ssice-a/EIEM-blender/releases/tag/v0.35.0"}
+                   "https://github.com/ssice-a/EFF-blender/releases/tag/v0.35.0"}
 
         def opener(request, timeout):
             self.assertEqual(timeout, 5)

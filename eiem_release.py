@@ -5,8 +5,8 @@ import re
 from urllib.request import Request, urlopen
 
 
-API_URL = "https://api.github.com/repos/ssice-a/EIEM-blender/releases/latest"
-RELEASE_PREFIX = "https://github.com/ssice-a/EIEM-blender/releases/"
+API_URL = "https://api.github.com/repos/ssice-a/EFF-blender/releases/latest"
+RELEASE_PREFIX = "https://github.com/ssice-a/EFF-blender/releases/"
 VERSION = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)$")
 
 

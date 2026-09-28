@@ -14,7 +14,7 @@ EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以
 
 ## 安装
 
-从 [Releases](https://github.com/ssice-a/EIEM-blender/releases) 下载 `EFF_Blender_v*.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。更新前先移除旧版并保存当前 `.blend` 工程。
+从 [Releases](https://github.com/ssice-a/EFF-blender/releases) 下载 `EFF_Blender_v*.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。更新前先移除旧版并保存当前 `.blend` 工程。
 
 ## 制作 Mod
 
@@ -38,4 +38,4 @@ EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以
 
 ## 鸣谢与免责声明
 
-感谢 [AnimeStudio](https://github.com/Escartem/AnimeStudio) 及其贡献者。第三方依赖的许可见 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)。插件不包含游戏资源；游戏素材版权归鹰角网络所有。使用前请阅读 [EFF 用户协议与免责声明](https://github.com/ssice-a/EIEM#用户协议与免责声明)，并自行承担使用风险。
+感谢 [AnimeStudio](https://github.com/Escartem/AnimeStudio) 及其贡献者。第三方依赖的许可见 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)。插件不包含游戏资源；游戏素材版权归鹰角网络所有。使用前请阅读 [EFF 用户协议与免责声明](https://github.com/ssice-a/EFF#用户协议与免责声明)，并自行承担使用风险。
