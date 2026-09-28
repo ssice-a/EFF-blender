@@ -17,7 +17,8 @@ EIEM Blender 是三端管线的作者端：AnimeStudio 生成 EIEM 源包，Blen
 
 - 导出只处理用户选中的 EIEM 网格及其依赖，不隐式扩大到其他源资源。
 - 同一源 Mesh 的多个部件共享形态键变量；合并 Mesh 保留形态键数据和顶点偏移。
-- 蒙皮槽同时导出 `bonePaths`（作者信息）和必需的 `bone_index_paths`（运行时结构身份）；运行时不依赖 Blender 显示名称。
+- 蒙皮槽同时导出 `bonePaths`（作者信息）和 `boneSourceCandidates`（源 Renderer 的 Mesh/槽位候选）。普通运行时绑定只使用候选表，不依赖 Blender 显示名称、rootBone 或运行时层级索引。
+- `bone_index_paths` 仍随 v6 输出，仅供显式 Mod-owned Skeleton 接口和往返编辑使用；普通 Mesh 替换不会读取它。
 - 没有原生供体的新增 Rig 骨骼可以通过 Skeleton 依赖导出；普通 Mesh 导出不会伪造源槽位。
 - 导出窗口负责把包写入所选父目录的 `mod/` 子目录。
 - 更新检查只读取 GitHub Release，不自动改写插件文件。

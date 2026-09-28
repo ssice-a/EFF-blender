@@ -256,8 +256,11 @@ def read_mesh(path):
         raise ValueError("mesh bone hierarchy-index palette does not match its bind poses")
     if bone_sources and len(bone_sources) != len(bindposes):
         raise ValueError("mesh bone source palette does not match its bind poses")
-    if bone_source_candidates and len(bone_source_candidates) != len(bindposes):
+    if skin and len(bone_source_candidates) != len(bindposes):
         raise ValueError("mesh bone source candidates do not match its bind poses")
+    if any(len(candidate) != 3 or not candidate[0] or not candidate[1]
+           for slot in bone_source_candidates for candidate in slot):
+        raise ValueError("mesh bone source candidate has an invalid identity")
     if len(blend_weights) != len(blend_frames):
         raise ValueError("mesh BlendShape weights do not match its frames")
     if reader.pos != len(reader.data):

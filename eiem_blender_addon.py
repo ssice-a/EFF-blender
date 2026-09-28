@@ -1604,8 +1604,14 @@ def _unique_source_donors(values):
                 not str(value[0]).strip() or not str(value[1]).strip()):
             continue
         try:
-            candidate = (str(value[0]), str(value[1]), int(value[2]))
+            slot = int(value[2])
         except (TypeError, ValueError):
+            continue
+        if slot < 0:
+            continue
+        candidate = (str(value[0]).replace("\\", "/").strip(),
+                     str(value[1]).strip(), slot)
+        if not candidate[0] or not candidate[1]:
             continue
         if candidate not in donors:
             donors.append(candidate)
@@ -1613,11 +1619,12 @@ def _unique_source_donors(values):
 
 
 def _source_candidates_for_object(obj, armature):
-    """Return native Mesh palette donors keyed by authored bone path.
+    """Return source Renderer palette donors keyed by authored bone path.
 
-    A replacement may add a group that was present on a sibling native Mesh.
-    The donor identity is kept as Mesh/slot metadata, never inferred from a
-    bone name or from this object's local palette order.
+    A replacement may add a group that was present on a sibling source Mesh.
+    The donor identity is kept as Mesh path/asset/slot metadata. It is never
+    inferred from a runtime Transform name or from this object's local LOD
+    order.
     """
     paths = parse_json_property(obj, "eiem_bone_paths_json", [])
     if not paths:
@@ -1672,8 +1679,12 @@ def shared_bone_source_candidates(armature):
     return records
 
 
-def armature_bone_index_paths(armature, paths):
-    """Stable Transform child-index paths for cross-prefab bone resolution."""
+def explicit_skeleton_bone_index_paths(armature, paths):
+    """Serialize paths for an explicit Mod-owned Skeleton resource.
+
+    Ordinary Mesh replacement does not use these paths. They remain in the
+    v6 payload so an explicit Skeleton can address its own generated nodes.
+    """
     bones = list(armature.data.bones)
     by_path = {record[0]: bone for bone, record, _ in skeleton_author_nodes(armature)}
     result = []
@@ -1830,11 +1841,20 @@ def export_skin_binding(obj, armature, source_vertices):
                 "%s 骨骼 %s 没有任何原生 Mesh 供体槽；当前 Mesh 阶段不能伪造槽号"
                 % (obj.name, path))
         source_candidates.append(candidates)
+    # Every exported palette slot must have a complete source identity for
+    # ordinary native Mesh replacement. Empty entries are reserved for slots
+    # supplied by an explicit Mod-owned Skeleton resource.
+    if (len(source_candidates) != len(paths) or any(
+            any(not isinstance(candidate, tuple) or len(candidate) != 3 or
+                not candidate[0] or not candidate[1] or candidate[2] < 0
+                for candidate in candidates)
+            for candidates in source_candidates)):
+        raise ValueError("%s source Renderer bone candidate table is incomplete" % obj.name)
     sources = [candidates[0] if candidates else ("", "", 0)
                for candidates in source_candidates]
     return ([skin_by_vertex[i] for i in source_vertices],
             [matrices[p] for p in paths], hashes, paths,
-            armature_bone_index_paths(armature, paths), sources,
+            explicit_skeleton_bone_index_paths(armature, paths), sources,
             source_candidates)
 
 
