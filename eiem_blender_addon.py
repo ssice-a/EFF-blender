@@ -2771,8 +2771,8 @@ def selected_eiem_physics(context=None):
     context = context or bpy.context
     return sorted(
         (obj for obj in context.selected_objects
-         if obj.eff_physics.kind == "GROUP"),
-        key=lambda obj: str(obj.eff_physics.identity),
+         if obj.eiem_physics.kind == "GROUP"),
+        key=lambda obj: str(obj.eiem_physics.identity),
     )
 
 
@@ -2921,7 +2921,7 @@ def package_physics_dependencies(plan, armatures, physics_objects):
     for obj in physics_objects or []:
         if not obj or physics_authoring.native.is_native(obj):
             raise ValueError("原生 Physics v2 目前只可作为导入、编辑和独立作者导出来源")
-        if obj.eff_physics.kind != "GROUP":
+        if obj.eiem_physics.kind != "GROUP":
             raise ValueError("组合 Mod 只能包含新增作者物理组")
         identity = obj.as_pointer()
         if identity in seen_groups:
@@ -2940,12 +2940,12 @@ def package_physics_dependencies(plan, armatures, physics_objects):
             positive_weighted_bone_names(obj))
 
     for obj in bpy.data.objects:
-        if not hasattr(obj, "eiem_physics") or obj.eff_physics.kind != "GROUP":
+        if not hasattr(obj, "eiem_physics") or obj.eiem_physics.kind != "GROUP":
             continue
-        rig = obj.eff_physics.rig
+        rig = obj.eiem_physics.rig
         if rig not in visible_rigs or obj.as_pointer() in seen_groups:
             continue
-        node_ids = {node.bone_id for node in obj.eff_physics.nodes}
+        node_ids = {node.bone_id for node in obj.eiem_physics.nodes}
         node_names = {
             bone.name for bone in rig.data.bones
             if str(bone.get("eiem_physics_id", "")) in node_ids
@@ -2956,7 +2956,7 @@ def package_physics_dependencies(plan, armatures, physics_objects):
 
     by_rig = {}
     for group in groups:
-        rig = group.eff_physics.rig
+        rig = group.eiem_physics.rig
         if not rig or rig.type != "ARMATURE":
             raise ValueError("物理组缺少共享 Rig：" + group.name)
         if not rig.get("eiem_section"):
@@ -2968,7 +2968,7 @@ def package_physics_dependencies(plan, armatures, physics_objects):
             seen_armatures.add(rig.as_pointer())
             result_armatures.append(rig)
     for selected in by_rig.values():
-        selected.sort(key=lambda obj: obj.eff_physics.identity)
+        selected.sort(key=lambda obj: obj.eiem_physics.identity)
     return result_armatures, by_rig
 
 
@@ -3902,7 +3902,7 @@ class EFF_OT_shape_control(bpy.types.Operator):
             if self.sync:
                 sync_new_shape_controls(obj)
             elif self.remove_index >= 0:
-                obj.data.eff_shape_controls.remove(self.remove_index)
+                obj.data.eiem_shape_controls.remove(self.remove_index)
             else:
                 key = obj.active_shape_key
                 add_shape_control(obj, key.name if key else "")
@@ -3933,7 +3933,7 @@ class EFF_OT_shape_key_record(bpy.types.Operator):
             workspace.status_text_set(text=text)
 
     def _control(self, context):
-        controls = context.object.data.eff_shape_controls
+        controls = context.object.data.eiem_shape_controls
         if not 0 <= self.control_index < len(controls):
             raise ValueError("形态键控制已改变，请重新操作")
         if self.direction not in {"INCREASE", "DECREASE"}:
@@ -4034,7 +4034,7 @@ class EFF_PT_shape_controls(bpy.types.Panel):
         obj = context.object
         layout.operator("eiem.shape_control", icon="ADD")
         layout.operator("eiem.shape_control", text="刷新新增形态键列表", icon="FILE_REFRESH").sync = True
-        for index, control in enumerate(obj.data.eff_shape_controls):
+        for index, control in enumerate(obj.data.eiem_shape_controls):
             box = layout.box()
             row = box.row(align=True)
             row.prop(control, "enabled")
@@ -4190,7 +4190,7 @@ class EFF_OT_switch_key_record(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        group = context.scene.eff_switch_active
+        group = context.scene.eiem_switch_active
         return bool(group and group.get("eiem_switch_group"))
 
     def _status(self, context, text=None):
@@ -4199,7 +4199,7 @@ class EFF_OT_switch_key_record(bpy.types.Operator):
             workspace.status_text_set(text=text)
 
     def invoke(self, context, event):
-        self._target = context.scene.eff_switch_active
+        self._target = context.scene.eiem_switch_active
         self._status(context, "录制切换按键：请按一个键或组合键；Esc 取消")
         context.window_manager.modal_handler_add(self)
         self.report({'INFO'}, "请按下要用于 %s 的游戏快捷键；Esc 取消" % self._target.name)
@@ -4269,7 +4269,7 @@ class EFF_OT_switch_state_drag(bpy.types.Operator):
             workspace.status_text_set(text=text)
 
     def invoke(self, context, event):
-        group = context.scene.eff_switch_active
+        group = context.scene.eiem_switch_active
         state = next((candidate for candidate in switch_states(group)
                       if candidate.name == self.state_name), None) if group else None
         if state is None:
@@ -4289,7 +4289,7 @@ class EFF_OT_switch_state_drag(bpy.types.Operator):
         if event.type in {"ESC", "RIGHTMOUSE"}:
             try:
                 set_switch_state_order(self._group, self._original)
-                self._group.eff_switch_state_index = self._original.index(
+                self._group.eiem_switch_state_index = self._original.index(
                     self._state)
             except (ReferenceError, ValueError):
                 pass
@@ -4316,7 +4316,7 @@ class EFF_OT_switch_state_drag(bpy.types.Operator):
                     self._group, self._state, current + 1)
                 self._anchor_y -= self._step
                 delta = event.mouse_y - self._anchor_y
-            self._group.eff_switch_state_index = current
+            self._group.eiem_switch_state_index = current
         except (ReferenceError, ValueError) as error:
             self._status(context)
             self.report({'ERROR'}, str(error))
@@ -4342,10 +4342,10 @@ class EFF_OT_switch_member_add(bpy.types.Operator):
                     context.mode == "OBJECT" and context.selected_objects)
 
     def execute(self, context):
-        group = context.scene.eff_switch_active
+        group = context.scene.eiem_switch_active
         states = switch_states(group)
         try:
-            active = states[max(0, min(group.eff_switch_state_index,
+            active = states[max(0, min(group.eiem_switch_state_index,
                                       len(states) - 1))] if states else None
             added = add_switch_members(group, context.selected_objects,
                                        context.scene, active)
@@ -4369,7 +4369,7 @@ class EFF_OT_switch_member_remove(bpy.types.Operator):
         return bool(group and group.get("eiem_switch_group"))
 
     def execute(self, context):
-        group = context.scene.eff_switch_active
+        group = context.scene.eiem_switch_active
         member = next((obj for obj in switch_members(group)
                        if obj.name == self.object_name), None)
         if member is None:
@@ -4397,7 +4397,7 @@ class EFF_OT_switch_member_remove_selected(bpy.types.Operator):
                     context.mode == "OBJECT" and context.selected_objects)
 
     def execute(self, context):
-        group = context.scene.eff_switch_active
+        group = context.scene.eiem_switch_active
         members = set(switch_members(group))
         selected = [obj for obj in context.selected_objects if obj in members]
         if not selected:
@@ -4420,7 +4420,7 @@ class EFF_OT_switch_state(bpy.types.Operator):
     state_name: StringProperty()
 
     def execute(self, context):
-        group = context.scene.eff_switch_active
+        group = context.scene.eiem_switch_active
         if not group or not group.get("eiem_switch_group"):
             return {'CANCELLED'}
         try:
@@ -4429,20 +4429,20 @@ class EFF_OT_switch_state(bpy.types.Operator):
                 return {'FINISHED'}
             states = switch_states(group)
             if self.action == "REMOVE_ACTIVE" and states:
-                index = max(0, min(group.eff_switch_state_index,
+                index = max(0, min(group.eiem_switch_state_index,
                                    len(states) - 1))
                 state = states[index]
             else:
                 state = next((s for s in states
                               if s.name == self.state_name), None)
                 if state is None and states and not self.state_name:
-                    index = max(0, min(group.eff_switch_state_index,
+                    index = max(0, min(group.eiem_switch_state_index,
                                        len(states) - 1))
                     state = states[index]
             if self.action == "ADD":
                 state = add_switch_state(group, '款式 %d' % (len(switch_states(group)) + 1))
                 capture_switch_state(group, state, context)
-                group.eff_switch_state_index = len(switch_states(group)) - 1
+                group.eiem_switch_state_index = len(switch_states(group)) - 1
             elif self.action == "SELECT_MEMBERS":
                 bpy.ops.object.select_all(action="DESELECT")
                 for obj in switch_members(group):
@@ -4468,8 +4468,8 @@ class EFF_OT_switch_state(bpy.types.Operator):
                 bpy.data.collections.remove(state)
                 if was_default:
                     set_switch_default(group, switch_states(group)[0])
-                group.eff_switch_state_index = min(
-                    group.eff_switch_state_index,
+                group.eiem_switch_state_index = min(
+                    group.eiem_switch_state_index,
                     len(switch_states(group)) - 1)
             return {'FINISHED'}
         except ValueError as error:
@@ -4508,7 +4508,7 @@ class EFF_PT_switches(bpy.types.Panel):
                 for candidate in groups:
                     mapping.label(text="%s  →  %s" % (
                         candidate.get("eiem_key", "未设置"), candidate.name))
-        group = context.scene.eff_switch_active
+        group = context.scene.eiem_switch_active
         if group and group.get("eiem_switch_group"):
             name_row = layout.row(align=True)
             draw_eiem_rna_property(name_row, group, "name", '组名', factor=0.3)
@@ -4543,7 +4543,7 @@ class EFF_PT_switches(bpy.types.Panel):
             states = switch_states(group)
             if states:
                 active_index = max(
-                    0, min(group.eff_switch_state_index, len(states) - 1))
+                    0, min(group.eiem_switch_state_index, len(states) - 1))
                 row = layout.row()
                 row.template_list(
                     "EFF_UL_switch_states", "", group, "children", group,
@@ -4692,7 +4692,7 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
             stats = export_package(
                 mod_export_directory(
                     self.directory or os.path.dirname(self.filepath), self.filepath,
-                    context.scene.eff_export_mod_name),
+                    context.scene.eiem_export_mod_name),
                 mesh_objects=meshes,
                 armatures=rigs,
                 physics_objects=selected_eiem_physics(context),
@@ -4742,7 +4742,7 @@ class EFF_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
             stats = export_package(
                 mod_export_directory(
                     self.directory or os.path.dirname(self.filepath), self.filepath,
-                    context.scene.eff_export_mod_name),
+                    context.scene.eiem_export_mod_name),
                 mesh_objects=meshes, armatures=[], physics_objects=[],
                 mesh_only=True, lod_levels=levels)
             self.report(
@@ -4885,13 +4885,13 @@ def register():
             _eiem_export_cache_depsgraph_update)
     for cls in classes: bpy.utils.register_class(cls)
     physics_authoring.register(globals())
-    bpy.types.Mesh.eff_shape_controls = CollectionProperty(type=EFF_PG_shape_control)
-    bpy.types.Collection.eff_switch_state_index = IntProperty(
+    bpy.types.Mesh.eiem_shape_controls = CollectionProperty(type=EFF_PG_shape_control)
+    bpy.types.Collection.eiem_switch_state_index = IntProperty(
         name='当前款式', default=0, min=0)
-    bpy.types.Scene.eff_switch_active = PointerProperty(
+    bpy.types.Scene.eiem_switch_active = PointerProperty(
         name="Switch group", type=bpy.types.Collection,
         poll=lambda self, collection: bool(collection.get("eiem_switch_group")))
-    bpy.types.Scene.eff_export_mod_name = StringProperty(
+    bpy.types.Scene.eiem_export_mod_name = StringProperty(
         name="Mod folder name", default="",
         description="Create or refresh the selected Mod folder")
     bpy.types.TOPBAR_MT_file_import.append(menu_import)
@@ -4905,10 +4905,10 @@ def unregister():
     physics_authoring.unregister()
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_export)
-    del bpy.types.Scene.eff_switch_active
-    del bpy.types.Scene.eff_export_mod_name
-    del bpy.types.Collection.eff_switch_state_index
-    del bpy.types.Mesh.eff_shape_controls
+    del bpy.types.Scene.eiem_switch_active
+    del bpy.types.Scene.eiem_export_mod_name
+    del bpy.types.Collection.eiem_switch_state_index
+    del bpy.types.Mesh.eiem_shape_controls
     for cls in reversed(classes): bpy.utils.unregister_class(cls)
 
 
