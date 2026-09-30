@@ -528,6 +528,106 @@ def get_point_attribute(mesh, name, member):
             for item in attribute.data]
 
 
+# Blender's native UV layers are only two-dimensional.  EFF meshes may carry
+# Z/W components and authored tangent frames, so those extra streams live in
+# regular POINT attributes.  The mapping below is author data: it records
+# which attribute belongs to which semantic/UV slot instead of making export
+# depend on an attribute's display name.  Names are kept only for Blender's
+# UI and for compatibility with older .blend files.
+AUTHOR_ATTRIBUTE_MAP = "author_attribute_map_json"
+UV_SLOT_MAP = "author_uv_slots_json"
+LEGACY_ATTRIBUTE_MAP = "eff_attribute_map_json"
+LEGACY_UV_SLOT_MAP = "eff_uv_slots_json"
+AUTHOR_UV_DIMENSIONS = "author_uv_dimensions_json"
+SOURCE_NORMAL_ATTRIBUTE = "SourceNormal"
+TANGENT_ATTRIBUTE = "Tangent"
+TANGENT_SIGN_ATTRIBUTE = "TangentSign"
+
+
+def _attribute_map(mesh):
+    value = parse_json_property(mesh, AUTHOR_ATTRIBUTE_MAP, None)
+    if value is None:
+        value = parse_json_property(mesh, LEGACY_ATTRIBUTE_MAP, {})
+    return value if isinstance(value, dict) else {}
+
+
+def _attribute_map_name(mesh, category, key):
+    mapping = _attribute_map(mesh)
+    values = mapping.get(category, {})
+    if not isinstance(values, dict):
+        return ""
+    value = values.get(str(key), "")
+    return str(value) if value else ""
+
+
+def _attribute_is_point(mesh, name, data_type=None):
+    attribute = mesh.attributes.get(name) if name else None
+    if attribute is None or attribute.domain != "POINT":
+        return False
+    if len(attribute.data) != len(mesh.vertices):
+        return False
+    return data_type is None or attribute.data_type == data_type
+
+
+def resolve_author_attribute(mesh, category, key, data_type=None):
+    """Resolve an authored attribute through its semantic mapping.
+
+    Imported meshes carry the mapping in ``author_attribute_map_json``.  When
+    an older .blend has no map, use the semantic suffix only as a one-time
+    compatibility fallback; the normal export path never requires a project
+    prefix in the attribute name.
+    """
+    mapped = _attribute_map_name(mesh, category, key)
+    if _attribute_is_point(mesh, mapped, data_type):
+        return mapped
+
+    if category == "uv_zw":
+        channel = int(key)
+        aliases = {
+            "UV%d_ZW" % channel,
+            "EFF_UV%d_ZW" % channel,
+        }
+        suffix = "_uv%d_zw" % channel
+        candidates = [
+            attribute.name for attribute in mesh.attributes
+            if attribute.domain == "POINT"
+            and (data_type is None or attribute.data_type == data_type)
+            and (attribute.name in aliases
+                 or attribute.name.casefold().endswith(suffix))
+        ]
+    else:
+        aliases = {
+            "source_normal": {"SourceNormal", "EFF_SourceNormal"},
+            "tangent": {"Tangent", "EFF_Tangent"},
+            "tangent_sign": {"TangentSign", "EFF_TangentSign"},
+        }.get(str(key), set())
+        candidates = [
+            attribute.name for attribute in mesh.attributes
+            if attribute.domain == "POINT"
+            and (data_type is None or attribute.data_type == data_type)
+            and attribute.name in aliases
+        ]
+    for candidate in candidates:
+        if _attribute_is_point(mesh, candidate, data_type):
+            return candidate
+    return ""
+
+
+def _set_author_attribute(mesh, category, key, name, data_type, values, member):
+    attribute = set_point_attribute(mesh, name, data_type, values, member)
+    mapping = _attribute_map(mesh)
+    mapping.setdefault(category, {})[str(key)] = attribute.name
+    mesh[AUTHOR_ATTRIBUTE_MAP] = json.dumps(mapping, separators=(",", ":"))
+    return attribute
+
+
+def _uv_slot_records(mesh):
+    value = parse_json_property(mesh, UV_SLOT_MAP, None)
+    if value is None:
+        value = parse_json_property(mesh, LEGACY_UV_SLOT_MAP, [])
+    return value if isinstance(value, list) else []
+
+
 def normal_state_crc(mesh):
     """Fingerprint Blender's currently evaluated per-corner normals.
 
@@ -697,7 +797,9 @@ def make_mesh(section, payload):
         mesh.update()
         # Lossless round-trip backup only. Viewport shading and normal-editing
         # tools use the native custom split normals set above.
-        set_point_attribute(mesh, "EFF_SourceNormal", "FLOAT_VECTOR", normals, "vector")
+        _set_author_attribute(
+            mesh, "point", "source_normal", SOURCE_NORMAL_ATTRIBUTE,
+            "FLOAT_VECTOR", normals, "vector")
     if len(payload["tangents"]) == count * 4:
         tangents = []
         signs = []
@@ -707,10 +809,15 @@ def make_mesh(section, payload):
                 tangent = unity_to_blender(tangent)
             tangents.append(tangent)
             signs.append(float(payload["tangents"][index * 4 + 3]))
-        set_point_attribute(mesh, "EFF_Tangent", "FLOAT_VECTOR", tangents, "vector")
-        set_point_attribute(mesh, "EFF_TangentSign", "FLOAT", signs, "value")
+        _set_author_attribute(
+            mesh, "point", "tangent", TANGENT_ATTRIBUTE,
+            "FLOAT_VECTOR", tangents, "vector")
+        _set_author_attribute(
+            mesh, "point", "tangent_sign", TANGENT_SIGN_ATTRIBUTE,
+            "FLOAT", signs, "value")
 
     uv_dimensions = []
+    uv_slots = []
     for channel, values in enumerate(payload["uvs"]):
         if not values:
             uv_dimensions.append(0)
@@ -737,10 +844,24 @@ def make_mesh(section, payload):
                 start = vertex * dimension
                 extras.append((float(values[start + 2]),
                                float(values[start + 3]) if dimension == 4 else 0.0))
-            set_point_attribute(mesh, "EFF_UV%d_ZW" % channel, "FLOAT2", extras, "vector")
+            attribute_name = "UV%d_ZW" % channel
+            _set_author_attribute(
+                mesh, "uv_zw", channel, attribute_name,
+                "FLOAT2", extras, "vector")
+        else:
+            attribute_name = ""
+        uv_slots.append({
+            "channel": channel,
+            "layer": layer.name,
+            "dimension": dimension,
+            "zw": attribute_name,
+        })
     while len(uv_dimensions) < 8:
         uv_dimensions.append(0)
+    mesh[AUTHOR_UV_DIMENSIONS] = json.dumps(uv_dimensions, separators=(",", ":"))
+    # Keep the old key for .blend files and tools that still inspect it.
     mesh["eiem_uv_dimensions_json"] = json.dumps(uv_dimensions, separators=(",", ":"))
+    mesh[UV_SLOT_MAP] = json.dumps(uv_slots, separators=(",", ":"))
 
     colors = payload["colors"]
     if len(colors) >= count * 4 and hasattr(mesh, "color_attributes"):
@@ -756,7 +877,7 @@ def make_mesh(section, payload):
     else:
         for polygon, submesh in zip(mesh.polygons, face_submesh):
             polygon.material_index = submesh
-    if "EFF_SourceNormal" in mesh.attributes:
+    if resolve_author_attribute(mesh, "point", "source_normal", "FLOAT_VECTOR"):
         mesh["eiem_normal_baseline_crc"] = normal_state_crc(mesh)
     return mesh
 
@@ -1234,15 +1355,38 @@ def export_corner_map(mesh, channels):
 
 
 def mesh_export_uv_channels(mesh):
-    """Read named, possibly sparse UV channels without collapsing corners."""
-    dimensions = parse_json_property(mesh, "eiem_uv_dimensions_json", [])
+    """Read mapped, possibly sparse UV channels without collapsing corners."""
+    dimensions = parse_json_property(mesh, AUTHOR_UV_DIMENSIONS, [])
+    if not dimensions:
+        # Compatibility for .blend files authored before the mapping metadata.
+        dimensions = parse_json_property(mesh, "eiem_uv_dimensions_json", [])
+    slots = {}
+    for record in _uv_slot_records(mesh):
+        try:
+            slots[int(record["channel"])] = record
+        except (KeyError, TypeError, ValueError):
+            continue
+    named_slots = any(
+        re.fullmatch(r"UV\d+", str(layer.name), re.IGNORECASE)
+        for layer in mesh.uv_layers
+    )
     output = []
     for channel in range(8):
-        layer = mesh.uv_layers.get("UV%d" % channel)
+        record = slots.get(channel, {})
+        layer = mesh.uv_layers.get(str(record.get("layer", "")))
+        if layer is None:
+            # Legacy fallback: the old importer encoded sparse slots in the
+            # layer name.  If that is absent, use the native layer order.
+            layer = mesh.uv_layers.get("UV%d" % channel)
+        if layer is None and not slots and not named_slots and channel < len(mesh.uv_layers):
+            layer = mesh.uv_layers[channel]
         if layer is None:
             output.append(None)
             continue
-        dimension = int(dimensions[channel]) if channel < len(dimensions) and dimensions[channel] else 2
+        dimension = int(record.get(
+            "dimension",
+            dimensions[channel] if channel < len(dimensions) and dimensions[channel] else 2,
+        ))
         if dimension < 2 or dimension > 4:
             raise ValueError("UV%d uses unsupported dimension %d" % (channel, dimension))
         if hasattr(layer.data, "foreach_get"):
@@ -1253,10 +1397,17 @@ def mesh_export_uv_channels(mesh):
             xy = [tuple(item.uv) for item in layer.data]
         zw = None
         if dimension > 2:
-            zw = get_point_attribute(mesh, "EFF_UV%d_ZW" % channel, "vector")
+            attribute_name = str(record.get("zw", ""))
+            if not attribute_name:
+                attribute_name = resolve_author_attribute(
+                    mesh, "uv_zw", channel, "FLOAT2")
+            zw = get_point_attribute(mesh, attribute_name, "vector")
             if zw is None:
-                raise ValueError("UV%d is %dD but its EFF_UV%d_ZW attribute is missing" %
-                                 (channel, dimension, channel))
+                # Blender's native UV layer is always a valid 2D source.  A
+                # missing Z/W author attribute therefore exports the data we
+                # actually have instead of failing because an old custom
+                # attribute name disappeared during a .blend migration.
+                dimension = 2
         output.append((dimension, xy, zw))
     return output
 
@@ -1287,17 +1438,21 @@ def mesh_export_tangents(mesh, source_normals, normal_corners, preserve_normals)
     Corner frames participate in serialization splitting (mirrored UVs can
     disagree even at corners with identical position, normal and UV).
     """
-    tangent_attr = mesh.attributes.get("EFF_Tangent")
-    sign_attr = mesh.attributes.get("EFF_TangentSign")
+    tangent_name = resolve_author_attribute(
+        mesh, "point", "tangent", "FLOAT_VECTOR")
+    sign_name = resolve_author_attribute(
+        mesh, "point", "tangent_sign", "FLOAT")
+    tangent_attr = mesh.attributes.get(tangent_name) if tangent_name else None
+    sign_attr = mesh.attributes.get(sign_name) if sign_name else None
     points = []
     if tangent_attr is not None or sign_attr is not None:
         if tangent_attr is None or sign_attr is None:
-            raise ValueError("EFF_Tangent and EFF_TangentSign must both be present")
+            raise ValueError("Tangent and TangentSign author attributes must both be present")
         if (tangent_attr.domain != "POINT" or tangent_attr.data_type != "FLOAT_VECTOR"
                 or sign_attr.domain != "POINT" or sign_attr.data_type != "FLOAT"):
-            raise ValueError("EFF_Tangent/TangentSign must be POINT vector/float attributes")
-        vectors = get_point_attribute(mesh, "EFF_Tangent", "vector")
-        signs = get_point_attribute(mesh, "EFF_TangentSign", "value")
+            raise ValueError("Tangent/TangentSign must be POINT vector/float attributes")
+        vectors = get_point_attribute(mesh, tangent_name, "vector")
+        signs = get_point_attribute(mesh, sign_name, "value")
         points = [(*vector, sign) for vector, sign in zip(vectors, signs)]
 
     def usable(value):
@@ -1867,7 +2022,9 @@ def write_mesh(path, obj):
     # normals per face corner. Keep the original float32 values for a lossless
     # untouched round trip; after a native Blender normal edit, export the
     # evaluated state instead of silently falling back to that backup.
-    source_normals = get_point_attribute(mesh, "EFF_SourceNormal", "vector")
+    source_normal_name = resolve_author_attribute(
+        mesh, "point", "source_normal", "FLOAT_VECTOR")
+    source_normals = get_point_attribute(mesh, source_normal_name, "vector")
     baseline_crc = str(mesh.get("eiem_normal_baseline_crc", ""))
     preserve_normals = (source_normals is not None and baseline_crc and
                         (normal_state_crc(mesh) == baseline_crc or
@@ -2020,7 +2177,9 @@ def write_merged_mesh(output, objects):
     for obj in objects:
         mesh = obj.data
         mesh.calc_loop_triangles()
-        source_normals = get_point_attribute(mesh, "EFF_SourceNormal", "vector")
+        source_normal_name = resolve_author_attribute(
+            mesh, "point", "source_normal", "FLOAT_VECTOR")
+        source_normals = get_point_attribute(mesh, source_normal_name, "vector")
         baseline_crc = str(mesh.get("eiem_normal_baseline_crc", ""))
         preserve_normals = (source_normals is not None and baseline_crc and
                             (normal_state_crc(mesh) == baseline_crc or

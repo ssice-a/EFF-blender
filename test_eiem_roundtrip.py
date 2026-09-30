@@ -89,12 +89,12 @@ for section, payload in mesh_payloads.items():
     assert len(obj.data.uv_layers) == sum(value >= 2 for value in dimensions)
     for channel, dimension in enumerate(dimensions):
         if dimension > 2:
-            assert f"EFF_UV{channel}_ZW" in obj.data.attributes
+            assert f"UV{channel}_ZW" in obj.data.attributes
     if payload["normals"]:
         assert all(polygon.use_smooth for polygon in obj.data.polygons), (
             section, "source normals require smooth faces"
         )
-        assert "EFF_SourceNormal" in obj.data.attributes, (section, "normal backup")
+        assert "SourceNormal" in obj.data.attributes, (section, "normal backup")
         assert "EFF_Normal" not in obj.data.attributes, (section, "legacy fake normal")
         assert obj.data.get("eiem_normal_baseline_crc") == addon.normal_state_crc(obj.data), (
             section, "normal baseline"
@@ -117,8 +117,8 @@ for section, payload in mesh_payloads.items():
                     section, "custom normal", loop.index, alignment
                 )
     if payload["tangents"]:
-        assert "EFF_Tangent" in obj.data.attributes
-        assert "EFF_TangentSign" in obj.data.attributes
+        assert "Tangent" in obj.data.attributes
+        assert "TangentSign" in obj.data.attributes
     if payload["colors"]:
         assert "Color" in obj.data.color_attributes
     expected_shapes = sum(channel[3] for channel in payload["blend_channels"])
