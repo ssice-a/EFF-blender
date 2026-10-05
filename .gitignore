@@ -7,3 +7,7 @@ __pycache__/
 *.blend2
 dist/
 release/
+# Bundled native exporter modules and ABI-specific dependencies are built from
+# the canonical tools/nativepack source and bin/author-core output.
+nativepack/
+vendor/

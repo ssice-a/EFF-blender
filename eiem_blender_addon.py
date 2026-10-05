@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import struct
+import sys
 import zlib
 import tempfile
 import math
@@ -26,7 +27,7 @@ from collections import defaultdict
 
 import bpy
 import bmesh
-from bpy.props import StringProperty, BoolProperty, PointerProperty, FloatProperty, IntProperty, CollectionProperty
+from bpy.props import StringProperty, BoolProperty, PointerProperty, FloatProperty, IntProperty, CollectionProperty, EnumProperty
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 from mathutils import Matrix, Quaternion, Vector
 
@@ -2013,7 +2014,7 @@ def export_skin_binding(obj, armature, source_vertices):
             source_candidates)
 
 
-def write_mesh(path, obj):
+def write_mesh(path, obj, return_snapshot=False):
     mesh = obj.data
     mesh.calc_loop_triangles()
     coordinate = mesh.get("eiem_coordinate_space", "unity-y-up-left-handed")
@@ -2100,6 +2101,18 @@ def write_mesh(path, obj):
         obj, armature, source_vertices)
     blend_vertices, blend_frames, blend_channels, blend_weights, additional = export_blend_shapes(obj, to_source, source_vertices)
 
+    if return_snapshot:
+        # Same corner/skin/shape mapping as the editable writer, without an
+        # intermediate author file or merged-submesh runtime workaround.
+        return dict(vertex_count=len(source_vertices), vertices=vertices,
+                    normals=normals, tangents=tangents, colors=colors, uvs=uv_layers,
+                    indices=indices, index_count=len(indices), submeshes=submeshes,
+                    skin=skin, bindposes=bindposes, bone_hashes=bone_hashes,
+                    bone_paths=bone_paths, bone_index_paths=bone_index_paths,
+                    bone_sources=bone_sources, bone_source_candidates=bone_source_candidates,
+                    blend_vertices=blend_vertices, blend_frames=blend_frames,
+                    blend_channels=blend_channels, blend_weights=blend_weights,
+                    additional=additional)
     writer = Writer(); writer.raw(MAGIC_MESH); writer.i32(6)
     writer.string(coordinate)
     writer.string(obj.data.get("eiem_source", "")); writer.string(obj.data.get("eiem_asset", obj.name))
@@ -4806,6 +4819,12 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
     filename_ext = ""
     directory: StringProperty(subtype="DIR_PATH")
     scope_message: StringProperty(options={"HIDDEN"})
+    resource_scope: EnumProperty(
+        name='导出资源', default='ALL',
+        items=(('ALL', '全部资源', '导出所选网格及其材质、贴图、控制配置'),
+               ('MESH', '仅 Mesh', '更新已有 Mod 中所选网格的几何、骨骼与形态数据'),
+               ('MATERIALS', '仅材质与贴图', '更新所选网格引用的材质、贴图及 INI 声明'),
+               ('TEXTURES', '仅贴图', '读取最新图片，更新贴图及绑定声明')))
     include_switches: BoolProperty(
         name='导出按键切换', default=True,
         description="导出款式切换及快捷键；取消后只导出默认款式，保留形态键与滑块控制")
@@ -4840,22 +4859,28 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
     def draw(self, context):
         self.layout.label(text=self.scope_message)
         self.layout.prop(context.scene, "eiem_export_mod_name", text='Mod 文件夹名')
-        self.layout.prop(self, "include_switches")
-        draw_lod_options(self.layout, self)
-        self.layout.label(text="选择父目录，并在文件名中填写 Mod 文件夹名；插件会自动创建该文件夹")
+        self.layout.prop(context.scene, "eiem_source_baseline", text='原生来源目录')
+        self.layout.prop(self, "resource_scope")
+        if self.resource_scope == 'ALL':
+            self.layout.prop(self, "include_switches")
+            draw_lod_options(self.layout, self)
 
     def execute(self, context):
         try:
             meshes, rigs = selected_eiem_resources(context)
-            levels = self._lod_levels(meshes)
-            stats = export_package(
+            levels = self._lod_levels(meshes) if self.resource_scope == 'ALL' else None
+            from .eiem_native_export import export_native_package
+            stats = export_native_package(
+                sys.modules[__name__],
                 mod_export_directory(
                     self.directory or os.path.dirname(self.filepath), self.filepath,
                     context.scene.eiem_export_mod_name),
                 mesh_objects=meshes,
                 armatures=rigs,
-                physics_objects=selected_eiem_physics(context),
-                lod_levels=levels, include_switches=self.include_switches)
+                physics_objects=selected_eiem_physics(context) if self.resource_scope == 'ALL' else [],
+                lod_levels=levels, include_switches=self.include_switches,
+                source_baseline=context.scene.eiem_source_baseline,
+                resource_scope=self.resource_scope)
             self.report(
                 {'INFO'},
                 "Exported %(meshes)d Mesh, %(materials)d Material, "
@@ -4868,7 +4893,7 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
 
 
 class EFF_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
-    """Export selected EFF meshes without Skeleton/Physics resources."""
+    """Update Mesh resources in an existing complete Mod."""
     bl_idname = "eiem.export_mesh_only"
     bl_label = "Export Mesh Only"
     filename_ext = ""
@@ -4898,12 +4923,15 @@ class EFF_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
         try:
             meshes, _ = selected_eiem_resources(context)
             levels = self._lod_levels(meshes)
-            stats = export_package(
+            from .eiem_native_export import export_native_package
+            stats = export_native_package(
+                sys.modules[__name__],
                 mod_export_directory(
                     self.directory or os.path.dirname(self.filepath), self.filepath,
                     context.scene.eiem_export_mod_name),
                 mesh_objects=meshes, armatures=[], physics_objects=[],
-                mesh_only=True, lod_levels=levels)
+                resource_scope='MESH', lod_levels=levels,
+                source_baseline=context.scene.eiem_source_baseline)
             self.report(
                 {'INFO'},
                 "Exported %(meshes)d Mesh, %(materials)d Material, "
@@ -4916,6 +4944,7 @@ class EFF_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
         if self.scope_message:
             self.layout.label(text=self.scope_message)
         self.layout.prop(context.scene, "eiem_export_mod_name", text='Mod 文件夹名')
+        self.layout.prop(context.scene, "eiem_source_baseline", text='原生来源目录')
         draw_lod_options(self.layout, self)
 
 
@@ -5005,7 +5034,7 @@ def menu_import(self, context):
 
 def menu_export(self, context):
     self.layout.operator(EFF_OT_export.bl_idname, text="EFF Mod 包")
-    self.layout.operator(EFF_OT_export_mesh_only.bl_idname, text='EFF 仅网格包')
+    self.layout.operator(EFF_OT_export_mesh_only.bl_idname, text='EFF 更新 Mesh')
 
 
 classes = (
@@ -5050,6 +5079,9 @@ def register():
     bpy.types.Scene.eiem_switch_active = PointerProperty(
         name="Switch group", type=bpy.types.Collection,
         poll=lambda self, collection: bool(collection.get("eiem_switch_group")))
+    bpy.types.Scene.eiem_source_baseline = StringProperty(
+        name='原生来源目录', subtype='DIR_PATH',
+        description='包含 source/manifest.json 的解包目录；留空则使用对象导入来源')
     bpy.types.Scene.eiem_export_mod_name = StringProperty(
         name="Mod folder name", default="",
         description="Create or refresh the selected Mod folder")
@@ -5066,6 +5098,7 @@ def unregister():
     bpy.types.TOPBAR_MT_file_export.remove(menu_export)
     del bpy.types.Scene.eiem_switch_active
     del bpy.types.Scene.eiem_export_mod_name
+    del bpy.types.Scene.eiem_source_baseline
     del bpy.types.Collection.eiem_switch_state_index
     del bpy.types.Mesh.eiem_shape_controls
     for cls in reversed(classes): bpy.utils.unregister_class(cls)

@@ -44,6 +44,9 @@ for cycle in range(3):
     assert metadata.bl_info == module.bl_info == module.eiem_blender_addon.bl_info
     assert bpy.ops.eiem.import_package.get_rna_type() is not None
     assert bpy.ops.eiem.export_package.get_rna_type() is not None
+    resource_scope = bpy.ops.eiem.export_package.get_rna_type().properties['resource_scope']
+    assert resource_scope.default == 'ALL'
+    assert [item.identifier for item in resource_scope.enum_items] == ['ALL', 'MESH', 'MATERIALS', 'TEXTURES']
     assert bpy.ops.eiem.export_mesh_only.get_rna_type() is not None
     assert bpy.ops.eiem.import_material.get_rna_type() is not None
     assert bpy.ops.eiem.import_physics.get_rna_type() is not None
@@ -84,6 +87,7 @@ for cycle in range(3):
     assert bpy.context.scene.eiem_physics_group == probe
     bpy.data.objects.remove(probe, do_unlink=True)
     assert hasattr(bpy.types.Scene, "eiem_switch_active")
+    assert hasattr(bpy.types.Scene, "eiem_source_baseline")
     assert hasattr(bpy.types.Collection, "eiem_switch_state_index")
     assert len(callbacks(bpy.types.TOPBAR_MT_file_import)) == 1
     assert len(callbacks(bpy.types.TOPBAR_MT_file_export)) == 1
@@ -93,6 +97,7 @@ for cycle in range(3):
     assert not callbacks(bpy.types.TOPBAR_MT_file_import)
     assert not callbacks(bpy.types.TOPBAR_MT_file_export)
     assert not hasattr(bpy.types.Scene, "eiem_switch_active")
+    assert not hasattr(bpy.types.Scene, "eiem_source_baseline")
     assert not hasattr(bpy.types.Collection, "eiem_switch_state_index")
     assert not hasattr(bpy.types.Object, "eiem_physics")
     assert not hasattr(bpy.types.Scene, "eiem_physics_group")
