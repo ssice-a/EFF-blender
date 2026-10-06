@@ -9,6 +9,7 @@ import bpy
 addon_path, package = map(Path, sys.argv[sys.argv.index("--") + 1:])
 spec = importlib.util.spec_from_file_location("eiem_normal_package_test", addon_path)
 addon = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = addon
 spec.loader.exec_module(addon)
 addon.register()
 try:

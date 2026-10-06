@@ -1,20 +1,19 @@
-"""Blender format-2 export. Uses the shared source parser and native writer.
+"""Blender format-2 export through the shared nativepack writer.
 
-No editable Mesh file, material merge, game deployment or runtime setter is
-part of this entry. The C++ parser is shared; geometry encoding currently uses
-the already verified nativepack writer. Full C++ geometry acceleration is not
-claimed by this bridge.
+This entry only assembles author resources and publishes an offline candidate;
+it does not call Unity or install a DLL. Geometry and material decoding remain
+in the canonical nativepack modules and the native compiler.
 """
-import copy
 import hashlib
 import importlib.util
-import json
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import sys
 import tempfile
+import types
 
 
 # Native partial exports used to rebuild the Blender snapshot on every click,
@@ -41,18 +40,32 @@ def _cached_mesh_snapshot(addon, obj):
     return snapshot, False
 
 def pack_modules():
-    local = Path(__file__).parent/'nativepack'
-    canonical = Path(__file__).parent.parent/'nativepack'
-    root = local if (local/'author_source.py').is_file() else canonical
+    local = Path(__file__).parent / 'nativepack'
+    canonical = Path(__file__).parent.parent / 'nativepack'
+    # The source checkout has a historical copy under Blender for releases;
+    # tools/nativepack is the only editable implementation. Installed bundles
+    # have no sibling tools/nativepack and therefore use their bundled copy.
+    root = canonical if (canonical / 'author_source.py').is_file() else local
     if not (root/'author_source.py').is_file():
         raise ValueError('缺少 EFF 原生导出模块，请安装完整插件包')
-    name = __package__ + '.nativepack'
-    if name not in sys.modules:
+    # Blender loads this file as part of the add-on package, while small
+    # diagnostics import it directly with ``spec_from_file_location``.
+    # Keep both entry paths on the same canonical package object.
+    name = (__package__ or '_eiem_blender_export') + '.nativepack'
+    loaded = sys.modules.get(name)
+    loaded_root = Path(next(iter(getattr(loaded, '__path__', (''))), '')).resolve() if loaded else None
+    if loaded is not None and loaded_root != root.resolve():
+        # A Blender reload can retain a previous package object. Remove that
+        # package and its children before importing from the canonical root.
+        for key in list(sys.modules):
+            if key == name or key.startswith(name + '.'):
+                del sys.modules[key]
+        loaded = None
+    if loaded is None:
         spec = importlib.util.spec_from_file_location(name, root/'__init__.py',
                                                       submodule_search_locations=[str(root)])
         # The canonical core is a namespace package, with no initializer.
         if not (root/'__init__.py').exists():
-            import types
             module = types.ModuleType(name); module.__path__ = [str(root)]
         else:
             module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
@@ -117,12 +130,90 @@ def material_fields(tree, overrides, encode):
     return changed
 
 def material_id(material):
-    return 'Material'+token(material.get('eiem_section', material.name)).removeprefix('Material')
+    stored = str(material.get('eiem_native_id', ''))
+    return stored or 'Material'+token(material.get('eiem_section', material.name)).removeprefix('Material')
+
+
+def material_ids(materials):
+    """Keep source-local section names from aliasing distinct Blender materials.
+
+    Normal imports retain their familiar section ID. A copied material or a
+    second source package can carry the same section, so assign a stable ID
+    once and keep it in the .blend for subsequent partial exports.
+    """
+    result, used = {}, {}
+    for material in sorted(materials, key=lambda item: item.name):
+        mid = material_id(material)
+        if mid in used and used[mid] is not material:
+            source = '|'.join(str(material.get(key, '')) for key in
+                              ('eiem_author_package', 'eiem_source', 'eiem_target_asset'))
+            suffix = hashlib.sha256((source + '|' + material.name).encode('utf-8')).hexdigest()[:12]
+            mid = mid + '_' + suffix
+        if mid in used:
+            raise ValueError('不同材质的导出 ID 冲突：' + material.name)
+        material['eiem_native_id'] = mid
+        used[mid] = material
+        result[material.as_pointer()] = mid
+    return result
+
+
+def shape_controls(addon, obj, include_hotkeys):
+    """Serialize the validated author controls using their native channel names."""
+    addon.sync_new_shape_controls(obj)
+    result = []
+    for control in obj.data.eiem_shape_controls:
+        record = dict((key, getattr(control, key)) for key in
+                      ('shape', 'enabled', 'identity', 'label', 'default',
+                       'minimum', 'maximum', 'hotkey_increase',
+                       'hotkey_decrease', 'hotkey_speed'))
+        if not control.enabled:
+            result.append(record)
+            continue
+        keys = obj.data.shape_keys
+        key = keys.key_blocks.get(control.shape) if keys else None
+        if key is None or key == keys.reference_key:
+            raise ValueError('形态键控制缺少有效频道：' + obj.name + ' / ' + control.shape)
+        record['shape'] = addon.shape_channel_name(obj, key)
+        if control.automatic:
+            record['default'], record['minimum'], record['maximum'] = (
+                key.value, key.slider_min, key.slider_max)
+        if not include_hotkeys:
+            record['hotkey_increase'] = record['hotkey_decrease'] = ''
+        result.append(record)
+    return result
+
+def _texture_image_signature(addon, image):
+    """Identify one image snapshot for the duration of an export."""
+    try:
+        pointer = int(image.as_pointer())
+    except (AttributeError, TypeError, ValueError):
+        pointer = id(image)
+    try:
+        source = str(addon.image_absolute_path(image) or '')
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        source = str(getattr(image, 'filepath', '') or '')
+    stamp = None
+    if source:
+        try:
+            stat_result = Path(source).stat()
+            stamp = (stat_result.st_mtime_ns, stat_result.st_size)
+        except OSError:
+            pass
+    revision = getattr(addon, '_owner_revision', lambda value: None)(image)
+    return (pointer, source, stamp, revision,
+            str(image.get('eiem_mipmaps', 'true')),
+            str(image.get('eiem_linear', 'false')),
+            str(image.get('eiem_filter', '1')),
+            str(image.get('eiem_wrap', '0')),
+            str(image.get('eiem_aniso', '1')),
+            str(image.get('eiem_mip_bias', '0')))
 
 def collect_material(addon, source, mat, images, textures, temporary, encode,
-                     existing=None, texture_only=False):
+                     existing=None, texture_only=False, mid=None,
+                     texture_cache=None):
     from PIL import Image
-    mid = material_id(mat)
+    texture_cache = texture_cache if texture_cache is not None else {}
+    mid = mid or material_id(mat)
     matpath = str(mat.get('eiem_target_path', '') or mat.get('eiem_source', ''))
     matasset = str(mat.get('eiem_target_asset', '') or mat.get('eiem_name', mat.name))
     native = source.resolve('Material', matpath, matasset)
@@ -150,21 +241,25 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
             raise ValueError('纹理属性缺少原生来源：' + prop)
         tex = next(r for r in source.manifest['resources'] if r['identity'] == pointer['identity'])
         image = images[section]
-        png = Path(temporary)/(hashlib.sha256(section.encode()).hexdigest()+'.png')
-        addon.write_texture(png, image)
-        with Image.open(png) as img:
-            mip = img.convert('RGBA'); width, height = mip.size; raw = bytearray(); count = 0
-            while True:
-                raw.extend(mip.transpose(Image.Transpose.FLIP_TOP_BOTTOM).tobytes()); count += 1
-                if str(image.get('eiem_mipmaps', 'true')) != 'true' or mip.size == (1, 1):
-                    break
-                mip = mip.resize((max(1, mip.width//2), max(1, mip.height//2)), Image.Resampling.BOX)
-        record = dict(id=tex['identity'], sourcePath=tex['logicalPath'], sourceAsset=tex['name'],
-                      pixels=bytes(raw), pixelLabel=token(Path(image.filepath).stem or image.name),
-                      format='RGBA32', width=width, height=height, mipCount=count,
-                      colorSpace=0 if str(image.get('eiem_linear', 'false')) == 'true' else 1,
-                      filter=int(image.get('eiem_filter', 1)), wrap=int(image.get('eiem_wrap', 0)),
-                      aniso=int(image.get('eiem_aniso', 1)), mipBias=float(image.get('eiem_mip_bias', 0)))
+        cache_key = _texture_image_signature(addon, image)
+        payload = texture_cache.get(cache_key)
+        if payload is None:
+            png = Path(temporary)/(hashlib.sha256(section.encode()).hexdigest()+'.png')
+            addon.write_texture(png, image)
+            with Image.open(png) as img:
+                mip = img.convert('RGBA'); width, height = mip.size; raw = bytearray(); count = 0
+                while True:
+                    raw.extend(mip.transpose(Image.Transpose.FLIP_TOP_BOTTOM).tobytes()); count += 1
+                    if str(image.get('eiem_mipmaps', 'true')) != 'true' or mip.size == (1, 1):
+                        break
+                    mip = mip.resize((max(1, mip.width//2), max(1, mip.height//2)), Image.Resampling.BOX)
+            payload = dict(pixels=bytes(raw), pixelLabel=token(Path(image.filepath).stem or image.name),
+                          format='RGBA32', width=width, height=height, mipCount=count,
+                          colorSpace=0 if str(image.get('eiem_linear', 'false')) == 'true' else 1,
+                          filter=int(image.get('eiem_filter', 1)), wrap=int(image.get('eiem_wrap', 0)),
+                          aniso=int(image.get('eiem_aniso', 1)), mipBias=float(image.get('eiem_mip_bias', 0)))
+            texture_cache[cache_key] = payload
+        record = dict(payload, id=tex['identity'], sourcePath=tex['logicalPath'], sourceAsset=tex['name'])
         if tex['identity'] in textures and textures[tex['identity']] != record:
             raise ValueError('同一原生纹理存在冲突修改：' + tex['name'])
         textures[tex['identity']] = record
@@ -179,8 +274,8 @@ def publish(staging, destination, reader):
     marker = destination/'mod.ini'
     previous = None
     if destination.exists() and any(destination.iterdir()):
-        if not marker.is_file() or not marker.read_text('utf-8-sig').startswith('; EFF resource-input Mod format 2'):
-            raise ValueError('不能覆盖非 format 2 目录，请选择新的 Mod 输出目录')
+        if not marker.is_file():
+            raise ValueError('不能覆盖缺少 mod.ini 的目录，请选择新的 Mod 输出目录')
         previous = reader(destination)
     candidate = reader(staging)
     old_files = previous['_files'] if previous is not None else set()
@@ -189,6 +284,10 @@ def publish(staging, destination, reader):
     def same_bytes(a, b):
         if not b.is_file() or a.stat().st_size != b.stat().st_size:
             return False
+        # Both packages have already passed checksum validation. An unchanged
+        # staging hardlink names the same file, so rereading both adds no proof.
+        if os.path.samefile(a, b):
+            return True
         with a.open('rb') as first, b.open('rb') as second:
             while True:
                 chunk = first.read(1024*1024)
@@ -217,14 +316,16 @@ def publish(staging, destination, reader):
             output = pending/'new'/name
             output.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(staging/name, output)
-        for name in set(changed) | set(removed):
+        for name in changed:
             original = destination/name
             if original.is_file():
                 saved = backup/name
                 saved.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(original, saved)
         for name in removed:
-            os.replace(destination/name, backup/name)
+            saved = backup/name
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(destination/name, saved)
             applied.append(name)
         for name in sorted(changed, key=lambda value: (value == 'mod.ini', value)):
             output = destination/name
@@ -248,6 +349,74 @@ def publish(staging, destination, reader):
     finally:
         if cleanup:
             shutil.rmtree(pending, ignore_errors=True)
+
+
+def _clone_staging_tree(source, destination):
+    """Clone a partial-export input with same-volume hardlinks when possible."""
+    source, destination = Path(source), Path(destination)
+    destination.mkdir(parents=True, exist_ok=False)
+    for path in source.rglob('*'):
+        relative = path.relative_to(source)
+        target = destination / relative
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        if not path.is_file():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not path.stat().st_mode & stat.S_IWRITE:
+            # Windows read-only attributes belong to the shared file, not one
+            # link. A private writable copy lets cleanup/detach proceed without
+            # changing the author's attributes.
+            shutil.copy2(path, target)
+            os.chmod(target, target.stat().st_mode | stat.S_IWRITE)
+            continue
+        try:
+            os.link(path, target)
+        except OSError:
+            # A workspace and destination on different volumes cannot share
+            # hardlinks; retain the old copy behavior for that case.
+            shutil.copy2(path, target)
+
+
+def _detach_staging_files(paths):
+    """Break hardlinks before update_directory writes a staged resource."""
+    for path in {Path(value) for value in paths}:
+        if not path.is_file():
+            continue
+        fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '.',
+                                          suffix='.detach', dir=str(path.parent))
+        os.close(fd)
+        try:
+            shutil.copy2(path, temporary)
+            os.chmod(temporary, os.stat(temporary).st_mode | stat.S_IWRITE)
+            os.replace(temporary, path)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
+def _partial_output_paths(staging, resource_scope, existing_ini, materials,
+                          textures, parts, identifier):
+    """Return every staged file that update_directory may write in place."""
+    paths = [Path(staging) / 'mod.ini']
+    if resource_scope in ('MATERIALS', 'TEXTURES'):
+        for material in materials:
+            if resource_scope == 'MATERIALS':
+                section = identifier(material['id'])
+                if section in existing_ini:
+                    paths.append(Path(staging) / existing_ini[section]['path'])
+        for texture in textures:
+            paths.append(Path(staging) / 'textures' /
+                         (identifier(texture['pixelLabel']) + '.tex'))
+    elif resource_scope == 'MESH':
+        for part in parts:
+            section = identifier(part['object'])
+            if section in existing_ini:
+                paths.append(Path(staging) / existing_ini[section]['path'])
+    return paths
 
 def export_native_package(addon, destination, mesh_objects, armatures=None,
                           physics_objects=None, mesh_only=False, lod_levels=None,
@@ -275,12 +444,12 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
     if resource_scope != 'ALL' and existing_ini is None:
         raise ValueError('部分导出需要已有的完整 Mod；首次请选择全部资源')
     if __package__:
-        from .eiem_offline_reload import reload_context, compile_reload
+        from .eiem_offline_reload import reload_context, compile_reload, prepare_static_sources
     else:
-        from eiem_offline_reload import reload_context, compile_reload
+        from eiem_offline_reload import reload_context, compile_reload, prepare_static_sources
     offline_context = reload_context(destination)
     if offline_context is None:
-        raise ValueError('完整原生导出需要离线编译目标：请设置 EFF_RELOAD_GAME 或 nativepack/offline-target.json，提供同版本游戏与来源基线')
+        raise ValueError('完整原生导出需要离线编译目标：请设置 EFF_RELOAD_GAME，或直接导出到游戏 plugin/mods/<Mod>，并提供经过结构校验的静态来源输入')
     if destination == source.package or source.package in destination.parents:
         raise ValueError('不能覆盖原生来源目录')
     bpy.context.view_layer.update()
@@ -288,18 +457,62 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
             addon.plan_switch_export(objects, include_switches=include_switches))
     if lod_levels is not None and resource_scope == 'ALL': plan = addon.expand_lod_plan(plan, lod_levels)
     encode = modules['type_tree'].encode
-    images = {str(i.get('eiem_section', '')): i for i in bpy.data.images if i.get('eiem_section')}
+    # Image sections are package-local.  Restrict lookup to the source package
+    # being exported so a second imported Mod with the same section/path
+    # cannot silently supply the first Mod's pixels.
+    source_packages = {str(source.package).replace('\\', '/').casefold()}
+    source_packages.update(
+        str(o.get('eiem_author_package', '')).replace('\\', '/').casefold()
+        for o in objects if o.get('eiem_author_package'))
+    images = {}
+    for image in bpy.data.images:
+        section = str(image.get('eiem_section', ''))
+        owner = str(image.get('eiem_author_package', '')).replace('\\', '/').casefold()
+        if not section or (owner and owner not in source_packages):
+            continue
+        if section in images and owner != next(iter(source_packages), ''):
+            continue
+        images[section] = image
+    selected_materials = set()
+    for view in objects:
+        original = addon.mesh_export_template(view)
+        for slot in {polygon.material_index for polygon in original.data.polygons}:
+            if slot < len(original.data.materials) and original.data.materials[slot] is not None:
+                selected_materials.add(original.data.materials[slot])
+    material_sections = material_ids(selected_materials)
     parts, materials, textures, rules = [], {}, {}, []
+    texture_cache = {}
     snapshots, part_cache = {}, {}
-    switches = [dict(variable=var, key=key, stateCount=len(states), default=default)
+    switches = [dict(variable=var, key=key, stateCount=len(states),
+                     stateValues=addon.switch_state_values(group), default=default)
                 for group, states, default, key, var in plan['groups']]
-    with tempfile.TemporaryDirectory(prefix='eff-native-export-') as temporary:
+    controls_by_object = {}
+    if not mesh_only and resource_scope == 'ALL':
+        originals = {addon.mesh_export_template(view) for view in plan['objects']
+                     if view not in plan['hidden']}
+        # This is the same author-side validator the controls panels use. It
+        # validates shared channels, ranges and hotkey collisions before any
+        # resource files are written.
+        _, _, hotkeys = addon.plan_shape_controls(list(originals),
+                                                 include_hotkeys=include_switches)
+        switch_keys = {switch['key'] for switch in switches}
+        if any(control['key'] in switch_keys for control in hotkeys):
+            raise ValueError('款式和形态键控制使用了同一快捷键')
+        controls_by_object = {original.as_pointer(): shape_controls(addon, original, include_switches)
+                              for original in originals}
+    temporary_parent = (str(destination.parent)
+                        if resource_scope != 'ALL' and destination.parent.is_dir()
+                        else None)
+    with tempfile.TemporaryDirectory(prefix='eff-native-export-',
+                                      dir=temporary_parent) as temporary:
         staging = Path(temporary)/'mod'
         if resource_scope != 'ALL':
-            shutil.copytree(destination, staging)
+            _clone_staging_tree(destination, staging)
         else:
             staging.mkdir()
-        resource_cache['__trusted_roots__'] = (staging.resolve(),)
+        # Partial staging may share files with the live author through links.
+        # It must hash current bytes even if a foreign writer preserves mtime.
+        resource_cache['__trusted_roots__'] = (staging.resolve(),) if resource_scope == 'ALL' else ()
         if resource_scope in ('MATERIALS', 'TEXTURES'):
             for view in objects:
                 original = addon.mesh_export_template(view)
@@ -308,10 +521,11 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
                     mat = original.data.materials[slot] if slot < len(original.data.materials) else None
                     if mat is None:
                         raise ValueError(original.name+' 缺少材质槽 '+str(slot))
-                    mid = material_id(mat)
+                    mid = material_sections[mat.as_pointer()]
                     if mid not in materials:
                         materials[mid] = collect_material(addon, source, mat, images, textures, temporary,
-                                                         encode, existing_ini, resource_scope == 'TEXTURES')
+                                                         encode, existing_ini, resource_scope == 'TEXTURES', mid,
+                                                         texture_cache)
         for group in plan['sources']:
             if resource_scope in ('MATERIALS', 'TEXTURES'):
                 break
@@ -334,19 +548,18 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
                     for slot, author in splits:
                         mat = original.data.materials[slot] if slot < len(original.data.materials) else None
                         if mat is None: raise ValueError(original.name+' 缺少材质槽 '+str(slot))
-                        mid = material_id(mat)
+                        mid = material_sections[mat.as_pointer()]
                         if resource_scope == 'ALL' and mid not in materials:
-                            materials[mid] = collect_material(addon, source, mat, images, textures, temporary, encode)
+                            materials[mid] = collect_material(addon, source, mat, images, textures, temporary,
+                                                              encode, mid=mid, texture_cache=texture_cache)
                         mesh, _ = modules['mesh'].native_mesh(source.tree(target), author, asset)
                         suffix = '' if len(splits)==1 else '_mat'+str(slot)
                         pid = 'Mesh'+token(original.name).removeprefix('Mesh')+suffix
-                        controls = [dict((k,getattr(c,k)) for k in
-                                         ('shape','enabled','identity','label','default','minimum','maximum',
-                                          'hotkey_increase','hotkey_decrease','hotkey_speed'))
-                                    for c in (() if mesh_only else original.data.eiem_shape_controls)]
+                        controls = controls_by_object.get(identity, [])
                         parts.append(dict(partId=pid,object=pid,material=mid,vertices=author['vertex_count'],
                                           indices=len(author['indices']),bonePaths=author['bone_paths'],
                                           shapeNames=[c[0] for c in author['blend_channels']],shapeControls=controls,
+                                          shapeOwner=str(original.data.get('eiem_control_id', '')),
                                           visibilityBindings=plan['bindings'].get(view,[]),
                                           nativeTypeHash=target['native']['typeHash'],
                                           fieldData={f:encode(mesh[f]) for f in modules['delta_apply'].GEOMETRY_FIELDS}))
@@ -370,9 +583,13 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
                         materials=list(materials.values()),textures=list(textures.values()),rules=rules,
                         switches=switches,resource_cache=resource_cache)
         else:
+            _detach_staging_files(_partial_output_paths(
+                staging, resource_scope, existing_ini, list(materials.values()),
+                list(textures.values()), parts, modules['ini_package'].identifier))
             modules['ini_package'].update_directory(staging,parts=parts,materials=list(materials.values()),
                         textures=list(textures.values()),texture_only=resource_scope == 'TEXTURES',
                         resource_cache=resource_cache)
+        prepare_static_sources(staging, source.package, offline_context, previous=destination)
         package=publish(staging,destination,read_package)
         offline = compile_reload(destination, offline_context) if offline_context else dict(offlineReloadPrepared=False)
         return dict(meshes=len(parts),materials=0 if resource_scope == 'TEXTURES' else len(materials),

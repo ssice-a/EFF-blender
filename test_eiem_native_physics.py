@@ -11,7 +11,9 @@ import bpy
 addon_path, evidence, output = map(Path, sys.argv[sys.argv.index("--")+1:])
 faulthandler.dump_traceback_later(45, repeat=True)
 spec = importlib.util.spec_from_file_location("eiem_native_test", addon_path)
-addon = importlib.util.module_from_spec(spec); spec.loader.exec_module(addon); addon.register()
+addon = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = addon
+spec.loader.exec_module(addon); addon.register()
 native = addon.physics_authoring.native
 output.mkdir(parents=True, exist_ok=True)
 payload = native.source.read_evidence(evidence)

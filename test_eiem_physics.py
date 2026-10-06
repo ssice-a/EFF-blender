@@ -9,7 +9,9 @@ from mathutils import Matrix, Quaternion, Vector
 
 addon_path, output = map(Path, sys.argv[sys.argv.index("--")+1:])
 spec = importlib.util.spec_from_file_location("eiem_physics_test", addon_path)
-addon = importlib.util.module_from_spec(spec); spec.loader.exec_module(addon); addon.register()
+addon = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = addon
+spec.loader.exec_module(addon); addon.register()
 physics = addon.physics_authoring
 nodes = [("",-1,(0,0,0),(0,0,0,1),(1,1,1)),
          ("Rig",0,(0.3,1,0.2),(0,0,0.6,0.8),(2,2,2))]

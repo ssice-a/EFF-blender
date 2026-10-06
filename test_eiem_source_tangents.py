@@ -16,6 +16,7 @@ import bpy
 addon_path, package = map(Path, sys.argv[sys.argv.index("--") + 1:])
 spec = importlib.util.spec_from_file_location("eiem_tangent_test", addon_path)
 addon = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = addon
 spec.loader.exec_module(addon)
 # System.Text.Json writes float32 negative zero as -0. Python's ordinary int
 # parser loses its sign; keep it when comparing the original float32 bits.

@@ -18,6 +18,7 @@ if output.exists():
     raise RuntimeError(f"test output must be new: {output}")
 spec = importlib.util.spec_from_file_location("eiem_blender_addon", addon_path)
 addon = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = addon
 spec.loader.exec_module(addon)
 addon.register()
 

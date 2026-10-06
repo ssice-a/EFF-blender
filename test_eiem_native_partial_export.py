@@ -49,9 +49,9 @@ def run(production, evidence, prepared_cache=None, compiler_path=None):
     compile_reload = offline.compile_reload
     if prepared_cache or compiler_path:
         def reuse_cache(destination, context=None):
-            compiler, baseline, cache, assembly = context
+            compiler, baseline, cache, game = context
             return compile_reload(destination, (Path(compiler_path) if compiler_path else compiler,
-                                    baseline, Path(prepared_cache) if prepared_cache else cache, assembly))
+                                    baseline, Path(prepared_cache) if prepared_cache else cache, game))
         offline.compile_reload = reuse_cache
 
     def no_mesh(*args, **kwargs):

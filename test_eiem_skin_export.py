@@ -11,6 +11,7 @@ from mathutils import Matrix
 addon_path, output = map(Path, sys.argv[sys.argv.index('--') + 1:])
 spec = importlib.util.spec_from_file_location('eiem_skin_test', addon_path)
 addon = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = addon
 spec.loader.exec_module(addon)
 
 def flat(matrix):

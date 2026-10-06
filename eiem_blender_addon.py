@@ -16,7 +16,6 @@ import shutil
 import struct
 import sys
 import zlib
-import tempfile
 import math
 import uuid
 import importlib.util
@@ -32,16 +31,14 @@ from bpy_extras.io_utils import ImportHelper, ExportHelper
 from mathutils import Matrix, Quaternion, Vector
 
 
-# Export cache state is deliberately session-scoped. Blender does not expose a
-# persistent revision number for every editable Mesh/Image field, so reusing a
-# cache across Blender restarts would risk publishing stale binary resources.
-# The cache files live under the OS temp directory and never enter the Mod.
+# Blender does not expose a persistent revision number for every editable
+# Mesh/Image field. Keep content revisions in this process so native snapshot
+# reuse never crosses a Blender restart or enters a published Mod.
 _EXPORT_DIRTY_SERIAL = defaultdict(int)
-_EXPORT_CACHES = {}
 _EXPORT_IN_PROGRESS = False
 
 
-def _eiem_export_cache_depsgraph_update(_scene, depsgraph):
+def _eiem_export_dirty_depsgraph_update(_scene, depsgraph):
     """Record changed Blender IDs without doing work during an export."""
     if _EXPORT_IN_PROGRESS:
         return
@@ -178,55 +175,11 @@ def _mesh_resource_token(obj):
     )
 
 
-def _skeleton_content_digest(armature):
-    """Fingerprint the authored node records serialized to a skeleton file."""
-    if armature is None:
-        return ""
-    digest = hashlib.sha1()
-    for _bone, record, source in skeleton_author_nodes(armature):
-        path, parent, position, rotation, scale = record
-        encoded = str(path).encode("utf-8", "replace")
-        digest.update(struct.pack("<I", len(encoded)))
-        digest.update(encoded)
-        digest.update(struct.pack("<iB", int(parent), int(bool(source))))
-        digest.update(struct.pack(
-            "<10f", *(float(value) for value in
-                       (*position, *rotation, *scale))))
-    return digest.hexdigest()
-
-
-def _skeleton_resource_token(armature):
-    return ("skeleton-v2", _owner_revision(armature),
-            _owner_revision(getattr(armature, "data", None)),
-            _skeleton_content_digest(armature))
-
-
-def _material_resource_token(material):
-    return ("material-v1", _owner_revision(material))
-
-
-def _texture_resource_token(image):
-    source = image_absolute_path(image) if image else ""
-    stat = None
-    if source and not image.is_dirty:
-        try:
-            info = Path(source).stat()
-            stat = (info.st_size, info.st_mtime_ns)
-        except OSError:
-            stat = None
-    # Dirty images are intentionally invalidated on every export. Blender does
-    # not publish a revision for Image.pixels, and a false hit would be worse
-    # than re-encoding one edited texture.
-    dirty = bool(image.is_dirty) if image else False
-    return ("texture-v1", _owner_revision(image), source, stat, dirty,
-            tuple(image.size) if image else (), uuid.uuid4().hex if dirty else "")
-
-
 if __package__:
     from . import eiem_release as release_check
     from . import eiem_format as format_io
     from . import eiem_lod as lod
-    from . import eiem_export_cache as export_cache_io
+    from . import eiem_native_export as native_export
     from . import eiem_physics_authoring as physics_authoring
     from . import eiem_blender_controls as controls
 else:
@@ -242,10 +195,10 @@ else:
         "eiem_lod", Path(__file__).with_name("eiem_lod.py"))
     lod = importlib.util.module_from_spec(_lod_spec)
     _lod_spec.loader.exec_module(lod)
-    _cache_spec = importlib.util.spec_from_file_location(
-        "eiem_export_cache", Path(__file__).with_name("eiem_export_cache.py"))
-    export_cache_io = importlib.util.module_from_spec(_cache_spec)
-    _cache_spec.loader.exec_module(export_cache_io)
+    _native_spec = importlib.util.spec_from_file_location(
+        "eiem_native_export", Path(__file__).with_name("eiem_native_export.py"))
+    native_export = importlib.util.module_from_spec(_native_spec)
+    _native_spec.loader.exec_module(native_export)
     _physics_spec = importlib.util.spec_from_file_location(
         "eiem_physics_authoring", Path(__file__).with_name("eiem_physics_authoring.py"))
     physics_authoring = importlib.util.module_from_spec(_physics_spec)
@@ -254,9 +207,6 @@ else:
         "eiem_blender_controls", Path(__file__).with_name("eiem_blender_controls.py"))
     controls = importlib.util.module_from_spec(_controls_spec)
     _controls_spec.loader.exec_module(controls)
-
-
-_ExportResourceCache = export_cache_io.ResourceCache
 
 
 # Preserve the standalone add-on's public Python surface for authoring scripts
@@ -372,7 +322,14 @@ read_skeleton = format_io.read_skeleton
 validate_skeleton_nodes = format_io.validate_skeleton_nodes
 
 def load_material(root, section, values, textures=None):
-    material = bpy.data.materials.get(section) or bpy.data.materials.new(section)
+    # Material names and INI sections are local to their source package. Two
+    # imported Mods can legitimately contain ``MaterialBody``; reusing the
+    # global Blender name used to overwrite the first Mod's material silently.
+    package = str(Path(root).resolve())
+    material = next((item for item in bpy.data.materials
+                     if str(item.get("eiem_author_package", "")) == package
+                     and str(item.get("eiem_section", "")) == section), None)
+    material = material or bpy.data.materials.new(section)
     material.use_nodes = True
     for key in list(material.keys()):
         if key.startswith("eiem_"):
@@ -393,12 +350,13 @@ def load_material(root, section, values, textures=None):
         if key in ("path", "target.path", "target.asset", "overrides"):
             continue
         if key.startswith("texture.") and textures and value in textures:
-            texture_bindings[key] = value
+            texture_bindings[key] = str(textures[value].get("eiem_section", value))
             image_path = bpy.path.abspath(textures[value].filepath,
                                           library=textures[value].library)
             value = str(Path(image_path).resolve())
         material["eiem_" + key] = value
     material["eiem_section"] = section
+    material["eiem_author_package"] = package
     if values.get("source"):
         material["eiem_source"] = values["source"]
     material["eiem_target_path"] = values.get("target.path", "")
@@ -412,6 +370,8 @@ def load_material(root, section, values, textures=None):
         key: str(value) for key, value in values.items()
         if key not in ("path", "target.path", "target.asset", "overrides")
     }
+    for key, value in texture_bindings.items():
+        baseline[key] = value
     if str(values.get("overrides", "false")).lower() == "true":
         baseline = {"source": values.get("source", "")}  # file is already an authored delta, not a game snapshot
     material["eiem_baseline_json"] = json.dumps(
@@ -425,7 +385,7 @@ def import_material_file(path, obj):
     if obj is None or obj.type != "MESH":
         raise ValueError('请先选择要指定材质的网格')
     values = read_flat_properties(path)
-    if values.get("format") != "EFFMAT" or values.get("version") != "1" or not values.get("source", "").strip():
+    if values.get("format") != "EFFMAT" or not values.get("source", "").strip():
         raise ValueError("请选择 EFF 导出的 .mat（EFFMAT version=1，包含 source），不是 Unity YAML 或节点材质")
     # Only use an enclosing package that actually declares this file.
     resources, root = {}, path.parent
@@ -1119,8 +1079,18 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
         if not section.lower().startswith("texture") or not values.get("path"):
             continue
         try:
-            image = bpy.data.images.load(str(safe_path(root, values["path"])), check_existing=True)
-            image["eiem_section"] = section
+            # Do not let Blender's global filepath cache alias two imported
+            # Mod packages. Their section/source metadata is package-local,
+            # even when both happen to point at the same disk PNG.
+            image = bpy.data.images.load(str(safe_path(root, values["path"])), check_existing=False)
+            used = {str(item.get("eiem_section")): item for item in bpy.data.images
+                    if item.get("eiem_section") and item is not image}
+            image_section = section
+            if section in used:
+                image_section = unique_texture_section(safe_path(root, values["path"]), used)
+            image["eiem_section"] = image_section
+            image["eiem_source_section"] = section
+            image["eiem_author_package"] = str(Path(root).resolve())
             image["eiem_relative_path"] = values["path"]
             image["eiem_source"] = values.get("source", "")
             image["eiem_name"] = values.get("name", image.name)
@@ -2162,376 +2132,6 @@ def write_mesh(path, obj, return_snapshot=False):
     path.write_bytes(writer.data)
 
 
-def write_merged_mesh(output, objects):
-    """Write sibling objects as one Mesh with one submesh per material slot.
-
-    The runtime hands a source Renderer exactly one Mesh, so mounting several
-    sibling parts natively means one Mesh carrying all of them. Each part's
-    material slot becomes its own submesh, which is also what makes a single
-    part addressable later: a submesh can be re-materialed without touching the
-    others.
-
-    Geometry is concatenated verbatim. Vertices are never welded and never
-    reordered, so each part keeps its identity and only gains a constant offset.
-    All parts must already agree on their joint palette, because one Mesh has
-    exactly one; write_mesh is what guarantees that for siblings exported from
-    one armature.
-    """
-    if not objects:
-        raise ValueError("没有可合并的网格")
-    path = Path(output)
-    coordinate = objects[0].data.get("eiem_coordinate_space", "unity-y-up-left-handed")
-    for obj in objects:
-        if obj.data.get("eiem_coordinate_space", "unity-y-up-left-handed") != coordinate:
-            raise ValueError('合并的网格坐标系不一致：' + obj.name)
-    to_source = blender_to_unity if is_unity_left_handed(coordinate) else (lambda value: tuple(value))
-
-    parts = []
-    for obj in objects:
-        mesh = obj.data
-        mesh.calc_loop_triangles()
-        source_normal_name = resolve_author_attribute(
-            mesh, "point", "source_normal", "FLOAT_VECTOR")
-        source_normals = get_point_attribute(mesh, source_normal_name, "vector")
-        baseline_crc = str(mesh.get("eiem_normal_baseline_crc", ""))
-        preserve_normals = (source_normals is not None and baseline_crc and
-                            (normal_state_crc(mesh) == baseline_crc or
-                             normal_state_matches_source(mesh, source_normals)))
-        normal_corners = [] if preserve_normals else [tuple(c.vector) for c in mesh.corner_normals]
-        uv_channels = mesh_export_uv_channels(mesh)
-        color_domain, color_values = mesh_export_colors(mesh)
-        tangent_points, tangent_corners = mesh_export_tangents(
-            mesh, source_normals, normal_corners, preserve_normals)
-        corner_channels = [channel[1] for channel in uv_channels if channel is not None]
-        if not preserve_normals:
-            corner_channels.append(normal_corners)
-        if color_domain == "CORNER":
-            corner_channels.append(color_values)
-        if tangent_corners:
-            corner_channels.append(tangent_corners)
-        source_vertices, source_loops, loop_vertices = export_corner_map(mesh, corner_channels)
-
-        coordinates = mesh_vertex_coordinates(mesh)
-        vertices = [coord for source in source_vertices
-                    for coord in to_source(coordinates[source])]
-        normal_values = [source_normals[source] if preserve_normals else
-                         normal_corners[loop] if loop is not None else tuple(mesh.vertices[source].normal)
-                         for source, loop in zip(source_vertices, source_loops)]
-        normals = [coord for value in normal_values for coord in to_source(value)]
-        tangents = []
-        if tangent_points:
-            for source, loop in zip(source_vertices, source_loops):
-                value = tangent_corners[loop] if tangent_corners and loop is not None else tangent_points[source]
-                tangents.extend(to_source(value[:3]))
-                tangents.append(value[3])
-        colors = []
-        if color_values:
-            for source, loop in zip(source_vertices, source_loops):
-                value = color_values[source] if color_domain == "POINT" else (
-                    color_values[loop] if loop is not None else (0.0, 0.0, 0.0, 0.0))
-                colors.extend(value)
-        uv_layers = []
-        for channel in uv_channels:
-            values = []
-            if channel is not None:
-                dimension, xy, zw = channel
-                for source, loop in zip(source_vertices, source_loops):
-                    values.extend(xy[loop] if loop is not None else (0.0, 0.0))
-                    if dimension > 2:
-                        values.extend(zw[source][:dimension - 2])
-            uv_layers.append(values)
-
-        by_slot = {}
-        for tri in mesh.loop_triangles:
-            slot = int(mesh.polygons[tri.polygon_index].material_index)
-            triangle = tuple(loop_vertices[loop] for loop in tri.loops)
-            if is_unity_left_handed(coordinate):
-                triangle = (triangle[0], triangle[2], triangle[1])
-            by_slot.setdefault(slot, []).extend(triangle)
-
-        (skin, bindposes, bone_hashes, bone_paths, bone_index_paths,
-         bone_sources, bone_source_candidates) = export_skin_binding(
-            obj, obj.find_armature(), source_vertices)
-        blend_vertices, blend_frames, blend_channels, blend_weights, additional = \
-            export_blend_shapes(obj, to_source, source_vertices)
-        parts.append({
-            "obj": obj,
-            "vertices": vertices, "normals": normals, "tangents": tangents,
-            "colors": colors, "uv_layers": uv_layers,
-            "count": len(source_vertices),
-            "channels": len(uv_layers),
-            "by_slot": by_slot,
-            "slot_count": max(len(obj.data.materials),
-                              (max(by_slot) + 1) if by_slot else 0),
-            "skin": skin, "bindposes": bindposes,
-            "bone_hashes": bone_hashes, "bone_paths": bone_paths,
-            "bone_index_paths": bone_index_paths,
-            "bone_sources": bone_sources,
-            "bone_source_candidates": bone_source_candidates,
-            "blend_vertices": blend_vertices,
-            "blend_frames": blend_frames,
-            "blend_channels": blend_channels,
-            "blend_weights": blend_weights,
-            "additional": additional,
-        })
-
-    # One Mesh has one joint palette. Sibling parts routinely address different
-    # subsets of the shared skeleton, so the palette is their ordered union and
-    # each part's joint indices are remapped into it. Refusing instead would
-    # reject exactly the sibling groups this exists for.
-    palette_paths = []
-    for part in sorted(parts, key=lambda item: len(item["bone_paths"]), reverse=True):
-        for path in part["bone_paths"]:
-            if path not in palette_paths:
-                palette_paths.append(path)
-    palette_index = {name: index for index, name in enumerate(palette_paths)}
-    for part in parts:
-        # All per-slot identities share the part's local palette order.
-        if not (len(part["bindposes"]) == len(part["bone_paths"]) ==
-                len(part["bone_hashes"]) == len(part["bone_index_paths"]) ==
-                len(part["bone_sources"]) ==
-                len(part["bone_source_candidates"])):
-            raise ValueError(
-                "网格 %s 的骨骼路径/绑定矩阵/哈希数量不一致" % part["obj"].name)
-        part["remap"] = [palette_index[name] for name in part["bone_paths"]]
-    # Bind poses come from the palette order. Parts exported from one skeleton
-    # agree to float precision, so the first part that declares a bone wins and
-    # a materially different matrix means the parts do not share one skin.
-    merged_poses = [None] * len(palette_paths)
-    for part in parts:
-        # enumerate(remap) yields (this part's own slot, its slot in the union).
-        for own_slot, union_slot in enumerate(part["remap"]):
-            pose = list(part["bindposes"][own_slot])[:16]
-            pose += [0.0] * (16 - len(pose))
-            existing = merged_poses[union_slot]
-            if existing is None:
-                merged_poses[union_slot] = pose
-            elif max(abs(a - b) for a, b in zip(existing, pose)) > 1e-4:
-                raise ValueError(
-                    "骨骼 %s 的绑定矩阵在合并的部件之间不一致"
-                    % part["bone_paths"][own_slot])
-    if any(pose is None for pose in merged_poses):
-        raise ValueError("合并的关节调色盘有不存在的绑定矩阵")
-    hashes = [None] * len(palette_paths)
-    for part in parts:
-        for own_slot, union_slot in enumerate(part["remap"]):
-            if hashes[union_slot] is None:
-                hashes[union_slot] = part["bone_hashes"][own_slot]
-    if any(value is None for value in hashes):
-        raise ValueError("合并的关节调色盘有不存在的骨骼哈希")
-    index_paths = [None] * len(palette_paths)
-    sources = [None] * len(palette_paths)
-    source_candidates = [None] * len(palette_paths)
-    for part in parts:
-        for own_slot, union_slot in enumerate(part["remap"]):
-            value = part["bone_index_paths"][own_slot]
-            existing = index_paths[union_slot]
-            if existing is None:
-                index_paths[union_slot] = value
-            elif existing != value:
-                raise ValueError("合并部件的骨骼层级索引不一致：" +
-                                 part["bone_paths"][own_slot])
-    if any(value is None for value in index_paths):
-        raise ValueError("合并的关节调色盘缺少骨骼层级索引")
-    for part in parts:
-        for own_slot, union_slot in enumerate(part["remap"]):
-            candidates = part["bone_source_candidates"][own_slot]
-            if source_candidates[union_slot] is None:
-                source_candidates[union_slot] = []
-            for candidate in candidates:
-                if candidate not in source_candidates[union_slot]:
-                    source_candidates[union_slot].append(candidate)
-    for slot, candidates in enumerate(source_candidates):
-        sources[slot] = candidates[0] if candidates else ("", "", 0)
-    if any(value is None for value in sources):
-        raise ValueError("merged palette is missing bone source slots")
-    channels = {part["channels"] for part in parts}
-    if len(channels) > 1:
-        raise ValueError(
-            "合并的网格 UV 通道数不一致，无法共用一个顶点布局："
-            + "，".join(part["obj"].name for part in parts))
-    # BoneWeight is per vertex, so every part must contribute one entry per
-    # vertex. A part with no armature has no skin, and letting that shorten the
-    # table would shift every later part's weights onto the wrong vertices.
-    for part in parts:
-        if len(part["skin"]) != part["count"]:
-            raise ValueError(
-                "网格 %s 的蒙皮数量(%d)与顶点数(%d)不一致，无法参与合并"
-                % (part["obj"].name, len(part["skin"]), part["count"]))
-
-    vertices, normals, tangents, colors = [], [], [], []
-    uv_layers = [[] for _ in range(parts[0]["channels"])]
-    indices, submeshes, skin = [], [], []
-    vertex_offset = 0
-    for part in parts:
-        vertices.extend(part["vertices"])
-        normals.extend(part["normals"])
-        tangents.extend(part["tangents"])
-        colors.extend(part["colors"])
-        for channel, values in enumerate(part["uv_layers"]):
-            uv_layers[channel].extend(values)
-        # One submesh per material slot, in slot order, so submesh N is the Nth
-        # slot of this part. Empty slots are kept rather than renumbered.
-        for slot in range(part["slot_count"]):
-            slot_indices = part["by_slot"].get(slot, [])
-            start = len(indices)
-            indices.extend(value + vertex_offset for value in slot_indices)
-            used = set(slot_indices)
-            first_vertex = min(used) + vertex_offset if used else 0
-            vertex_count = (max(used) - min(used) + 1) if used else 0
-            submeshes.append((0, start, len(slot_indices), 0, first_vertex,
-                              vertex_count))
-        for weights_value, bones_value in part["skin"]:
-            skin.append((weights_value,
-                         [part["remap"][int(b)] for b in bones_value]))
-        vertex_offset += part["count"]
-
-    writer = Writer(); writer.raw(MAGIC_MESH); writer.i32(6)
-    writer.string(coordinate)
-    writer.string(parts[0]["obj"].data.get("eiem_source", ""))
-    writer.string(parts[0]["obj"].data.get("eiem_asset", parts[0]["obj"].name))
-    writer.i32(vertex_offset); writer.floats(vertices); writer.floats(normals)
-    writer.floats(tangents); writer.floats(colors)
-    for values in uv_layers: writer.floats(values)
-    writer.i32(len(indices))
-    writer.uints(indices)
-    writer.i32(len(submeshes))
-    for topology, start, count, base, first, vertex_count in submeshes:
-        writer.i32(topology); writer.u32(start); writer.u32(count)
-        writer.u32(base); writer.u32(first); writer.u32(vertex_count)
-    writer.i32(len(skin))
-    writer.skin(skin)
-    writer.i32(len(merged_poses))
-    for pose in merged_poses:
-        for value in pose: writer.f32(value)
-    writer.i32(len(hashes))
-    writer.uints(hashes)
-    writer.i32(len(palette_paths))
-    for value in palette_paths: writer.string(value)
-    writer.i32(len(index_paths))
-    for value in index_paths: writer.string(value)
-    writer.i32(len(sources))
-    for source in sources:
-        writer.string(source[0]); writer.string(source[1]); writer.u32(source[2])
-    writer.i32(len(source_candidates))
-    for candidates in source_candidates:
-        writer.i32(len(candidates))
-        for source in candidates:
-            writer.string(source[0]); writer.string(source[1]); writer.u32(source[2])
-
-    # Blend shapes keep their part-local vertex indices shifted by that part's
-    # base offset, exactly like the geometry they displace.  The old merged
-    # writer discarded this stream, leaving ShapeControl declarations pointing
-    # at a Mesh with zero channels.  Accumulate matching channel/frame names
-    # across sibling parts so one slider drives the complete merged Mesh.
-    blend_channel_records = {}
-    blend_channel_order = []
-    vertex_base = 0
-    merged_additional = []
-    for part in parts:
-        part_additional = part["additional"]
-        if part_additional and len(part_additional) != part["count"]:
-            raise ValueError(
-                "合并网格的附加形态数据与顶点数量不一致：" + part["obj"].name)
-        if part_additional:
-            merged_additional.extend(part_additional)
-        else:
-            merged_additional.extend([(0.0, 0.0, 0.0)] * part["count"])
-
-        local_frames = part["blend_frames"]
-        local_weights = part["blend_weights"]
-        for channel_name, channel_hash, first_frame, frame_count in part["blend_channels"]:
-            channel_key = (str(channel_name), int(channel_hash))
-            channel = blend_channel_records.get(channel_key)
-            if channel is None:
-                channel = {"name": str(channel_name), "hash": int(channel_hash),
-                           "frames": [], "frame_keys": {}}
-                blend_channel_records[channel_key] = channel
-                blend_channel_order.append(channel_key)
-            for local_index in range(frame_count):
-                frame_index = first_frame + local_index
-                if frame_index >= len(local_frames):
-                    raise ValueError(
-                        '合并网格的形态键帧引用无效：' + part["obj"].name)
-                frame_name, _, _, has_normals, has_tangents, has_additional = \
-                    local_frames[frame_index]
-                weight = (float(local_weights[frame_index])
-                          if frame_index < len(local_weights) else 100.0)
-                frame_key = (str(frame_name), weight)
-                target_frame = channel["frame_keys"].get(frame_key)
-                if target_frame is None:
-                    target_frame = {
-                        "name": str(frame_name), "weight": weight,
-                        "has_normals": bool(has_normals),
-                        "has_tangents": bool(has_tangents),
-                        "has_additional": bool(has_additional),
-                        "vertices": [],
-                    }
-                    channel["frame_keys"][frame_key] = target_frame
-                    channel["frames"].append(target_frame)
-                else:
-                    target_frame["has_normals"] |= bool(has_normals)
-                    target_frame["has_tangents"] |= bool(has_tangents)
-                    target_frame["has_additional"] |= bool(has_additional)
-                start = local_frames[frame_index][1]
-                count = local_frames[frame_index][2]
-                end = min(len(part["blend_vertices"]), start + count)
-                for vertex_index, delta_position, delta_normal, delta_tangent in \
-                        part["blend_vertices"][start:end]:
-                    target_frame["vertices"].append((
-                        int(vertex_index) + vertex_base,
-                        delta_position, delta_normal, delta_tangent))
-        vertex_base += part["count"]
-
-    merged_blend_vertices = []
-    merged_blend_frames = []
-    merged_blend_channels = []
-    merged_blend_weights = []
-    for channel_key in blend_channel_order:
-        channel = blend_channel_records[channel_key]
-        first_frame = len(merged_blend_frames)
-        for frame in channel["frames"]:
-            first_vertex = len(merged_blend_vertices)
-            merged_blend_vertices.extend(frame["vertices"])
-            merged_blend_frames.append((
-                frame["name"], first_vertex, len(frame["vertices"]),
-                frame["has_normals"], frame["has_tangents"],
-                frame["has_additional"],
-            ))
-            merged_blend_weights.append(frame["weight"])
-        merged_blend_channels.append((
-            channel["name"], channel["hash"], first_frame,
-            len(merged_blend_frames) - first_frame,
-        ))
-
-    writer.i32(len(merged_blend_vertices))
-    writer.blend_vertices(merged_blend_vertices)
-    writer.i32(len(merged_blend_frames))
-    for name, first, count, has_normals, has_tangents, has_additional in merged_blend_frames:
-        writer.string(name); writer.u32(first); writer.u32(count)
-        writer.raw(bytes((int(has_normals), int(has_tangents), int(has_additional))))
-    writer.i32(len(merged_blend_channels))
-    for name, name_hash, first, count in merged_blend_channels:
-        writer.string(name); writer.u32(name_hash); writer.u32(first); writer.u32(count)
-    writer.floats(merged_blend_weights)
-    # Additional normals are optional and are already per exported vertex for
-    # each part (export_blend_shapes rejects topology-changing data).  Keep the
-    # stream aligned with the concatenated vertex buffer when any part has it.
-    has_additional = any(part["additional"] for part in parts)
-    additional_values = merged_additional if has_additional else []
-    writer.i32(len(additional_values))
-    for value in additional_values:
-        for component in value: writer.f32(component)
-    # Write through the parameter: the palette loop above rebinds the local.
-    Path(output).write_bytes(writer.data)
-    return {
-        "parts": len(parts),
-        "vertices": vertex_offset,
-        "submeshes": len(submeshes),
-        "slots": [part["slot_count"] for part in parts],
-    }
-
-
 def skeleton_author_nodes(obj):
     """Source nodes are references, new nodes carry actual parent-local TRS.
 
@@ -2766,7 +2366,9 @@ def resolve_material_texture(material, property_name, value, images_by_section,
             original_bindings[property_name] = section
             return section
 
-    image = bpy.data.images.load(str(requested), check_existing=True)
+    # Image datablocks carry package ownership metadata; Blender's global
+    # filepath cache must not alias an image imported for another Mod.
+    image = bpy.data.images.load(str(requested), check_existing=False)
     existing_section = image.get("eiem_section", "")
     if existing_section and existing_section in images_by_section:
         section = canonical_texture_section(image, images_by_section)
@@ -2796,35 +2398,6 @@ def resolve_material_texture(material, property_name, value, images_by_section,
     images_by_section[section] = image
     original_bindings[property_name] = section
     return section
-
-
-def prepare_export_root(root, incremental=False):
-    """Prepare an EFF export root; incremental mode keeps reusable files.
-
-    A normal export removes stale generated directories; incremental export
-    lets the session cache prune them after materialization.
-    """
-    root = Path(root).resolve()
-    marker = root / "mod.ini"
-    generated = False
-    if marker.is_file():
-        first_line = marker.read_text(encoding="utf-8-sig", errors="replace").splitlines()[:1]
-        generated = first_line == ["; Generated by EFF Blender add-on"]
-        if generated and not incremental:
-            for directory in ("meshes", "materials", "textures", "skeletons", "physics"):
-                candidate = (root / directory).resolve()
-                if candidate.parent == root and candidate.is_dir():
-                    shutil.rmtree(candidate)
-        if generated:
-            generated_ui = root / "ui.lua"
-            if generated_ui.is_file():
-                first_ui_line = generated_ui.read_text(
-                    encoding="utf-8-sig", errors="replace").splitlines()[:1]
-                if first_ui_line == [
-                    "-- Optional Blender template. All window behavior belongs to this Lua file."]:
-                    generated_ui.unlink()
-    root.mkdir(parents=True, exist_ok=True)
-    return root, generated
 
 
 def _validated_mod_folder_name(value):
@@ -2966,7 +2539,7 @@ def material_override_payload(material, images_by_section, force=False):
         "eiem_section", "eiem_source", "eiem_shader", "eiem_format",
         "eiem_version", "eiem_name", "eiem_target_path", "eiem_target_asset",
         "eiem_texture_sections_json", "eiem_baseline_json",
-        "eiem_material_file",
+        "eiem_material_file", "eiem_author_package", "eiem_native_id",
     }
     overrides = []
     referenced_images = set()
@@ -3056,818 +2629,55 @@ def unique_export_section(requested, used, prefix):
     return candidate
 
 
-def positive_weighted_bone_names(obj):
-    """Return vertex-group names that actually influence this Mesh."""
-    names_by_index = {group.index: group.name for group in obj.vertex_groups}
-    return {
-        names_by_index[membership.group]
-        for vertex in obj.data.vertices
-        for membership in vertex.groups
-        if membership.weight > 1e-8 and membership.group in names_by_index
-    }
-
-
-def package_physics_dependencies(plan, armatures, physics_objects):
-    """Resolve authored Physics used by the selected Mesh dependency closure.
-
-    Explicitly selected groups remain supported. In addition, a group is inferred
-    when a selected visible Mesh has positive vertex weights on one of its nodes.
-    This keeps Mesh-only export optional while preventing a physical Mesh export
-    from silently dropping the Physics resource that drives those bones.
-    """
-    if not rig_export_enabled():
-        # Mesh serialization still reads the Blender Armature for its skin
-        # palette, but this export deliberately emits no Skeleton/Physics
-        # resource declarations.
-        return [], {}
-    result_armatures = []
-    seen_armatures = set()
-    for rig in armatures or []:
-        identity = rig.as_pointer()
-        if identity not in seen_armatures:
-            seen_armatures.add(identity)
-            result_armatures.append(rig)
-
-    groups = []
-    seen_groups = set()
-    for obj in physics_objects or []:
-        if not obj or physics_authoring.native.is_native(obj):
-            raise ValueError("原生 Physics v2 目前只可作为导入、编辑和独立作者导出来源")
-        if obj.eiem_physics.kind != "GROUP":
-            raise ValueError("组合 Mod 只能包含新增作者物理组")
-        identity = obj.as_pointer()
-        if identity in seen_groups:
-            continue
-        seen_groups.add(identity)
-        groups.append(obj)
-
-    visible_meshes = [obj for obj in plan["objects"] if obj not in plan["hidden"]]
-    visible_rigs = {obj.find_armature() for obj in visible_meshes if obj.find_armature()}
-    weighted_bones_by_rig = {}
-    for obj in visible_meshes:
-        rig = obj.find_armature()
-        if not rig:
-            continue
-        weighted_bones_by_rig.setdefault(rig, set()).update(
-            positive_weighted_bone_names(obj))
-
-    for obj in bpy.data.objects:
-        if not hasattr(obj, "eiem_physics") or obj.eiem_physics.kind != "GROUP":
-            continue
-        rig = obj.eiem_physics.rig
-        if rig not in visible_rigs or obj.as_pointer() in seen_groups:
-            continue
-        node_ids = {node.bone_id for node in obj.eiem_physics.nodes}
-        node_names = {
-            bone.name for bone in rig.data.bones
-            if str(bone.get("eiem_physics_id", "")) in node_ids
-        }
-        if node_names & weighted_bones_by_rig.get(rig, set()):
-            seen_groups.add(obj.as_pointer())
-            groups.append(obj)
-
-    by_rig = {}
-    for group in groups:
-        rig = group.eiem_physics.rig
-        if not rig or rig.type != "ARMATURE":
-            raise ValueError("物理组缺少共享 Rig：" + group.name)
-        if not rig.get("eiem_section"):
-            raise ValueError("物理组的共享 Rig 不是 EFF Skeleton：" + rig.name)
-        if rig not in visible_rigs:
-            raise ValueError("物理组没有同 Rig 的所选可见 Mesh：" + group.name)
-        by_rig.setdefault(rig, []).append(group)
-        if rig.as_pointer() not in seen_armatures:
-            seen_armatures.add(rig.as_pointer())
-            result_armatures.append(rig)
-    for selected in by_rig.values():
-        selected.sort(key=lambda obj: obj.eiem_physics.identity)
-    return result_armatures, by_rig
-
-
 def export_package(root, mesh_objects=None, armatures=None, physics_objects=None,
-                   mesh_only=False, lod_levels=None, include_switches=True):
+                   mesh_only=False, lod_levels=None, include_switches=True,
+                   source_baseline='', resource_scope='ALL'):
+    """Export through the single format-2 author pipeline used by the UI.
+
+    Selection and Blender dependency updates stay in this facade. Native
+    encoding, author publication and offline compilation live in their focused
+    modules; callers cannot accidentally select the removed format-1 runtime
+    replacement writer.
+    """
     if mesh_objects is None:
-        if physics_objects is None:
-            physics_objects = selected_eiem_physics()
         mesh_objects, selected_armatures = selected_eiem_resources()
         if armatures is None:
             armatures = selected_armatures
-    mesh_objects = list(mesh_objects or [])
-    armatures = list(armatures or [])
+        if physics_objects is None:
+            physics_objects = selected_eiem_physics()
     if mesh_only:
-        # Mesh-only is explicit: keep the mesh's existing skin payload, but do
-        # not infer or publish Skeleton/Physics resource dependencies.
-        armatures = []
-        physics_objects = []
-    if not mesh_objects:
-        raise ValueError("No EFF mesh objects selected")
-    if bpy.context.mode != "OBJECT":
+        armatures, physics_objects = [], []
+    if not source_baseline:
+        source_baseline = getattr(bpy.context.scene, 'eiem_source_baseline', '')
+    if bpy.context.mode != 'OBJECT':
         raise ValueError('请回到物体模式后导出')
-    # Flush edits made through Blender's UI so the depsgraph handler can mark
-    # the affected Mesh, Armature, Material, or Shape Key before cache lookup.
+    # Consume user edits before looking up the snapshot cache. Updates produced
+    # by triangulation/tangent evaluation are consumed while suppressed so they
+    # do not turn an unchanged second export into a false miss.
     bpy.context.view_layer.update()
-    plan = (plan_mesh_only_export(mesh_objects)
-            if mesh_only else plan_switch_export(
-                mesh_objects, include_switches=include_switches))
-    if lod_levels is not None:
-        plan = expand_lod_plan(plan, lod_levels)
-    prepared_physics = None
-    if not mesh_only:
-        armatures, prepared_physics = package_physics_dependencies(
-            plan, armatures, physics_objects)
-    if not mesh_only and rig_export_enabled():
-        for obj in plan["objects"]:
-            rig = obj.find_armature()
-            if rig and not obj.hide_render:
-                authored = {
-                    bone.name for bone, record, source in skeleton_author_nodes(rig)
-                    if not source
-                }
-                if (authored & positive_weighted_bone_names(obj)
-                        and rig not in armatures):
-                    raise ValueError("%s 使用了新增骨架；请同时选择共享骨架后导出" % obj.name)
-    # Stage all validation and binary writes first. Invalid author data must
-    # not remove a previously working package.
-    destination = Path(root).resolve()
-    if any(str(destination).lower() == str(o.get("eiem_author_package", "")).lower()
-           for o in plan["objects"]):
-        raise ValueError("请选择新的 mod 输出目录，不要覆盖离线源资源包")
     global _EXPORT_IN_PROGRESS
-    cache_key = str(destination).casefold()
-    export_cache = _EXPORT_CACHES.get(cache_key)
-    if export_cache is None:
-        export_cache = _ExportResourceCache(destination)
-        _EXPORT_CACHES[cache_key] = export_cache
-    export_cache.begin_export()
+    previous_export = _EXPORT_IN_PROGRESS
     _EXPORT_IN_PROGRESS = True
     try:
-        with tempfile.TemporaryDirectory(prefix="eiem-export-") as temporary:
-            staging = Path(temporary)
-            stats = write_export_package(
-                staging, plan, armatures, physics_objects,
-                include_rig=not mesh_only, mesh_only=mesh_only,
-                include_switches=include_switches,
-                prepared_physics=prepared_physics,
-                export_cache=export_cache)
-            root, was_generated = prepare_export_root(destination, incremental=True)
-            # A cache hit can leave its existing resource file in place.  Only
-            # remove stale files when this is an EFF package we own; a newly
-            # selected arbitrary directory must not have its contents pruned.
-            if was_generated:
-                export_cache.prune_destination()
-            export_cache.prune_cache()
-            for item in staging.iterdir():
-                if item.is_dir():
-                    shutil.copytree(item, root / item.name, dirs_exist_ok=True)
-                elif item.name != "mod.ini":
-                    shutil.copy2(item, root / item.name)
-            shutil.copy2(staging / "mod.ini", root / "mod.ini")
-            print("[EFF] export cache: %d hits, %d misses" %
-                  (export_cache.hits, export_cache.misses))
-            export_cache.hits = 0
-            export_cache.misses = 0
-            # Consume mesh updates caused by calc_loop_triangles/calc_tangents
-            # while the handler is still suppressed; otherwise those internal
-            # writes would invalidate an unchanged resource on the next click.
-            bpy.context.view_layer.update()
-            return stats
+        return native_export.export_native_package(
+            sys.modules[__name__], root, list(mesh_objects or []),
+            armatures=list(armatures or []), physics_objects=list(physics_objects or []),
+            mesh_only=mesh_only, lod_levels=lod_levels,
+            include_switches=include_switches, source_baseline=source_baseline,
+            resource_scope=resource_scope)
     finally:
-        _EXPORT_IN_PROGRESS = False
-        export_cache.hits = 0
-        export_cache.misses = 0
+        try:
+            bpy.context.view_layer.update()
+        finally:
+            _EXPORT_IN_PROGRESS = previous_export
 
 
 def export_visible_package(root, context=None):
-    """Export the current visible mesh view without rig, physics or switches."""
+    """Export the current visible EFF mesh view using format 2."""
     meshes = visible_eiem_resources(context)
     if not meshes:
-        raise ValueError("No visible EFF mesh objects found")
-    previous_rig = os.environ.get("EFF_DISABLE_RIG_EXPORT")
-    os.environ["EFF_DISABLE_RIG_EXPORT"] = "1"
-    try:
-        return export_package(
-            root,
-            mesh_objects=meshes,
-            armatures=[],
-            physics_objects=[],
-            mesh_only=True,
-        )
-    finally:
-        if previous_rig is None:
-            os.environ.pop("EFF_DISABLE_RIG_EXPORT", None)
-        else:
-            os.environ["EFF_DISABLE_RIG_EXPORT"] = previous_rig
-
-
-def merged_source_keys(mesh_objects, plan):
-    """Return source identities whose selected parts will share one Mesh.
-
-    A merged Mesh has a new, global submesh/material-slot layout.  Its Render
-    therefore has to declare every material slot, including slots whose source
-    material was unchanged.  Ordinary single Mesh exports can still omit those
-    unchanged declarations and inherit the game's original material array.
-    """
-    groups = {}
-    for obj in mesh_objects:
-        if obj in plan["hidden"]:
-            continue
-        groups.setdefault(mesh_source_identity(obj), 0)
-        groups[mesh_source_identity(obj)] += 1
-    return {key for key, count in groups.items() if count >= 2}
-
-
-def rig_export_enabled():
-    """Whether Skeleton/Physics resource files are emitted by this export."""
-    return os.environ.get("EFF_DISABLE_RIG_EXPORT", "").strip() not in (
-        "1", "true", "yes")
-
-
-def build_merged_action(mesh_objects, plan, root, object_actions, shape_bindings,
-                        material_sections, material_payloads, exported_armatures,
-                        physics_sections, seen_mesh_sections, shared_mesh_sections,
-                        resource_lines, export_cache=None):
-    """Collapse each source Mesh's sibling parts into one exported Mesh.
-
-    A source Renderer carries exactly one Mesh, so sibling parts mounted on one
-    source Renderer have to travel inside one Mesh. Exporting them separately
-    makes the runtime create extra Renderers and register them after the game has
-    already built its renderer registry, which is where a part could end up
-    outside that registry and render in its bind pose.
-
-    Merging is keyed on the source Mesh identity, which is also what the export
-    plan groups by, so a group can never mix two different source Meshes. The
-    merged Mesh carries one submesh per material slot of each part, and every
-    part is left addressing that one section so the source Render declares a
-    single direct mesh replacement with no additional Renderers.
-    """
-    merged_groups = {}
-    for obj in mesh_objects:
-        if obj in plan["hidden"]:
-            continue
-        key = mesh_source_identity(obj)
-        groups = merged_groups.setdefault(key, {"members": []})
-        groups["members"].append(obj)
-
-    shared_merged = {}
-    for key, group in sorted(merged_groups.items(), key=lambda item: item[0]):
-        members = group["members"]
-        if len(members) < 2:
-            # A single part already declares the source's own Mesh.
-            del merged_groups[key]
-            continue
-        # LOD views may arrive in a different plan order. Canonicalize by the
-        # authored objects so geometry, submesh slots, materials, and switches
-        # retain one order for every Render rule sharing this resource.
-        members.sort(key=lambda member: (
-            mesh_export_template(member).name,
-            mesh_export_template(member).as_pointer()))
-        first = members[0]
-        templates = [mesh_export_template(member) for member in members]
-        template_key = tuple(template.as_pointer() for template in templates)
-        shared = shared_merged.get(template_key)
-        # Name the merged resource after the part it replaces, marked as merged,
-        # so a generated mod.ini shows at a glance that one Mesh carries the
-        # whole group.
-        if shared is None:
-            template_first = templates[0]
-            section = unique_export_section(
-                str(template_first.data["eiem_section"]) + "_MERGED",
-                seen_mesh_sections, "Mesh")
-            filename = "meshes/" + section + ".mesh"
-            if export_cache is None:
-                stats = write_merged_mesh(root / filename, templates)
-            else:
-                stats = {}
-                hit = export_cache.materialize(
-                    filename,
-                    ("merged-v1", tuple(_mesh_resource_token(template)
-                                        for template in templates)),
-                    root / filename,
-                    lambda path: stats.update(write_merged_mesh(path, templates)))
-                if hit:
-                    stats = export_cache.metadata[filename]
-                else:
-                    export_cache.metadata[filename] = dict(stats)
-            shared_merged[template_key] = (section, stats)
-            wrote_resource = True
-        else:
-            section, stats = shared
-            wrote_resource = False
-        # One submesh per material slot, parts in member order, so a part's first
-        # slot lands after all earlier parts' slots. Material slots must be
-        # numbered in that same merged space or a later part would overwrite an
-        # earlier one's slot.
-        action = ["mesh=" + section]
-        action.extend(shape_bindings.get(first, []))
-        rig = first.find_armature()
-        skeleton = exported_armatures.get(rig)
-        if skeleton:
-            action.append("skeleton=" + skeleton)
-        physics = physics_sections.get(rig)
-        if physics:
-            action.append("physics=" + physics)
-        slot_offset = 0
-        slot_ranges = {}
-        for position, member in enumerate(members):
-            slot_count = stats["slots"][position]
-            slot_ranges[member] = (slot_offset, slot_offset + slot_count)
-            for slot, material in enumerate(member.data.materials):
-                material_section = material_sections.get(material, "")
-                if material_section in material_payloads:
-                    action.append("material.%d=%s"
-                                  % (slot_offset + slot, material_section))
-            slot_offset += slot_count
-        for member in members:
-            object_actions[member] = list(action)
-        group["slot_ranges"] = slot_ranges
-
-        if wrote_resource:
-            template_first = templates[0]
-            declaration = [
-                "[" + section + "]", "path=" + filename,
-                "source=" + str(template_first.data.get("eiem_source", "")),
-                "asset=" + str(template_first.data.get(
-                    "eiem_asset", template_first.name)),
-            ]
-            target_path = str(template_first.data.get(
-                "eiem_target_path", "")).strip()
-            if target_path:
-                declaration.extend([
-                    "target.path=" + target_path,
-                    "target.asset=" + str(template_first.data.get(
-                        "eiem_target_asset", "")),
-                ])
-            declaration.append("")
-            resource_lines.extend(declaration)
-    return merged_groups
-
-
-def _normalise_visibility_binding(binding):
-    """Return the common binding shape used by the exporter.
-
-    Older callers may still provide ``(variable, visible_values)``. New
-    overlap-aware plans provide dictionaries carrying all state values.
-    """
-    if isinstance(binding, tuple):
-        variable, visible = binding
-        values = tuple(visible)
-        return {"variable": variable, "values": values, "visible": values}
-    if not isinstance(binding, dict):
-        raise ValueError("invalid switch visibility binding")
-    return {
-        "variable": str(binding.get("variable", "")),
-        "values": tuple(binding.get("values", ())),
-        "visible": tuple(binding.get("visible", ())),
-    }
-
-
-def _visibility_entries_overlap(entries):
-    masks = []
-    for binding, start, end in entries:
-        if start < 0 or end > 32 or start >= end:
-            raise ValueError('按键控制的合并 Mesh 必须包含 1 到 32 个 submesh')
-        mask = ((1 << (end - start)) - 1) << start
-        if any(mask & other for other in masks):
-            return True
-        masks.append(mask)
-    return False
-
-
-def _append_visibility_metadata(lines, entries):
-    combined = {}
-    order = []
-    for raw_binding, start, end in entries:
-        binding = _normalise_visibility_binding(raw_binding)
-        variable = binding["variable"]
-        values = tuple(binding["values"])
-        visible = set(binding["visible"])
-        if not variable or not values or len(values) > 32:
-            raise ValueError("invalid switch visibility binding")
-        slot_mask = ((1 << (end - start)) - 1) << start
-        item = combined.get(variable)
-        if item is None:
-            item = {"values": values, "masks": [0] * len(values),
-                    "controlled": 0}
-            combined[variable] = item
-            order.append(variable)
-        elif item["values"] != values:
-            raise ValueError("同一切换组在合并 Mesh 中的状态值不一致")
-        item["controlled"] |= slot_mask
-        for index, value in enumerate(values):
-            if value in visible:
-                item["masks"][index] |= slot_mask
-    for index, variable in enumerate(order):
-        item = combined[variable]
-        lines.extend([
-            "visibility.%d.variable=%s" % (index, variable),
-            "visibility.%d.values=%s" % (
-                index, ",".join(str(value) for value in item["values"])),
-            "visibility.%d.masks=%s" % (
-                index, ",".join(str(mask) for mask in item["masks"])),
-            "visibility.%d.controlled=%d" % (index, item["controlled"]),
-        ])
-
-
-def append_submesh_visibility(lines, binding, start, end):
-    """Emit old syntax for disjoint groups or metadata for overlap."""
-    if not binding:
-        return
-    entries = [(item, start, end) for item in (
-        binding if isinstance(binding, list) else [binding])]
-    if not _visibility_entries_overlap(entries):
-        for item, item_start, item_end in entries:
-            normal = _normalise_visibility_binding(item)
-            variable, visible = normal["variable"], normal["visible"]
-            condition = " || ".join(
-                "%s == %d" % (variable, value) for value in visible)
-            for submesh in range(item_start, item_end):
-                if not condition:
-                    lines.append("submesh_visible.%d=false" % submesh)
-                else:
-                    lines.extend([
-                        "if " + condition,
-                        "    submesh_visible.%d=true" % submesh,
-                        "else",
-                        "    submesh_visible.%d=false" % submesh,
-                        "endif",
-                    ])
-        return
-    _append_visibility_metadata(lines, entries)
-
-
-def append_visibility_for_members(lines, members, switch_bindings,
-                                  slot_ranges):
-    """Emit visibility for a merged Render, preserving all member ranges."""
-    entries = []
-    for member in members:
-        bindings = switch_bindings.get(member)
-        if not bindings:
-            continue
-        if not isinstance(bindings, list):
-            bindings = [bindings]
-        for binding in bindings:
-            start, end = slot_ranges[member]
-            entries.append((binding, start, end))
-    if not entries:
-        return
-    if not _visibility_entries_overlap(entries):
-        for binding, start, end in entries:
-            append_submesh_visibility(lines, binding, start, end)
-    else:
-        _append_visibility_metadata(lines, entries)
-
-def write_export_package(root, plan, armatures, physics_objects=None,
-                         include_rig=True, mesh_only=False, include_switches=True,
-                         prepared_physics=None, export_cache=None):
-    # A hidden selection declares skip only: its geometry, materials, textures
-    # and shape controls must not become resource dependencies.
-    mesh_objects = [o for o in plan["objects"] if o not in plan["hidden"]]
-    if include_rig:
-        if prepared_physics is None:
-            armatures, physics_by_rig = package_physics_dependencies(
-                plan, armatures, physics_objects)
-        else:
-            physics_by_rig = prepared_physics
-    else:
-        armatures, physics_by_rig = [], {}
-
-    # The export graph is rooted at the selected Mesh resources. Materials and
-    # images outside this dependency closure are never written.
-    referenced_materials = {}
-    force_materials = set()
-    material_sections = {}
-    used_material_sections = set()
-    merged_keys = merged_source_keys(mesh_objects, plan)
-    for obj in mesh_objects:
-        original_slots = parse_json_property(
-            obj, "eiem_original_material_sections_json", {})
-        for slot, material in enumerate(obj.data.materials):
-            if not material:
-                continue
-            original_section = str(material.get("eiem_section", ""))
-            if not original_section:
-                raise ValueError(
-                    "Mesh %s material slot %d is not an EFF material" %
-                    (obj.name, slot))
-            if material not in material_sections:
-                material_sections[material] = unique_export_section(
-                    original_section, used_material_sections, "Material")
-            section = material_sections[material]
-            referenced_materials[section] = material
-            if (mesh_source_identity(obj) in merged_keys or
-                    str(original_slots.get(str(slot), "")) != original_section):
-                force_materials.add(section)
-
-    images_by_section = {
-        str(image.get("eiem_section")): image for image in bpy.data.images
-        if image.get("eiem_section")
-    }
-    material_payloads = {}
-    referenced_images = set()
-    for section, material in sorted(referenced_materials.items()):
-        values, images = material_override_payload(
-            material, images_by_section, section in force_materials)
-        if values is None:
-            continue
-        material_payloads[section] = (material, values)
-        referenced_images.update(images)
-
-    resource_lines = ["; Generated by EFF Blender add-on", ""]
-    render_lines = []
-    seen_render_sections = set()
-    object_actions = {}
-    if mesh_only:
-        # A Mesh-only package has no authoring controls.  In particular, do not
-        # inspect unrelated switch/shape metadata attached to the selected
-        # object; those controls belong to a full package export.
-        shape_controls, shape_bindings, shape_hotkeys = [], {}, []
-        switches_enabled = False
-    else:
-        shape_controls, shape_bindings, shape_hotkeys = plan_shape_controls(
-            mesh_objects, include_hotkeys=include_switches)
-        switches_enabled = include_switches
-    switch_groups = plan["groups"] if switches_enabled else []
-    switch_bindings = plan["bindings"] if switches_enabled else {}
-    if not switches_enabled:
-        shape_hotkeys = []
-    used_hotkeys = {group[3] for group in switch_groups}
-    for control in shape_hotkeys:
-        if control["key"] in used_hotkeys:
-            raise ValueError("多个控制使用同一快捷键：" + control["key"])
-        used_hotkeys.add(control["key"])
-    if switch_groups or shape_controls:
-        resource_lines.append("[Constants]")
-        for group, states, default, key, variable in switch_groups:
-            resource_lines.append("persist %s=%d" % (variable, default))
-        for variable, label, default, minimum, maximum in shape_controls:
-            resource_lines.append("persist %s=%.9g" % (variable, default))
-        resource_lines.append("")
-        for index, (variable, label, default, minimum, maximum) in enumerate(shape_controls, 1):
-            resource_lines.extend([
-                "[ShapeControl%d]" % index,
-                "variable=" + variable,
-                "label=" + label,
-                "min=%.9g" % minimum,
-                "max=%.9g" % maximum,
-                "",
-            ])
-        for index, (group, states, default, key, variable) in enumerate(switch_groups, 1):
-            key_lines = [
-                "; " + group.name.replace("\n", " ").replace("\r", " "),
-                "[KeySwitch%d]" % index, "key=" + key, "type=cycle",
-                variable + "=" + ",".join(str(i) for i in switch_state_values(group)),
-            ]
-            resource_lines.extend(key_lines + [""])
-        for index, control in enumerate(shape_hotkeys, 1):
-            resource_lines.extend([
-                "; " + control["label"].replace("\n", " ").replace("\r", " "),
-                "[KeyShape%d]" % index,
-                "key=" + control["key"],
-                "type=" + control.get("type", "hold"),
-                "speed=%.9g" % control.get("speed", 1.0),
-                control["variable"] + "=%.9g" % control["target"],
-                "",
-            ])
-    exported_armatures = {}
-    seen_skeleton_sections = set()
-    seen_physics_sections = set()
-    physics_sections = {}
-    for rig in physics_by_rig:
-        requested = str(rig.get("eiem_physics_section", "")).strip()
-        if not requested:
-            requested = "Physics" + str(rig.get("eiem_section", rig.name))
-        physics_sections[rig] = unique_export_section(
-            requested, seen_physics_sections, "Physics")
-    for armature in armatures:
-        section = unique_export_section(armature["eiem_section"], seen_skeleton_sections, "Skeleton")
-        exported_armatures[armature] = section
-        physics_section = physics_sections.get(armature)
-        filename = ("physics/" + physics_section + "/skeleton.skeleton"
-                    if physics_section else "skeletons/" + section + ".skeleton")
-        (root / filename).parent.mkdir(parents=True, exist_ok=True)
-        if export_cache is None:
-            write_skeleton(root / filename, armature)
-        else:
-            export_cache.materialize(
-                filename, _skeleton_resource_token(armature), root / filename,
-                lambda path: write_skeleton(path, armature))
-        declaration = [
-            "[" + section + "]", "path=" + filename,
-            "source=" + str(armature.get("eiem_source", "")),
-        ]
-        target_path = str(armature.get("eiem_target_path", "")).strip()
-        if target_path:
-            declaration.extend([
-                "target.path=" + target_path,
-                "target.asset=" + str(armature.get("eiem_target_asset", "")),
-            ])
-        declaration.append("")
-        resource_lines.extend(declaration)
-
-    for rig, groups in physics_by_rig.items():
-        section = physics_sections[rig]
-        directory = root / "physics" / section
-        filename = "physics/" + section + "/" + section + ".physics"
-        payload = physics_authoring.author_document(groups, "skeleton.skeleton")
-        directory.mkdir(parents=True, exist_ok=True)
-        if export_cache is None:
-            (root / filename).write_bytes(
-                physics_authoring.document.encode(payload))
-        else:
-            payload_bytes = physics_authoring.document.encode(payload)
-            export_cache.materialize(
-                filename,
-                ("physics-v2", _owner_revision(rig),
-                 tuple(_owner_revision(group) for group in groups),
-                 hashlib.sha1(payload_bytes).hexdigest()),
-                root / filename,
-                lambda path: path.write_bytes(payload_bytes))
-        resource_lines.extend(["[" + section + "]", "path=" + filename, ""])
-
-    if mesh_objects:
-        (root / "meshes").mkdir(exist_ok=True)
-    seen_mesh_sections = set()
-    shared_mesh_sections = {}
-    merged_groups = build_merged_action(
-        mesh_objects, plan, root, object_actions, shape_bindings,
-        material_sections, material_payloads, exported_armatures, physics_sections,
-        seen_mesh_sections, shared_mesh_sections, resource_lines, export_cache)
-    merged_objects = {
-        obj for group in merged_groups.values() for obj in group["members"]
-    }
-    for obj in mesh_objects:
-        if obj in merged_objects:
-            continue
-        # A synchronized LOD view changes the target Renderer only. Its Mesh
-        # buffers and source-slot provenance remain those of the selected
-        # authored template, so every target LOD must reference one resource.
-        template = mesh_export_template(obj)
-        rig = template.find_armature()
-        data_identity = (template.data.as_pointer(),
-                         rig.as_pointer() if rig else 0,
-                         tuple(g.name for g in template.vertex_groups),
-                         str(template.get("eiem_bone_palette_json", "")),
-                         str(template.get("eiem_bindposes_json", "")),
-                         str(template.get("eiem_bone_paths_json", "")),
-                         str(template.get("eiem_bone_sources_json", "")))
-        section = shared_mesh_sections.get(data_identity)
-        if section is None:
-            section = unique_export_section(
-                template.data["eiem_section"], seen_mesh_sections, "Mesh")
-            shared_mesh_sections[data_identity] = section
-            filename = "meshes/" + section + ".mesh"
-            # Merged groups were already written by build_merged_action, which
-            # also re-pointed every member at the shared section. What is left
-            # here is one Mesh per part.
-            if export_cache is None:
-                write_mesh(root / filename, template)
-            else:
-                export_cache.materialize(
-                    filename, _mesh_resource_token(template), root / filename,
-                    lambda path: write_mesh(path, template))
-            declaration = [
-                "[" + section + "]", "path=" + filename,
-                "source=" + str(template.data.get("eiem_source", "")),
-                "asset=" + str(template.data.get(
-                    "eiem_asset", template.name)),
-            ]
-            target_path = str(template.data.get(
-                "eiem_target_path", "")).strip()
-            if target_path:
-                declaration.extend([
-                    "target.path=" + target_path,
-                    "target.asset=" + str(template.data.get(
-                        "eiem_target_asset", "")),
-                ])
-            declaration.append("")
-            resource_lines.extend(declaration)
-        action = ["mesh=" + section]
-        action.extend(shape_bindings.get(obj, []))
-        rig = obj.find_armature()
-        skeleton = exported_armatures.get(rig)
-        if skeleton:
-            action.append("skeleton=" + skeleton)
-        physics = physics_sections.get(rig)
-        if physics:
-            action.append("physics=" + physics)
-        for slot, material in enumerate(obj.data.materials):
-            material_section = material_sections.get(material, "")
-            if material_section in material_payloads:
-                action.append("material.%d=%s" % (slot, material_section))
-        object_actions[obj] = action
-
-    for source_index, objects in enumerate(plan["sources"], 1):
-        first = objects[0]
-        root_render = unique_export_section(
-            first.get("eiem_render_section", "RenderSource%d" % source_index),
-            seen_render_sections, "Render")
-        asset = str(first.get("eiem_render_asset", "") or first.data.get(
-            "eiem_target_asset", first.data.get("eiem_asset", "")))
-
-        merged = merged_groups.get(mesh_source_identity(first))
-        if merged:
-            # All active members share one source Renderer and one generated
-            # Mesh. A switch changes only the corresponding submesh index
-            # buffers, preserving the game's skeleton/LOD/physics ownership.
-            render_lines.extend(["[" + root_render + "]", "asset=" + asset])
-            render_lines.extend(object_actions[merged["members"][0]])
-            append_visibility_for_members(
-                render_lines, merged["members"], switch_bindings,
-                merged["slot_ranges"])
-            render_lines.append("")
-            continue
-        render_lines.extend(["[" + root_render + "]", "asset=" + asset])
-        active_objects = [obj for obj in objects if obj in object_actions]
-        if not active_objects:
-            render_lines.extend(["handling=skip", ""])
-            continue
-        if len(active_objects) != 1:
-            raise ValueError(
-                "同一源 Mesh 的多个可见部件未能合并，拒绝回退到额外 Renderer")
-        active = active_objects[0]
-        render_lines.extend(object_actions[active])
-        append_submesh_visibility(
-            render_lines, switch_bindings.get(active), 0,
-            max(1, len(active.data.materials)))
-        render_lines.append("")
-
-    if material_payloads:
-        (root / "materials").mkdir(exist_ok=True)
-    for section, (material, values) in sorted(material_payloads.items()):
-        filename = "materials/" + section + ".mat"
-        material_text = "\n".join(values) + "\n"
-        if export_cache is None:
-            (root / filename).write_text(material_text, encoding="utf-8")
-        else:
-            export_cache.materialize(
-                filename,
-                ("material-v2", _material_resource_token(material),
-                 section in force_materials,
-                 hashlib.sha1(material_text.encode("utf-8")).hexdigest()),
-                root / filename,
-                lambda path: path.write_text(material_text, encoding="utf-8"))
-        declaration = ["[" + section + "]", "path=" + filename]
-        target_path = str(material.get("eiem_target_path", ""))
-        if target_path:
-            declaration.extend([
-                "target.path=" + target_path,
-                "target.asset=" + str(material.get(
-                    "eiem_target_asset", material.get("eiem_name", material.name))),
-            ])
-        declaration.append("")
-        resource_lines.extend(declaration)
-
-    if referenced_images:
-        (root / "textures").mkdir(exist_ok=True)
-    output_textures = {}
-    for section in sorted(referenced_images):
-        image = images_by_section.get(section)
-        if image is None:
-            raise ValueError("Material references missing Texture section " + section)
-        disk_name = texture_output_filename(image)
-        filename = "textures/" + disk_name
-        collision = output_textures.get(disk_name.lower())
-        if collision is not None and collision is not image and not texture_images_equal(collision, image):
-            raise ValueError(
-                "Two modified textures use the same filename with different content: " + disk_name)
-        if collision is None:
-            if export_cache is None:
-                write_texture(root / filename, image)
-            else:
-                export_cache.materialize(
-                    filename, _texture_resource_token(image), root / filename,
-                    lambda path: write_texture(path, image))
-            output_textures[disk_name.lower()] = image
-        declaration = [
-            "[" + section + "]", "path=" + filename,
-            "source=" + str(image.get("eiem_source", "")),
-            "name=" + str(image.get("eiem_name", image.name)),
-        ]
-        target_path = str(image.get("eiem_target_path", ""))
-        if target_path:
-            declaration.extend([
-                "target.path=" + target_path,
-                "target.asset=" + str(image.get("eiem_target_asset", image.name)),
-            ])
-        declaration.extend([
-            "linear=" + str(image.get("eiem_linear", "false")),
-            "mipmaps=" + str(image.get("eiem_mipmaps", "true")),
-            "filter=" + str(image.get("eiem_filter", "1")),
-            "wrap=" + str(image.get("eiem_wrap", "0")),
-            "aniso=" + str(image.get("eiem_aniso", "1")),
-            "mip_bias=" + str(image.get("eiem_mip_bias", "0")), "",
-        ])
-        resource_lines.extend(declaration)
-
-    (root / "mod.ini").write_text(
-        "\n".join(resource_lines + render_lines), encoding="utf-8")
-    return {
-        "meshes": len(seen_mesh_sections),
-        "skeletons": len(exported_armatures),
-        "physics": len(physics_sections),
-        "materials": len(material_payloads), "textures": len(referenced_images),
-        "prefabs": 0,
-    }
+        raise ValueError('No visible EFF mesh objects found')
+    return export_package(root, meshes, [], [], mesh_only=True)
 
 
 EFF_INTERNAL_MATERIAL_PROPERTIES = {
@@ -4869,9 +3679,7 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
         try:
             meshes, rigs = selected_eiem_resources(context)
             levels = self._lod_levels(meshes) if self.resource_scope == 'ALL' else None
-            from .eiem_native_export import export_native_package
-            stats = export_native_package(
-                sys.modules[__name__],
+            stats = export_package(
                 mod_export_directory(
                     self.directory or os.path.dirname(self.filepath), self.filepath,
                     context.scene.eiem_export_mod_name),
@@ -4923,9 +3731,7 @@ class EFF_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
         try:
             meshes, _ = selected_eiem_resources(context)
             levels = self._lod_levels(meshes)
-            from .eiem_native_export import export_native_package
-            stats = export_native_package(
-                sys.modules[__name__],
+            stats = export_package(
                 mod_export_directory(
                     self.directory or os.path.dirname(self.filepath), self.filepath,
                     context.scene.eiem_export_mod_name),
@@ -5068,9 +3874,9 @@ classes = (
 
 
 def register():
-    if _eiem_export_cache_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
+    if _eiem_export_dirty_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(
-            _eiem_export_cache_depsgraph_update)
+            _eiem_export_dirty_depsgraph_update)
     for cls in classes: bpy.utils.register_class(cls)
     physics_authoring.register(globals())
     bpy.types.Mesh.eiem_shape_controls = CollectionProperty(type=EFF_PG_shape_control)
@@ -5090,9 +3896,9 @@ def register():
 
 
 def unregister():
-    if _eiem_export_cache_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
+    if _eiem_export_dirty_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(
-            _eiem_export_cache_depsgraph_update)
+            _eiem_export_dirty_depsgraph_update)
     physics_authoring.unregister()
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_export)

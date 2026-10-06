@@ -32,7 +32,10 @@ jobs:
         run: |
           $package = "EFF_Blender"
           New-Item -ItemType Directory -Force -Path $package | Out-Null
-          Copy-Item __init__.py,eiem_blender_addon.py,eiem_blender_controls.py,eiem_export_cache.py,eiem_release.py,eiem_format.py,eiem_lod.py,eiem_physics_authoring.py,eiem_physics_document.py,eiem_physics_native.py,eiem_physics_source.py,README.md,LICENSE,THIRD_PARTY_NOTICES -Destination $package
+          Copy-Item __init__.py,eiem_blender_addon.py,eiem_blender_controls.py,eiem_native_export.py,eiem_offline_reload.py,eiem_release.py,eiem_format.py,eiem_lod.py,eiem_physics_authoring.py,eiem_physics_document.py,eiem_physics_native.py,eiem_physics_source.py,README.md,LICENSE,THIRD_PARTY_NOTICES -Destination $package
+          if (-not (Test-Path nativepack)) { throw 'Release requires a generated nativepack/ bundle; run the canonical tools/diagnostics/bundle_blender_native_export.py step before packaging.' }
+          Copy-Item nativepack -Destination $package -Recurse
+          if (Test-Path vendor) { Copy-Item vendor -Destination $package -Recurse }
           Compress-Archive -Path $package -DestinationPath "EFF_Blender_${{ github.ref_name }}.zip"
       - uses: softprops/action-gh-release@v2
         with:

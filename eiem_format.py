@@ -51,7 +51,7 @@ class Reader:
 
     def floats(self):
         count = self.i32()
-        if count < 0 or count > 100000000:
+        if count < 0:
             raise ValueError("invalid EFF array length")
         return self.array("f", count)
 
@@ -192,8 +192,6 @@ def read_mesh(path):
     if reader.take(8) != MAGIC_MESH:
         raise ValueError("not an EFF mesh")
     version = reader.i32()
-    if version != 6:
-        raise ValueError(f"unsupported EFF mesh version {version}; re-export with the current AnimeStudio")
     coordinate = reader.string()
     source = reader.string()
     name = reader.string()
@@ -225,7 +223,7 @@ def read_mesh(path):
     bone_source_candidates = []
     for _ in range(candidate_slots):
         candidate_count = reader.i32()
-        if candidate_count < 0 or candidate_count > 1024:
+        if candidate_count < 0 or candidate_count > (len(reader.data)-reader.pos)//6:
             raise ValueError("invalid mesh bone source candidate count")
         bone_source_candidates.append([
             (reader.string(), reader.string(), reader.u32())
@@ -273,11 +271,9 @@ def read_skeleton(path):
     if reader.take(8) != MAGIC_SKEL:
         raise ValueError("not an EFF skeleton")
     version = reader.i32()
-    if version != 2:
-        raise ValueError("unsupported EFF skeleton version")
     coordinate = reader.string()
     count = reader.i32()
-    if coordinate != "unity-y-up-left-handed" or not 0 < count <= 16384:
+    if coordinate != "unity-y-up-left-handed" or not 0 < count or count > (len(reader.data)-reader.pos)//45:
         raise ValueError("invalid skeleton coordinate space or node count")
     nodes = []
     for _ in range(max(0, count)):
@@ -286,7 +282,7 @@ def read_skeleton(path):
                       struct.unpack("<4f", reader.take(16)),
                       struct.unpack("<3f", reader.take(12))))
     bone_count = reader.i32()
-    if not 0 <= bone_count <= 16384:
+    if not 0 <= bone_count or bone_count > (len(reader.data)-reader.pos)//4:
         raise ValueError("invalid skeleton palette count")
     bones = [reader.i32() for _ in range(max(0, bone_count))]
     root_bone = reader.i32()
@@ -303,11 +299,11 @@ def read_skeleton(path):
 
 
 def validate_skeleton_nodes(nodes, source_nodes):
-    if not 0 < len(nodes) <= 16384 or len(nodes) != len(source_nodes):
+    if not 0 < len(nodes) or len(nodes) != len(source_nodes):
         raise ValueError("invalid skeleton node count")
     seen = set()
     for i, (path, parent, position, rotation, scale) in enumerate(nodes):
-        if (path in seen or len(path.encode("utf-8")) > 4096 or "\\" in path or "\0" in path or
+        if (path in seen or "\\" in path or "\0" in path or
                 any(part in ("", ".", "..") for part in path.split("/")) and path != ""):
             raise ValueError("invalid or duplicate skeleton path: " + path)
         seen.add(path)

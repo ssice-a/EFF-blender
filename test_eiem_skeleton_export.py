@@ -11,7 +11,9 @@ from mathutils import Matrix, Quaternion, Vector
 
 addon_path, output = map(Path, sys.argv[sys.argv.index('--') + 1:])
 spec=importlib.util.spec_from_file_location('eiem_skeleton_test',addon_path)
-addon=importlib.util.module_from_spec(spec); spec.loader.exec_module(addon); addon.register()
+addon=importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = addon
+spec.loader.exec_module(addon); addon.register()
 
 def flat(m): return [m[r][c] for c in range(4) for r in range(4)]
 def matrix(record):
