@@ -2,6 +2,8 @@
 
 EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以在 Blender 中编辑网格、材质、贴图、款式切换和形态键，然后导出可放入 EFF `plugin/mods` 的 Mod 文件夹。
 
+本次发布 **v0.40.0**，配套 [EFF v1.3.0](https://github.com/ssice-a/EFF/releases/tag/v1.3.0) 与 [AnimeStudio v1.3.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.3.0)。Windows x64 发布包包含原生导出核心、资源编译器、来源工具及 Pillow；已在 Blender 5.0.1 / Python 3.11 验证。其他 Python 布局需要对应的依赖构建。
+
 ## 功能
 
 - 导入和编辑 EFF 网格、材质、贴图、骨骼、LOD 与物理资源。
@@ -9,12 +11,14 @@ EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以
 - 为形态键提供 Blender 滑块，并可按需录制游戏快捷键。
 - 创建款式切换组，设置默认款式和游戏快捷键。
 - 导出 format 2 完整 Mod，或更新已有 Mod 的 Mesh、材质和贴图；导出按键切换选项默认开启。
-- 导出复用当前 Blender 会话内的 Mesh 快照及离线编译缓存。
+- 分资源导出复用当前会话 Mesh 快照及离线编译缓存；仅贴图导出保留已有完整 Mod 的其他资源。
+- 自动生成每个 Mod 的 `source-inputs.bin`，按完整 mods 集合准备替换规则。
+- 同一游戏材质可作为多个独立作者材质的模板，各自保留参数和贴图绑定。
 - 在 EFF 面板中检查 GitHub Release 更新并忽略指定版本。
 
 ## 安装
 
-从 [Releases](https://github.com/ssice-a/EFF-blender/releases) 下载 `EFF_Blender_v*.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。更新前先移除旧版并保存当前 `.blend` 工程。
+从 [Releases](https://github.com/ssice-a/EFF-blender/releases) 下载 `EFF_Blender_v0.40.0.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。更新前保存工程、关闭 Blender，再替换旧插件并重新启动，以释放原生 DLL 和旧 Python 模块。
 
 ## 制作 Mod
 
@@ -24,13 +28,17 @@ EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以
 4. 需要形态键时，在网格数据属性的 **EFF 形态键控制**中点击“接管当前形态键”。这会把已有的 Blender 形态键登记为导出滑块；它不会修改顶点，也不会自动创建游戏快捷键。快捷键需要在同一面板中单独录制。
 5. 选择要导出的 EFF 网格，在 EFF 面板或 **文件 → 导出** 中选择“导出所选 Mod”。首次选择“全部资源”；后续可以选择“仅 Mesh”“仅材质与贴图”或“仅贴图”更新已有完整 Mod。完整导出窗口中的“导出按键切换”默认勾选；取消后只导出默认款式，不导出款式和形态键快捷键，但仍保留形态键及其滑块。
 6. 在 EFF 导出区域填写 Mod 文件夹名，然后在文件浏览器中选择父目录；插件创建或刷新同名文件夹，把 `mod.ini`、`meshes/`、`materials/` 和 `textures/` 写入其中，再准备离线候选。需要直接在游戏中使用时，父目录选择游戏的 `plugin/mods/`。文件浏览器里的文件名不决定 Mod 名称。
-7. 进入游戏后按小键盘减号（`NUMPADMINUS`）刷新 Mod。该按键写入游戏全局设置，不再占用 F10。
+7. 等待导出和离线准备完成，进入游戏后按 **F10** 热重载。按 **Ins** 选择接收物理按键的 Mod；默认选中首个可控制 Mod。实际快捷键以游戏 `plugin/eff.ini` 为准。
 
 完整导出要生成游戏可加载的离线候选时，请设置 `EFF_RELOAD_GAME` 环境变量指向当前游戏目录；如果输出目录本身位于 `plugin/mods/<Mod>` 下，插件会从目录结构推断游戏目录。插件不保存开发者本机的游戏路径，也不会把固定的 Mod 名称写入代码。
 
 导出只处理当前选择的资源。请保留 AnimeStudio 源包和 `.blend` 工程，避免覆盖源资源。
 
-Physics 参数和预览仍可在作者工具中编辑；新增 Physics 的游戏原生导出尚未接通。多个作者包可以在 Blender 中共存，同名材质和贴图会保持来源归属；当前 DLL 的热重载事务仍只支持一个 Mod，不能据此认为多个 Mod 可以同时热重载。
+多个作者包可以在 Blender 中共存，同名材质和贴图保持精确来源归属。每个导出 Mod 的 INI 是作者规则入口；F10 统一加载整个 mods 目录，包括多角色的增删与资源修改。全 LOD 导出会把当前作者几何映射到各目标 LOD，不会自动减面。
+
+保留源包的 `source/manifest.json` 和 `source/serialized/` 供精确来源和字段模板读取；普通 Blender 导出不读取 `source/streams/` 的原始载荷快照。新解包贴图使用短名称，旧包的哈希名称按自己的 INI/manifest 继续使用，不能只改文件名而不更新引用。游戏 Mod 无需携带原包快照或全局索引。
+
+Physics 参数和预览仍可在作者工具中编辑，新增 Physics 尚未接通完整游戏模拟链。当前测试不代表所有角色或二三十个 Mod 的性能已经验证。
 
 ## 更新
 

@@ -10,10 +10,39 @@ permissions:
 
 jobs:
   package:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+    env:
+      FRAMEWORK_TAG: v1.3.0
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout paired framework sources
+        uses: actions/checkout@v4
+        with:
+          repository: ssice-a/EFF
+          ref: ${{ env.FRAMEWORK_TAG }}
+          path: framework
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Fetch paired compiler and source tool
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download $env:FRAMEWORK_TAG --repo ssice-a/EFF --pattern "EFF_${env:FRAMEWORK_TAG}_dll.zip" --dir framework/bin/paired-release
+          if ($LASTEXITCODE -ne 0) { throw 'Paired EFF release unavailable' }
+          Expand-Archive "framework/bin/paired-release/EFF_${env:FRAMEWORK_TAG}_dll.zip" framework/bin/paired-game
+          Copy-Item framework/bin/paired-game/plugin/tools/static-sources framework/bin/static-sources -Recurse
+      - name: Build author core and Python dependencies
+        shell: pwsh
+        run: |
+          cmd /c framework\tools\diagnostics\build_author_core.cmd
+          if ($LASTEXITCODE -ne 0) { throw 'Author core build failed' }
+          python -m pip install --only-binary=:all: --target framework/bin/author-core/vendor Pillow==12.3.0
+          if ($LASTEXITCODE -ne 0) { throw 'Pillow dependency install failed' }
       - name: Verify release tag matches Blender version
+        shell: bash
         run: |
           python - <<'PY'
           import ast, os
@@ -31,11 +60,12 @@ jobs:
         shell: pwsh
         run: |
           $package = "EFF_Blender"
-          New-Item -ItemType Directory -Force -Path $package | Out-Null
-          Copy-Item __init__.py,eiem_blender_addon.py,eiem_blender_controls.py,eiem_native_export.py,eiem_offline_reload.py,eiem_release.py,eiem_format.py,eiem_lod.py,eiem_physics_authoring.py,eiem_physics_document.py,eiem_physics_native.py,eiem_physics_source.py,README.md,LICENSE,THIRD_PARTY_NOTICES -Destination $package
-          if (-not (Test-Path nativepack)) { throw 'Release requires a generated nativepack/ bundle; run the canonical tools/diagnostics/bundle_blender_native_export.py step before packaging.' }
-          Copy-Item nativepack -Destination $package -Recurse
-          if (Test-Path vendor) { Copy-Item vendor -Destination $package -Recurse }
+          $paired = git -C framework/tools/Blender rev-parse HEAD
+          $current = git rev-parse HEAD
+          if ($paired -ne $current) { throw 'Framework tag pins another Blender commit' }
+          python framework/tools/diagnostics/bundle_blender_native_export.py --output $package --compiler framework/bin/paired-game/plugin/tools/eff_resource_pack.exe --abi 35
+          if ($LASTEXITCODE -ne 0) { throw 'Canonical Blender bundle failed' }
+          Copy-Item README.md,LICENSE,THIRD_PARTY_NOTICES -Destination $package
           Compress-Archive -Path $package -DestinationPath "EFF_Blender_${{ github.ref_name }}.zip"
       - uses: softprops/action-gh-release@v2
         with:
