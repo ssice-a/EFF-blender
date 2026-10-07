@@ -41,11 +41,7 @@ def _cached_mesh_snapshot(addon, obj):
 
 def pack_modules():
     local = Path(__file__).parent / 'nativepack'
-    canonical = Path(__file__).parent.parent / 'nativepack'
-    # The source checkout has a historical copy under Blender for releases;
-    # tools/nativepack is the only editable implementation. Installed bundles
-    # have no sibling tools/nativepack and therefore use their bundled copy.
-    root = canonical if (canonical / 'author_source.py').is_file() else local
+    root = local
     if not (root/'author_source.py').is_file():
         raise ValueError('缺少 EFF 原生导出模块，请安装完整插件包')
     # Blender loads this file as part of the add-on package, while small
@@ -74,8 +70,6 @@ def pack_modules():
     modules = {n: import_module(name+'.'+n) for n in
                ('author_source', 'mesh', 'delta_apply', 'type_tree', 'ini_package', 'ini_reader')}
     dll = root/'eff_author_core.dll'
-    if not dll.is_file():
-        dll = Path(__file__).resolve().parents[2]/'bin/author-core/eff_author_core.dll'
     if not dll.is_file():
         raise ValueError('缺少 eff_author_core.dll，请安装完整插件包')
     return modules, dll
@@ -590,8 +584,11 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
                         textures=list(textures.values()),texture_only=resource_scope == 'TEXTURES',
                         resource_cache=resource_cache)
         prepare_static_sources(staging, source.package, offline_context, previous=destination)
+        prior_compiled = destination / 'compiled.bin'
+        if prior_compiled.is_file() and not (staging / 'compiled.bin').is_file():
+            shutil.copyfile(prior_compiled, staging / 'compiled.bin')
+        offline = compile_reload(staging, offline_context)
         package=publish(staging,destination,read_package)
-        offline = compile_reload(destination, offline_context) if offline_context else dict(offlineReloadPrepared=False)
         return dict(meshes=len(parts),materials=0 if resource_scope == 'TEXTURES' else len(materials),
                     textures=len(textures),skeletons=0,physics=0,format=2,
                     rules=len(rules) if resource_scope == 'ALL' else 0,

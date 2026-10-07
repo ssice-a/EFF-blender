@@ -12,7 +12,7 @@ jobs:
   package:
     runs-on: windows-latest
     env:
-      FRAMEWORK_TAG: v1.3.0
+      FRAMEWORK_TAG: v1.3.1
     steps:
       - uses: actions/checkout@v4
       - name: Checkout paired framework sources
@@ -25,15 +25,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Fetch paired compiler and source tool
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+      - name: Build add-on-owned compiler and source preparer
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download $env:FRAMEWORK_TAG --repo ssice-a/EFF --pattern "EFF_${env:FRAMEWORK_TAG}_dll.zip" --dir framework/bin/paired-release
-          if ($LASTEXITCODE -ne 0) { throw 'Paired EFF release unavailable' }
-          Expand-Archive "framework/bin/paired-release/EFF_${env:FRAMEWORK_TAG}_dll.zip" framework/bin/paired-game
-          Copy-Item framework/bin/paired-game/plugin/tools/static-sources framework/bin/static-sources -Recurse
+          cmd /c framework\tools\build_resource_pack.cmd v35
+          if ($LASTEXITCODE -ne 0) { throw 'Author compiler build failed' }
+          framework/tools/build_static_sources.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Source preparer build failed' }
       - name: Build author core and Python dependencies
         shell: pwsh
         run: |
@@ -63,7 +64,7 @@ jobs:
           $paired = git -C framework/tools/Blender rev-parse HEAD
           $current = git rev-parse HEAD
           if ($paired -ne $current) { throw 'Framework tag pins another Blender commit' }
-          python framework/tools/diagnostics/bundle_blender_native_export.py --output $package --compiler framework/bin/paired-game/plugin/tools/eff_resource_pack.exe --abi 35
+          python framework/tools/diagnostics/bundle_blender_native_export.py --output $package --compiler framework/bin/resource-pack-v35/eff_resource_pack.exe --abi 35
           if ($LASTEXITCODE -ne 0) { throw 'Canonical Blender bundle failed' }
           Copy-Item README.md,LICENSE,THIRD_PARTY_NOTICES -Destination $package
           Compress-Archive -Path $package -DestinationPath "EFF_Blender_${{ github.ref_name }}.zip"

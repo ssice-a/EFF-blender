@@ -1,8 +1,4 @@
-"""Publish game-ready reload inputs using the DLL's data structures.
-
-This module only resolves user-selected game paths and invokes the canonical
-disk compiler. It does not parse resources or implement a second exporter.
-"""
+"""Compile one staged Mod with this add-on's own author tools."""
 from pathlib import Path
 import json
 import os
@@ -19,6 +15,7 @@ STRUCTURES = dict(
     resource='block-directory/le64/sha256/type-tree',
     current='key+manifest-sha256/tsv')
 MOD_SET_STRUCTURE = 'authors+shared-inputs/transaction'
+COMPILED_MOD = 'compiled-mod/source-author-spans+object-layouts+type-dictionary+relocations/le64/sha256'
 MANIFEST_ENCODING = 'self-described-roots/le64'
 LEGACY_ENCODINGS = {
     'EFF_NATIVE_PACK_V35_1': 'legacy-root-markers/le64',
@@ -64,7 +61,7 @@ def _require_manifest_reader(produced, consumer):
 
 
 def _compiler_protocol(path, expected=None):
-    """Validate an offline compiler before it can publish ``current.tsv``."""
+    """Read the compiler's declared byte structures before author export."""
     path = Path(path)
     try:
         result = subprocess.run(
@@ -133,23 +130,20 @@ def reload_context(destination):
     # config. Any other destination still requires EFF_RELOAD_GAME.
     if game is None:
         for parent in destination.parents:
-            if parent.name.lower() == 'plugin' and ((parent / 'resource-reload-baseline/baseline.tsv').is_file()
-                    or (parent / 'tools/eff_resource_pack.exe').is_file()):
+            if parent.name.lower() == 'plugin' and (parent.parent / 'Endfield_Data').is_dir():
                 game = parent.parent
                 break
     if game is None:
-        return None
-    baseline = game / 'plugin/resource-reload-baseline'
-    mods = (game / 'plugin/mods').resolve()
-    cache = game / 'plugin/resource-reload-cache' if destination.parent == mods else destination.with_name(destination.name + '.reload')
+        raise ValueError('离线编译需要游戏安装路径；导出到游戏 plugin/mods，或设置 EFF_RELOAD_GAME')
+    baseline = destination / 'compiled.bin'
+    cache = destination
     protocol = _game_protocol(game)
-    candidates = [game / 'plugin/tools/eff_resource_pack.exe',
-                  Path(__file__).parent / 'nativepack/eff_resource_pack.exe',
-                  Path(__file__).resolve().parents[2] / 'bin/resource-pack-v35/eff_resource_pack.exe',
-                  Path(__file__).resolve().parents[2] / 'bin/resource-pack/eff_resource_pack.exe']
+    if protocol is not None and protocol.get('compiledMod') != COMPILED_MOD:
+        raise ValueError('当前 DLL 不支持独立 Mod 编译结构，请安装配套 DLL')
+    candidates = [Path(__file__).parent / 'nativepack/eff_resource_pack.exe']
     compiler, declaration = _select_compiler(candidates, protocol)
-    if not (baseline / 'baseline.tsv').is_file() and declaration.get('staticSourceInputs') != STATIC_SOURCE_INPUTS:
-        raise ValueError('完整离线热重载需要声明兼容数据结构的 eff_resource_pack.exe 和游戏来源基线')
+    if declaration.get('compiledMod') != COMPILED_MOD:
+        raise ValueError('插件缺少支持独立 Mod 编译结果的配套工具，请安装完整插件包')
     return compiler, baseline, cache, game
 
 
@@ -178,11 +172,7 @@ def prepare_static_sources(destination, source_package, context, previous=None):
     # An unchanged descriptor can be reused by the tool without opening an
     # index. An index is required only for initial or changed source identities.
     index = index or source_package / 'index/endfield_assets.eidx'
-    tool = Path(game) / 'plugin/tools/static-sources/EndfieldVfsProbe.exe'
-    if not tool.is_file():
-        tool = Path(__file__).parent / 'nativepack/static-sources/EndfieldVfsProbe.exe'
-    if not tool.is_file():
-        tool = Path(__file__).resolve().parents[2] / 'tools/EndfieldVfsProbe/bin/Release/net9.0/EndfieldVfsProbe.exe'
+    tool = Path(__file__).parent / 'nativepack/eff_source_prepare.exe'
     if not tool.is_file():
         raise ValueError('缺少静态来源准备工具，请安装配套插件工具')
     command = [str(tool), '--prepare-static-sources', str(game), str(index), str(destination), str(compiler)]
@@ -199,37 +189,23 @@ def compile_reload(destination, context=None):
     if context is None:
         return dict(offlineReloadPrepared=False, offlineReloadReason='workspace-author-export')
     compiler, baseline, cache, game = context
-    protocol = _compiler_protocol(compiler, _game_protocol(game))
-    arguments = protocol.get('arguments', COMPILER_ARGUMENTS)
-    if arguments not in (COMPILER_ARGUMENTS, LEGACY_ARGUMENTS):
-        raise ValueError('资源编译器命令参数结构不兼容：' + str(arguments))
+    consumer = _game_protocol(game)
+    protocol = _compiler_protocol(compiler, consumer)
+    if protocol.get('compiledMod') != COMPILED_MOD or (consumer is not None and consumer.get('compiledMod') != COMPILED_MOD):
+        raise ValueError('插件或 DLL 不支持独立 Mod 编译结构，请更新配套文件')
     destination = Path(destination).resolve()
-    mods = (game / 'plugin/mods').resolve()
-    global_cache = (game / 'plugin/resource-reload-cache').resolve()
-    installed = destination.parent == mods and Path(cache).resolve() == global_cache
-    if installed and protocol['structures'].get('modSet') == MOD_SET_STRUCTURE:
-        command = [str(compiler), '--mods', str(mods), str(baseline), str(cache)]
-    else:
-        if installed:
-            authors = [path.resolve() for path in mods.iterdir()
-                       if path.is_dir() and (path / 'mod.ini').is_file()]
-            if authors != [destination]:
-                raise ValueError('当前编译器不支持多角色 Mod 组合的完整作者集合结构，不能向公共缓存发布单个 Mod')
-        command = [str(compiler), str(destination), str(baseline), str(cache)]
-    if arguments == LEGACY_ARGUMENTS:
-        command.append(str(game / 'GameAssembly.dll'))
+    command = [str(compiler), '--export-mod', str(destination), str(game)]
     result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace',
                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), check=False)
     if result.returncode:
         raise ValueError('离线资源构建失败，游戏继续保留上一完整候选：' + (result.stderr or result.stdout)[-1600:])
     if any(row.startswith('OFFLINE-SOURCE-LOOKUP-PENDING ') for row in result.stdout.splitlines()):
         raise ValueError('静态来源未准备完整，请重新生成该 Mod 的来源清单；旧候选未发布为新导出结果')
-    rows = (cache / 'current.tsv').read_text('utf-8-sig').splitlines()
-    if len(rows) != 2 or len(rows[0].split('\t')) != 2 or rows[0].split('\t')[0] != 'EFF_RESOURCE_RELOAD_CURRENT':
-        raise ValueError('离线构建未发布完整候选清单')
-    pointer = rows[1].split('\t')
-    if len(pointer) != 2 or any(not re.fullmatch(r'[0-9A-F]{64}', value) for value in pointer):
-        raise ValueError('离线构建发布的候选指针无效')
-    key, digest = pointer
-    return dict(offlineReloadPrepared=True, offlineReloadKey=key, offlineReloadManifestHash=digest,
-                offlineReloadCache=str(cache), offlineCompiler=protocol.get('compiler', str(compiler)))
+    artifact = destination / 'compiled.bin'
+    if not artifact.is_file():
+        raise ValueError('资源编译没有生成完整的 compiled.bin')
+    import hashlib
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest().upper()
+    return dict(offlineReloadPrepared=True, offlineReloadKey=digest,
+                offlineReloadManifestHash=digest, offlineReloadCache=str(destination),
+                offlineCompiler=protocol.get('compiler', str(compiler)))

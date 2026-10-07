@@ -1,4 +1,4 @@
-"""The author output and native candidate publication must share one compiler."""
+"""Independent author compilation uses only installed add-on tools."""
 import importlib.util
 import json
 from pathlib import Path
@@ -11,73 +11,73 @@ spec=importlib.util.spec_from_file_location('eiem_offline_reload',Path(__file__)
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 
 class OfflineExportTests(unittest.TestCase):
-    def test_global_cache_compiles_whole_character_set(self):
+    def protocol(self):
+        return dict(format=module.EXPECTED_PROTOCOL, compiledMod=module.COMPILED_MOD,
+                    staticSourceInputs=module.STATIC_SOURCE_INPUTS,
+                    structures=dict(module.STRUCTURES),compiler='arbitrary-label',abi=999)
+
+    def test_compile_only_requested_staged_mod(self):
         with tempfile.TemporaryDirectory() as folder:
-            game=Path(folder);mods=game/'plugin/mods';author=mods/'CharacterA';author.mkdir(parents=True)
-            (author/'mod.ini').write_text('[Mod]\nformat=2\nid=A\n')
-            other=mods/'CharacterB';other.mkdir();(other/'mod.ini').write_text('[Mod]\nformat=2\nid=B\n')
-            cache=game/'plugin/resource-reload-cache';cache.mkdir();(cache/'current.tsv').write_text('EFF_RESOURCE_RELOAD_CURRENT\t1\n'+'A'*64+'\t'+'B'*64+'\n')
-            compiler=game/'compiler.exe';baseline=game/'baseline'
-            protocol=dict(format=module.EXPECTED_PROTOCOL,version=1,abi=35,compiler=module.COMPILERS[35],authorFormat=2,resourceVersion=2,modSetVersion=1,arguments=['author','baseline','cache'])
-            with patch.object(module.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=json.dumps(protocol),stderr='')) as run:
-                module.compile_reload(author,(compiler,baseline,cache,game))
-                self.assertEqual(run.call_args.args[0],[str(compiler),'--mods',str(mods.resolve()),str(baseline),str(cache)])
-            del protocol['modSetVersion'];before=(cache/'current.tsv').read_bytes()
-            with patch.object(module.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=json.dumps(protocol),stderr='')) as run:
-                with self.assertRaisesRegex(ValueError,'多角色'):module.compile_reload(author,(compiler,baseline,cache,game))
+            game=Path(folder);stage=game/'stage';stage.mkdir();other=game/'other';other.mkdir()
+            sentinel=other/'compiled.bin';sentinel.write_bytes(b'other Mod')
+            calls=[]
+            def invoke(command,**kwargs):
+                calls.append(command)
+                if command[-1]=='--protocol':return SimpleNamespace(returncode=0,stdout=json.dumps(self.protocol()),stderr='')
+                self.assertEqual(command,[str(game/'local-compiler.exe'),'--export-mod',str(stage.resolve()),str(game)])
+                (stage/'compiled.bin').write_bytes(b'independent result')
+                return SimpleNamespace(returncode=0,stdout='COMPILED-MOD-PUBLISHED',stderr='')
+            with patch.object(module.subprocess,'run',side_effect=invoke):
+                self.assertTrue(module.compile_reload(stage,(game/'local-compiler.exe',stage/'compiled.bin',stage,game))['offlineReloadPrepared'])
+            self.assertEqual(sentinel.read_bytes(),b'other Mod');self.assertEqual(len(calls),2)
+            self.assertFalse((game/'plugin/resource-reload-cache').exists())
+
+    def test_game_and_workspace_exports_use_addon_compiler_only(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);addon=root/'addon';tool=addon/'nativepack/eff_resource_pack.exe';tool.parent.mkdir(parents=True);tool.touch()
+            game=root/'game';(game/'Endfield_Data').mkdir(parents=True);author=game/'plugin/mods/A';author.mkdir(parents=True)
+            foreign=game/'plugin/tools/eff_resource_pack.exe';foreign.parent.mkdir();foreign.touch()
+            reply=SimpleNamespace(returncode=0,stdout=json.dumps(self.protocol()),stderr='')
+            with patch.object(module,'__file__',str(addon/'eiem_offline_reload.py')),patch.object(module.subprocess,'run',return_value=reply) as run,patch.dict(module.os.environ,{},clear=True):
+                context=module.reload_context(author);self.assertEqual(context[0],tool);self.assertEqual(context[2],author.resolve())
+                with patch.dict(module.os.environ,{'EFF_RELOAD_GAME':str(game)}):self.assertEqual(module.reload_context(root/'export')[0],tool)
+                tool.unlink()
+                with self.assertRaisesRegex(ValueError,'编译器'):module.reload_context(author)
+                self.assertTrue(all(call.args[0][0]==str(tool) for call in run.call_args_list))
+
+    def test_old_dll_rejected_before_publication(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game=Path(folder);declaration=game/'plugin/package-protocol.json';declaration.parent.mkdir()
+            declaration.write_text(json.dumps(dict(self.protocol(),compiledMod='another-byte-layout')))
+            stage=game/'stage';stage.mkdir();artifact=stage/'compiled.bin';artifact.write_bytes(b'previous')
+            with patch.object(module.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=json.dumps(self.protocol()),stderr='')) as run:
+                with self.assertRaisesRegex(ValueError,'独立 Mod'):module.compile_reload(stage,(game/'compiler',None,None,game))
                 self.assertEqual(run.call_count,1)
-            self.assertEqual((cache/'current.tsv').read_bytes(),before)
+            self.assertEqual(artifact.read_bytes(),b'previous')
 
-    def test_installed_legacy_compiler_uses_set_cache_and_its_declared_path_layout(self):
+    def test_failed_or_incomplete_compile_keeps_previous_mod(self):
         with tempfile.TemporaryDirectory() as folder:
-            game=Path(folder);mods=game/'plugin/mods';author=mods/'LZY';author.mkdir(parents=True)
-            (author/'mod.ini').write_text('[Mod]\nformat=2\nid=LZY\n')
-            cache=game/'plugin/resource-reload-cache';cache.mkdir()
-            before=('EFF_RESOURCE_RELOAD_CURRENT\t1\n'+'A'*64+'\t'+'B'*64+'\n').encode()
-            (cache/'current.tsv').write_bytes(before)
-            owner=b'EFF_OFFLINE_CACHE_OWNER\t2\n'+b'C'*64+b'\n'
-            (cache/'owner.tsv').write_bytes(owner)
-            compiler=game/'compiler.exe';baseline=game/'baseline'
-            protocol=dict(format=module.EXPECTED_PROTOCOL,version=1,abi=35,
-                          compiler=module.COMPILERS[35],authorFormat=2,resourceVersion=2,modSetVersion=1)
-            expected=[str(compiler),'--mods',str(mods.resolve()),str(baseline),str(cache),str(game/'GameAssembly.dll')]
-            def run(command,**kwargs):
-                if command[-1]=='--protocol':
-                    return SimpleNamespace(returncode=0,stdout=json.dumps(protocol),stderr='')
-                if command!=expected:
-                    return SimpleNamespace(returncode=1,stdout='',stderr='legacy CLI or set-cache owner mismatch')
-                return SimpleNamespace(returncode=0,stdout='OFFLINE-REUSED',stderr='')
-            with patch.object(module.subprocess,'run',side_effect=run):
-                self.assertTrue(module.compile_reload(author,(compiler,baseline,cache,game))['offlineReloadPrepared'])
-            self.assertEqual((cache/'owner.tsv').read_bytes(),owner)
-            self.assertEqual((cache/'current.tsv').read_bytes(),before)
+            game=Path(folder);stage=game/'stage';stage.mkdir();published=game/'published';published.mkdir();old=published/'compiled.bin';old.write_bytes(b'previous')
+            protocol=SimpleNamespace(returncode=0,stdout=json.dumps(self.protocol()),stderr='')
+            for result in (SimpleNamespace(returncode=1,stdout='',stderr='invalid target'),SimpleNamespace(returncode=0,stdout='',stderr='')):
+                with patch.object(module.subprocess,'run',side_effect=[protocol,result]):
+                    with self.assertRaises(ValueError):module.compile_reload(stage,(game/'compiler',None,None,game))
+                self.assertEqual(old.read_bytes(),b'previous')
 
-    def test_game_and_workspace_exports_use_same_compiler(self):
+    def test_source_preparation_uses_local_tool_and_seeds_previous_descriptor(self):
         with tempfile.TemporaryDirectory() as folder:
-            game=Path(folder)/'game';baseline=game/'plugin/resource-reload-baseline';baseline.mkdir(parents=True)
-            (baseline/'baseline.tsv').write_text('baseline')
-            compiler=game/'plugin/tools/eff_resource_pack.exe';compiler.parent.mkdir()
-            compiler.write_bytes(b'EFF_NATIVE_PACK_V35_1')
-            author=game/'plugin/mods/ModA';author.mkdir(parents=True)
-            protocol = dict(format='EFF_OFFLINE_PACKAGE_PROTOCOL', version=1, abi=35,
-                            compiler='EFF_NATIVE_PACK_V35_1', authorFormat=2, resourceVersion=2,
-                            arguments=['author','baseline','cache'])
-            queried = SimpleNamespace(returncode=0,stdout=json.dumps(protocol),stderr='')
-            with patch.dict(module.os.environ,{'EFF_RELOAD_GAME':str(game)}), patch.object(module.subprocess,'run',return_value=queried):
-                self.assertEqual(module.reload_context(author)[2],game/'plugin/resource-reload-cache')
-                exported=Path(folder)/'ModA';self.assertEqual(module.reload_context(exported)[2],Path(folder)/'ModA.reload')
-                self.assertEqual(module.reload_context(exported)[3],game)
-            self.assertFalse((game/'GameAssembly.dll').exists())
-            cache=Path(folder)/'cache';cache.mkdir();key='A'*64;digest='B'*64
-            (cache/'current.tsv').write_text('EFF_RESOURCE_RELOAD_CURRENT\t1\n'+key+'\t'+digest+'\n')
-            with patch.object(module.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=json.dumps(protocol),stderr='')) as run:
-                result=module.compile_reload(author,(compiler,baseline,cache,game))
-                self.assertTrue(result['offlineReloadPrepared']);self.assertEqual(result['offlineReloadKey'],key)
-                self.assertEqual(run.call_args.args[0],[str(compiler),str(author.resolve()),str(baseline),str(cache)])
-            before=(cache/'current.tsv').read_bytes()
-            with patch.object(module.subprocess,'run',side_effect=[queried,SimpleNamespace(returncode=1,stdout='',stderr='bad skeleton')]):
-                with self.assertRaisesRegex(ValueError,'bad skeleton'):module.compile_reload(author,(compiler,baseline,cache,game))
-            self.assertEqual((cache/'current.tsv').read_bytes(),before)
+            root=Path(folder);addon=root/'addon';tool=addon/'nativepack/eff_source_prepare.exe';tool.parent.mkdir(parents=True);tool.touch()
+            game=root/'game';stage=root/'stage';stage.mkdir();prior=root/'prior';prior.mkdir();(prior/'source-inputs.bin').write_bytes(b'prior')
+            source=root/'workspace/character.eff';source.mkdir(parents=True);index=root/'workspace/index/endfield_assets.eidx';index.parent.mkdir();index.touch()
+            def invoke(command,**kwargs):
+                if command[-1]=='--protocol':return SimpleNamespace(returncode=0,stdout=json.dumps(self.protocol()),stderr='')
+                self.assertEqual(command,[str(tool),'--prepare-static-sources',str(game),str(index),str(stage),str(addon/'compiler')])
+                self.assertEqual((stage/'source-inputs.bin').read_bytes(),b'prior');(stage/'source-inputs.bin').write_bytes(b'current')
+                return SimpleNamespace(returncode=0,stdout='',stderr='')
+            with patch.object(module,'__file__',str(addon/'eiem_offline_reload.py')),patch.object(module.subprocess,'run',side_effect=invoke),patch.dict(module.os.environ,{},clear=True):
+                module.prepare_static_sources(stage,source,(addon/'compiler',None,None,game),previous=prior)
+            self.assertEqual((prior/'source-inputs.bin').read_bytes(),b'prior')
+            self.assertEqual((stage/'source-inputs.bin').read_bytes(),b'current')
 
     def test_failed_protocol_query_never_guesses_from_executable_markers(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -122,31 +122,6 @@ class OfflineExportTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '结构'):
                 module._game_protocol(game)
 
-    def test_manifest_byte_layout_is_checked_independently_of_abi(self):
-        legacy = dict(format=module.EXPECTED_PROTOCOL, version=1, abi=35,
-                      compiler=module.COMPILERS[35], authorFormat=2, resourceVersion=2)
-        current = dict(legacy, structures=dict(module.STRUCTURES,
-                      manifestEncoding=module.MANIFEST_ENCODING,
-                      manifestInputs=[module.MANIFEST_ENCODING, *module.LEGACY_ENCODINGS.values()]))
-        with tempfile.TemporaryDirectory() as folder:
-            compiler = Path(folder) / 'eff_resource_pack.exe'
-            # Equal release labels do not make different headers readable.
-            with patch.object(module.subprocess, 'run', return_value=SimpleNamespace(
-                    returncode=0, stdout=json.dumps(current), stderr='')):
-                with self.assertRaisesRegex(ValueError, '清单字段布局'):
-                    module._compiler_protocol(compiler, legacy)
-            # The new reader accepts both known layouts regardless of labels.
-            for marker in module.COMPILERS.values():
-                old = dict(legacy, abi=999, compiler=marker, authorFormat=999,
-                           resourceVersion=999, version=999)
-                with patch.object(module.subprocess, 'run', return_value=SimpleNamespace(
-                        returncode=0, stdout=json.dumps(old), stderr='')):
-                    module._compiler_protocol(compiler, current)
-            future = dict(current, abi=999, version=999, compiler='arbitrary-build')
-            with patch.object(module.subprocess, 'run', return_value=SimpleNamespace(
-                    returncode=0, stdout=json.dumps(future), stderr='')):
-                module._compiler_protocol(compiler, current)
-
     def test_rule_encoding_requires_a_matching_reader(self):
         rules = 'compressed-rules/xpress-huffman/le64'
         old = dict(format=module.EXPECTED_PROTOCOL, structures=dict(module.STRUCTURES,
@@ -161,95 +136,5 @@ class OfflineExportTests(unittest.TestCase):
                     module._compiler_protocol(compiler, old)
                 self.assertEqual(module._compiler_protocol(compiler, current)['structures']['manifestEncoding'], rules)
 
-    def test_failed_layout_check_does_not_publish_a_candidate(self):
-        with tempfile.TemporaryDirectory() as folder:
-            game = Path(folder)
-            declaration = game / 'plugin/package-protocol.json'
-            declaration.parent.mkdir()
-            legacy = dict(format=module.EXPECTED_PROTOCOL, version=1, abi=35,
-                          compiler=module.COMPILERS[35], authorFormat=2, resourceVersion=2)
-            declaration.write_text(json.dumps(legacy))
-            cache = game / 'cache'; cache.mkdir()
-            before = b'previous complete publication'
-            (cache / 'current.tsv').write_bytes(before)
-            current = dict(legacy, structures=dict(module.STRUCTURES))
-            with patch.object(module.subprocess, 'run', return_value=SimpleNamespace(
-                    returncode=0, stdout=json.dumps(current), stderr='')) as run:
-                with self.assertRaisesRegex(ValueError, '清单字段布局'):
-                    module.compile_reload(game / 'author', (game / 'compiler.exe',
-                        game / 'baseline', cache, game))
-                self.assertEqual(run.call_count, 1)
-            self.assertEqual((cache / 'current.tsv').read_bytes(), before)
-
-    def test_first_static_export_compiles_without_preexisting_baseline(self):
-        with tempfile.TemporaryDirectory() as folder:
-            game=Path(folder);author=game/'plugin/mods/NewRole';author.mkdir(parents=True)
-            compiler=game/'plugin/tools/eff_resource_pack.exe';compiler.parent.mkdir();compiler.write_bytes(b'fixture')
-            protocol=dict(format=module.EXPECTED_PROTOCOL,compiler=module.COMPILERS[35],
-                          staticSourceInputs=module.STATIC_SOURCE_INPUTS,modSetVersion=1,
-                          arguments=module.COMPILER_ARGUMENTS,structures=dict(module.STRUCTURES,
-                              modSet=module.MOD_SET_STRUCTURE,manifestEncoding=module.MANIFEST_ENCODING,manifestInputs=[module.MANIFEST_ENCODING]))
-            reply=SimpleNamespace(returncode=0,stdout=json.dumps(protocol),stderr='')
-            cache=game/'plugin/resource-reload-cache';cache.mkdir()
-            (cache/'current.tsv').write_text('EFF_RESOURCE_RELOAD_CURRENT\t1\n'+'A'*64+'\t'+'B'*64+'\n')
-            with patch.object(module.subprocess,'run',return_value=reply) as run:
-                context=module.reload_context(author)
-                result=module.compile_reload(author,context)
-                self.assertTrue(result['offlineReloadPrepared'])
-                self.assertEqual(run.call_args.args[0][1],'--mods')
-            self.assertFalse((game/'plugin/resource-reload-baseline/baseline.tsv').exists())
-
-    def test_missing_static_target_rejects_without_reporting_old_current(self):
-        with tempfile.TemporaryDirectory() as folder:
-            game=Path(folder);author=game/'plugin/mods/NewRole';author.mkdir(parents=True)
-            baseline=game/'plugin/resource-reload-baseline';baseline.mkdir();(baseline/'baseline.tsv').write_text('fixture')
-            cache=game/'plugin/resource-reload-cache';cache.mkdir();before=b'previous complete candidate';(cache/'current.tsv').write_bytes(before)
-            protocol=dict(format=module.EXPECTED_PROTOCOL,compiler=module.COMPILERS[35],modSetVersion=1,
-                          arguments=module.COMPILER_ARGUMENTS,staticSourceInputs=module.STATIC_SOURCE_INPUTS)
-            with patch.object(module.subprocess,'run',side_effect=[
-                    SimpleNamespace(returncode=0,stdout=json.dumps(protocol),stderr=''),
-                    SimpleNamespace(returncode=1,stdout='',stderr='static source manifest does not cover current INI targets')]):
-                with self.assertRaisesRegex(ValueError,'static source manifest'):
-                    module.compile_reload(author,(game/'compiler.exe',baseline,cache,game))
-            self.assertEqual((cache/'current.tsv').read_bytes(),before)
-
-    def test_static_preparation_uses_staged_mod_and_existing_author_index(self):
-        with tempfile.TemporaryDirectory() as folder:
-            game=Path(folder)/'game';stage=Path(folder)/'staged';stage.mkdir()
-            source=Path(folder)/'workspace/exports/character.eff';source.mkdir(parents=True)
-            index=Path(folder)/'workspace/index/endfield_assets.eidx';index.parent.mkdir();index.touch()
-            tool=game/'plugin/tools/static-sources/EndfieldVfsProbe.exe';tool.parent.mkdir(parents=True);tool.touch()
-            protocol=dict(format=module.EXPECTED_PROTOCOL,structures=dict(module.STRUCTURES),staticSourceInputs=module.STATIC_SOURCE_INPUTS)
-            def invoke(command, **kwargs):
-                if command[-1]=='--protocol':
-                    return SimpleNamespace(returncode=0,stdout=json.dumps(protocol),stderr='')
-                self.assertEqual(command[1:5],['--prepare-static-sources',str(game),str(index),str(stage)])
-                (stage/'source-inputs.bin').write_bytes(b'generated')
-                return SimpleNamespace(returncode=0,stdout='STATIC-SOURCES-PREPARED',stderr='')
-            with patch.object(module.subprocess,'run',side_effect=invoke),patch.dict(module.os.environ,{},clear=True):
-                module.prepare_static_sources(stage,source,(game/'compiler.exe',game/'baseline',game/'cache',game))
-            self.assertEqual((stage/'source-inputs.bin').read_bytes(),b'generated')
-
-    def test_full_export_seeds_descriptor_but_still_checks_new_declarations(self):
-        with tempfile.TemporaryDirectory() as folder:
-            game=Path(folder);previous=game/'published';stage=game/'stage';source=game/'source'
-            for path in (previous,stage,source):path.mkdir()
-            descriptor=previous/'source-inputs.bin';descriptor.write_bytes(b'previous-validated-descriptor')
-            tool=game/'plugin/tools/static-sources/EndfieldVfsProbe.exe';tool.parent.mkdir(parents=True);tool.touch()
-            protocol=dict(format=module.EXPECTED_PROTOCOL,structures=dict(module.STRUCTURES),staticSourceInputs=module.STATIC_SOURCE_INPUTS)
-            requests=[]
-            def invoke(command,**kwargs):
-                if command[-1]=='--protocol':return SimpleNamespace(returncode=0,stdout=json.dumps(protocol),stderr='')
-                requests.append(command)
-                self.assertEqual((stage/'source-inputs.bin').read_bytes(),b'previous-validated-descriptor')
-                # Changed declarations are assessed by the source tool, not by
-                # the exporter. Replacing the seed must not change publication.
-                (stage/'source-inputs.bin').write_bytes(b'new-target-descriptor')
-                return SimpleNamespace(returncode=0,stdout='STATIC-SOURCES-PREPARED',stderr='')
-            with patch.object(module.subprocess,'run',side_effect=invoke),patch.dict(module.os.environ,{},clear=True):
-                module.prepare_static_sources(stage,source,(game/'compiler.exe',game/'baseline',game/'cache',game),previous=previous)
-            self.assertEqual(len(requests),1)
-            self.assertEqual(descriptor.read_bytes(),b'previous-validated-descriptor')
-            self.assertEqual((stage/'source-inputs.bin').read_bytes(),b'new-target-descriptor')
 
 if __name__=='__main__':unittest.main()

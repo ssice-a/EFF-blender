@@ -1,12 +1,10 @@
-# EFF Blender v0.40.0
+# EFF Blender v0.40.1
 
-配套：[EFF v1.3.0](https://github.com/ssice-a/EFF/releases/tag/v1.3.0)、[AnimeStudio v1.3.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.3.0)。
+配套：[EFF v1.3.1](https://github.com/ssice-a/EFF/releases/tag/v1.3.1)、[AnimeStudio v1.3.1](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.3.1)。
 
-- 完整与分资源导出统一通过原生作者核心和配套编译器，复用 Mesh 快照、静态来源描述及编译缓存。
-- 每个 Mod 自动携带 source-inputs.bin，导出按完整 mods 集合准备替换规则；兼容已声明的编译器参数布局。
-- 同一来源材质可作为独立作者副本，分别绑定原版或自定义贴图。
-- 保留款式切换、默认状态、按键声明、形态键及滑块；全 LOD 映射保持准确骨骼槽来源。
-- README 更新为 F10 热重载、Ins 选择按键目标、多角色流程及短贴图名称说明。
-- ZIP 包含作者核心 DLL、v35 编译器、静态来源工具及 Pillow，无需从开发目录另行复制。
+- 在暂存目录编译当前一个 Mod，完整校验后发布作者资源和 compiled.bin；完整与分资源导出保持同一流程。
+- 安装包自带作者核心、编译器、小型来源准备工具和 Pillow，全部从插件自己的目录读取。
+- 源 Mesh 离线匹配全部 PFB/Renderer；不打包完整原游戏包，也不编译游戏中其他 Mod。
+- 保留按键切换、默认款式、形态控制、材质模板和静态 Mesh 制作。
 
-保存工程并关闭 Blender，替换旧插件后安装 EFF_Blender_v0.40.0.zip，再启动 Blender。Windows x64 / Blender 5.0.1（Python 3.11）已验证；其他 Python 布局需匹配的原生依赖。首次导出选择全部资源，后续可分资源更新；等待准备完成后在游戏按 F10。不会自动为低级 LOD 减面，Physics 尚未接通完整游戏模拟链。
+保存工程并关闭 Blender，再安装 EFF_Blender_v0.40.1.zip。目标 Windows x64 / Blender 5.0.1（Python 3.11）；其他 Python 布局需匹配依赖。首次导出选全部资源，导出到游戏 plugin/mods 或设置 EFF_RELOAD_GAME。实测 LZY 编译规则增加约 11.25 MiB。游戏 DLL 需配套更新，Mod 随 compiled.bin 一起分发。全 LOD 输出不会自动减面，Physics 尚未接通完整模拟链。

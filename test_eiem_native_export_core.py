@@ -120,10 +120,10 @@ class NativeExportCoreTests(unittest.TestCase):
             self.assertEqual(original.read_bytes(), b'original')
             self.assertEqual(staged.read_bytes(), b'updated')
 
-    def test_checkout_imports_canonical_nativepack(self):
+    def test_export_imports_installed_addon_nativepack(self):
         modules, _ = exporter.pack_modules()
         self.assertEqual(Path(modules['author_source'].__file__).resolve().parent,
-                         (ROOT / 'tools/nativepack').resolve())
+                         (ROOT / 'tools/Blender/nativepack').resolve())
 
     def test_material_ids_do_not_alias_sources_and_remain_stable(self):
         first = Material('MaterialBody', dict(eiem_section='MaterialBody',

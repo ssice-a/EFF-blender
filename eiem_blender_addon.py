@@ -1846,6 +1846,10 @@ def explicit_skeleton_bone_index_paths(armature, paths):
 def export_skin_binding(obj, armature, source_vertices):
     """Keep original slots; extend with bones from this shared armature."""
     if not armature:
+        # A static consumer can reuse a source Mesh carrying unused skin
+        # metadata. Without a renderer bone palette none of it is a binding.
+        if not parse_json_property(obj, "eiem_bone_paths_json", []):
+            return ([], [], [], [], [], [], [])
         return ([], parse_json_property(obj, "eiem_bindposes_json", []),
                 parse_json_property(obj, "eiem_bone_hashes_json", []),
                 parse_json_property(obj, "eiem_bone_paths_json", []),
