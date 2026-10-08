@@ -2,7 +2,9 @@
 
 EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以在 Blender 中编辑网格、材质、贴图、款式切换和形态键，然后导出可放入 EFF `plugin/mods` 的 Mod 文件夹。
 
-本次发布 **v0.40.1**，配套 [EFF v1.3.1](https://github.com/ssice-a/EFF/releases/tag/v1.3.1) 与 [AnimeStudio v1.3.1](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.3.1)。Windows x64 发布包包含原生导出核心、资源编译器、来源工具及 Pillow；已在 Blender 5.0.1 / Python 3.11 验证。其他 Python 布局需要对应的依赖构建。
+本次发布 **v0.40.2**，配套 [EFF v1.3.3](https://github.com/ssice-a/EFF/releases/tag/v1.3.3) 与 [AnimeStudio v1.3.1](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.3.1)。Windows x64 发布包包含原生导出核心、资源编译器、来源工具及 Pillow；已在 Blender 5.0.1 / Python 3.11 验证。其他 Python 布局需要对应的依赖构建。
+
+带截图的[简易 Mod 制作教程](https://github.com/ssice-a/EFF/blob/main/Mod%20Tutorial.md)包含安装、解包、材质编辑和所选网格导出步骤。
 
 ## 功能
 
@@ -11,14 +13,14 @@ EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以
 - 为形态键提供 Blender 滑块，并可按需录制游戏快捷键。
 - 创建款式切换组，设置默认款式和游戏快捷键。
 - 导出 format 2 完整 Mod，或更新已有 Mod 的 Mesh、材质和贴图；导出按键切换选项默认开启。
-- 分资源导出复用当前会话 Mesh 快照；仅贴图导出保留已有完整 Mod 的其他资源。
+- 分资源导出复用当前会话 Mesh 快照；同一次导出复用共享骨架的路径、供体及绑定信息；仅贴图导出保留已有完整 Mod 的其他资源。
 - 自动生成每个 Mod 的 `source-inputs.bin`，只编译当前导出的独立 Mod，生成 `compiled.bin`。
 - 同一游戏材质可作为多个独立作者材质的模板，各自保留参数和贴图绑定。
 - 在 EFF 面板中检查 GitHub Release 更新并忽略指定版本。
 
 ## 安装
 
-从 [Releases](https://github.com/ssice-a/EFF-blender/releases) 下载 `EFF_Blender_v0.40.1.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。更新前保存工程、关闭 Blender，再替换旧插件并重新启动，以释放原生 DLL 和旧 Python 模块。
+从 [Releases](https://github.com/ssice-a/EFF-blender/releases) 下载 `EFF_Blender_v0.40.2.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。更新前保存工程、关闭 Blender，再替换旧插件并重新启动，以释放原生 DLL 和旧 Python 模块。
 
 ## 制作 Mod
 
@@ -28,7 +30,7 @@ EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以
 4. 需要形态键时，在网格数据属性的 **EFF 形态键控制**中点击“接管当前形态键”。这会把已有的 Blender 形态键登记为导出滑块；它不会修改顶点，也不会自动创建游戏快捷键。快捷键需要在同一面板中单独录制。
 5. 选择要导出的 EFF 网格，在 EFF 面板或 **文件 → 导出** 中选择“导出所选 Mod”。首次选择“全部资源”；后续可以选择“仅 Mesh”“仅材质与贴图”或“仅贴图”更新已有完整 Mod。完整导出窗口中的“导出按键切换”默认勾选；取消后只导出默认款式，不导出款式和形态键快捷键，但仍保留形态键及其滑块。
 6. 在 EFF 导出区域填写 Mod 文件夹名，然后在文件浏览器中选择父目录；插件创建或刷新同名文件夹，把 `mod.ini`、`meshes/`、`materials/` 和 `textures/` 写入其中，再在暂存目录中完成独立编译和校验后发布。需要直接在游戏中使用时，父目录选择游戏的 `plugin/mods/`。文件浏览器里的文件名不决定 Mod 名称。
-7. 等待导出和离线准备完成，进入游戏后按 **F10** 热重载。按 **Ins** 选择接收物理按键的 Mod；默认选中首个可控制 Mod。实际快捷键以游戏 `plugin/eff.ini` 为准。
+7. 等待导出和离线准备完成，进入游戏后按 **F10** 热重载。按 **Ins** 独立勾选哪些 Mod 接收按键，默认全部启用，允许多个 Mod 同时响应。也可在各 `mod.ini` 的 `[Mod]` 中设置 `key_switch_enabled=0` 或 `1`。实际全局快捷键以游戏 `plugin/eff.ini` 为准。
 
 导出需要游戏安装路径，请设置 `EFF_RELOAD_GAME` 环境变量指向当前游戏目录；如果输出目录本身位于 `plugin/mods/<Mod>` 下，插件会从目录结构推断游戏目录。插件不保存开发者本机的游戏路径，也不会把固定的 Mod 名称写入代码。
 

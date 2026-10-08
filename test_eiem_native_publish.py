@@ -77,6 +77,20 @@ class PublishTests(unittest.TestCase):
         self.assertIn('source-inputs.bin',result['_files'])
         self.assertEqual((self.root/'source-inputs.bin').read_bytes(),b'new sources')
 
+    def test_compiled_rules_are_published_on_first_and_repeated_export(self):
+        (self.stage/'compiled.bin').write_bytes(b'new compiled rules')
+        fresh = Path(self.temp.name) / 'first-compiled'
+        result = exporter.publish(self.stage, fresh, read_package)
+        self.assertIn('compiled.bin', result['_files'])
+        self.assertEqual((fresh/'compiled.bin').read_bytes(), b'new compiled rules')
+        (self.root/'compiled.bin').write_bytes(b'previous compiled rules')
+        self.change_texture()
+        result = exporter.publish(self.stage, self.root, read_package)
+        self.assertIn('compiled.bin', result['_files'])
+        self.assertEqual((self.root/'compiled.bin').read_bytes(), b'new compiled rules')
+        self.assertEqual((self.root/'textures/body.tex').read_bytes(),
+                         (self.stage/'textures/body.tex').read_bytes())
+
     @unittest.skipUnless(os.name == 'nt', 'requires Windows sharing flags')
     def test_texture_export_with_directory_and_unchanged_mesh_locked(self):
         before = self.hashes()
@@ -128,6 +142,8 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(self.hashes(), before)
 
     def test_failed_ini_publication_restores_resources_and_deletions(self):
+        (self.root/'compiled.bin').write_bytes(b'previous compiled rules')
+        (self.stage/'compiled.bin').write_bytes(b'new compiled rules')
         before = self.hashes()
         self.change_texture(rename=True)
         replace = os.replace

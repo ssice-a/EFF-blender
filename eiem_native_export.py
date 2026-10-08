@@ -13,6 +13,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import time
 import types
 
 
@@ -24,16 +25,19 @@ _NATIVE_SNAPSHOT_CACHE = {}
 _NATIVE_SNAPSHOT_CACHE_LIMIT = 128
 
 
-def _cached_mesh_snapshot(addon, obj):
+def _cached_mesh_snapshot(addon, obj, skin_cache=None):
+    options = dict(return_snapshot=True)
+    if skin_cache is not None:
+        options['skin_cache'] = skin_cache
     token_fn = getattr(addon, '_mesh_resource_token', None)
     if token_fn is None:
-        return addon.write_mesh(None, obj, return_snapshot=True), False
+        return addon.write_mesh(None, obj, **options), False
     token = token_fn(obj)
     key = (int(obj.as_pointer()), token)
     cached = _NATIVE_SNAPSHOT_CACHE.get(key)
     if cached is not None:
         return cached, True
-    snapshot = addon.write_mesh(None, obj, return_snapshot=True)
+    snapshot = addon.write_mesh(None, obj, **options)
     _NATIVE_SNAPSHOT_CACHE[key] = snapshot
     while len(_NATIVE_SNAPSHOT_CACHE) > _NATIVE_SNAPSHOT_CACHE_LIMIT:
         _NATIVE_SNAPSHOT_CACHE.pop(next(iter(_NATIVE_SNAPSHOT_CACHE)))
@@ -87,6 +91,19 @@ def baseline_for(objects, configured):
     if len(sources) != 1 or not (next(iter(sources))/'source/manifest.json').is_file():
         raise ValueError('旧工程未保留完整原生来源，请在导出窗口指定包含 source/manifest.json 的解包目录')
     return next(iter(sources))
+
+
+def material_source(primary, material, cache):
+    """A material imported from another package retains that package's schema."""
+    owner = str(material.get('eiem_author_package', '')).strip()
+    if not owner:
+        return primary
+    package = Path(owner).resolve()
+    if package == primary.package:
+        return primary
+    if package not in cache:
+        cache[package] = type(primary)(package, primary.core)
+    return cache[package]
 
 def split_material(author):
     # The snapshot already has one consistent corner/skin/shape vertex map.
@@ -416,6 +433,7 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
                           physics_objects=None, mesh_only=False, lod_levels=None,
                           include_switches=True, source_baseline='', resource_scope='ALL'):
     import bpy
+    started = time.perf_counter()
     vendor=Path(__file__).parent/'vendor'
     if vendor.is_dir() and str(vendor) not in sys.path: sys.path.insert(0,str(vendor))
     if resource_scope not in ('ALL', 'MESH', 'MATERIALS', 'TEXTURES'):
@@ -449,7 +467,11 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
     bpy.context.view_layer.update()
     plan = (addon.plan_mesh_only_export(objects) if mesh_only or resource_scope != 'ALL' else
             addon.plan_switch_export(objects, include_switches=include_switches))
-    if lod_levels is not None and resource_scope == 'ALL': plan = addon.expand_lod_plan(plan, lod_levels)
+    if resource_scope == 'ALL':
+        if lod_levels is None:
+            lod_levels = addon.lod_levels_for_export(objects, all_levels=True)
+        if lod_levels:
+            plan = addon.expand_lod_plan(plan, lod_levels)
     encode = modules['type_tree'].encode
     # Image sections are package-local.  Restrict lookup to the source package
     # being exported so a second imported Mod with the same section/path
@@ -458,6 +480,10 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
     source_packages.update(
         str(o.get('eiem_author_package', '')).replace('\\', '/').casefold()
         for o in objects if o.get('eiem_author_package'))
+    source_packages.update(
+        str(slot.material.get('eiem_author_package', '')).replace('\\', '/').casefold()
+        for obj in plan['objects'] for slot in addon.mesh_export_template(obj).material_slots
+        if slot.material and slot.material.get('eiem_author_package'))
     images = {}
     for image in bpy.data.images:
         section = str(image.get('eiem_section', ''))
@@ -476,7 +502,9 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
     material_sections = material_ids(selected_materials)
     parts, materials, textures, rules = [], {}, {}, []
     texture_cache = {}
+    material_sources = {}
     snapshots, part_cache = {}, {}
+    skin_cache = {}
     switches = [dict(variable=var, key=key, stateCount=len(states),
                      stateValues=addon.switch_state_values(group), default=default)
                 for group, states, default, key, var in plan['groups']]
@@ -485,13 +513,10 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
         originals = {addon.mesh_export_template(view) for view in plan['objects']
                      if view not in plan['hidden']}
         # This is the same author-side validator the controls panels use. It
-        # validates shared channels, ranges and hotkey collisions before any
+        # validates shared channels and ranges before any
         # resource files are written.
         _, _, hotkeys = addon.plan_shape_controls(list(originals),
                                                  include_hotkeys=include_switches)
-        switch_keys = {switch['key'] for switch in switches}
-        if any(control['key'] in switch_keys for control in hotkeys):
-            raise ValueError('款式和形态键控制使用了同一快捷键')
         controls_by_object = {original.as_pointer(): shape_controls(addon, original, include_switches)
                               for original in originals}
     temporary_parent = (str(destination.parent)
@@ -517,7 +542,7 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
                         raise ValueError(original.name+' 缺少材质槽 '+str(slot))
                     mid = material_sections[mat.as_pointer()]
                     if mid not in materials:
-                        materials[mid] = collect_material(addon, source, mat, images, textures, temporary,
+                        materials[mid] = collect_material(addon, material_source(source, mat, material_sources), mat, images, textures, temporary,
                                                          encode, existing_ini, resource_scope == 'TEXTURES', mid,
                                                          texture_cache)
         for group in plan['sources']:
@@ -535,7 +560,7 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
                 original = addon.mesh_export_template(view)
                 identity = original.as_pointer()
                 if identity not in snapshots:
-                    snapshots[identity], _ = _cached_mesh_snapshot(addon, original)
+                    snapshots[identity], _ = _cached_mesh_snapshot(addon, original, skin_cache)
                 if identity not in part_cache:
                     cache = []
                     splits = list(split_material(snapshots[identity]))
@@ -544,7 +569,7 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
                         if mat is None: raise ValueError(original.name+' 缺少材质槽 '+str(slot))
                         mid = material_sections[mat.as_pointer()]
                         if resource_scope == 'ALL' and mid not in materials:
-                            materials[mid] = collect_material(addon, source, mat, images, textures, temporary,
+                            materials[mid] = collect_material(addon, material_source(source, mat, material_sources), mat, images, textures, temporary,
                                                               encode, mid=mid, texture_cache=texture_cache)
                         mesh, _ = modules['mesh'].native_mesh(source.tree(target), author, asset)
                         suffix = '' if len(splits)==1 else '_mat'+str(slot)
@@ -575,7 +600,9 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
         if resource_scope == 'ALL':
             modules['ini_package'].export_directory(staging,mod_id=token(destination.name),parts=parts,
                         materials=list(materials.values()),textures=list(textures.values()),rules=rules,
-                        switches=switches,resource_cache=resource_cache)
+                        switches=switches,resource_cache=resource_cache,
+                        key_switch_enabled=modules['ini_reader'].key_switch_enabled(
+                            existing_ini['Mod'].get('key_switch_enabled', '1')) if existing_ini else True)
         else:
             _detach_staging_files(_partial_output_paths(
                 staging, resource_scope, existing_ini, list(materials.values()),
@@ -583,13 +610,19 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
             modules['ini_package'].update_directory(staging,parts=parts,materials=list(materials.values()),
                         textures=list(textures.values()),texture_only=resource_scope == 'TEXTURES',
                         resource_cache=resource_cache)
+        author_done = time.perf_counter()
         prepare_static_sources(staging, source.package, offline_context, previous=destination)
         prior_compiled = destination / 'compiled.bin'
         if prior_compiled.is_file() and not (staging / 'compiled.bin').is_file():
             shutil.copyfile(prior_compiled, staging / 'compiled.bin')
         offline = compile_reload(staging, offline_context)
+        compile_done = time.perf_counter()
         package=publish(staging,destination,read_package)
         return dict(meshes=len(parts),materials=0 if resource_scope == 'TEXTURES' else len(materials),
                     textures=len(textures),skeletons=0,physics=0,format=2,
                     rules=len(rules) if resource_scope == 'ALL' else 0,
-                    resourceScope=resource_scope,nativeSubmission=False, **offline)
+                    resourceScope=resource_scope,nativeSubmission=False,
+                    exportSeconds=time.perf_counter()-started,
+                    exportCostsMs=dict(author=(author_done-started)*1000,
+                                       compile=(compile_done-author_done)*1000,
+                                       publish=(time.perf_counter()-compile_done)*1000), **offline)

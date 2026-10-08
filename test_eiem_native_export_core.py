@@ -55,6 +55,38 @@ def addon_function(name, namespace):
 
 
 class NativeExportCoreTests(unittest.TestCase):
+    def test_mesh_snapshots_share_only_the_current_exports_skin_context(self):
+        calls=[]
+        addon=SimpleNamespace(write_mesh=lambda path,obj,**options:
+            calls.append((obj,options)) or dict(owner=obj))
+        first,second=object(),object()
+        cache={}
+        exporter._cached_mesh_snapshot(addon,first,cache)
+        exporter._cached_mesh_snapshot(addon,second,cache)
+        self.assertIs(calls[0][1]['skin_cache'],cache)
+        self.assertIs(calls[1][1]['skin_cache'],cache)
+        self.assertIsNot(calls[0][0],calls[1][0])
+        next_export={}
+        exporter._cached_mesh_snapshot(addon,first,next_export)
+        self.assertIs(calls[2][1]['skin_cache'],next_export)
+        self.assertIsNot(calls[2][1]['skin_cache'],cache)
+
+    def test_material_uses_its_own_source_and_reuses_loaded_package(self):
+        class Source:
+            def __init__(self, package, core):
+                self.package, self.core = Path(package).resolve(), core
+        main = Source('/sources/main', object())
+        local = Material('Local')
+        foreign = Material('Foreign', dict(eiem_author_package='/sources/foreign'))
+        cache = {}
+        self.assertIs(exporter.material_source(main, local, cache), main)
+        resolved = exporter.material_source(main, foreign, cache)
+        self.assertEqual(resolved.package, Path('/sources/foreign').resolve())
+        self.assertIs(resolved.core, main.core)
+        self.assertIs(exporter.material_source(main, foreign, cache), resolved)
+        local['eiem_author_package'] = str(main.package)
+        self.assertIs(exporter.material_source(main, local, cache), main)
+
     def test_shared_texture_conversion_reuses_pixels_and_preserves_conflicts(self):
         from PIL import Image
         with tempfile.TemporaryDirectory() as folder:

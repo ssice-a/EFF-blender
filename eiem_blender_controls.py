@@ -240,15 +240,6 @@ def switch_key_from_event(event):
 def set_switch_group_key(group, key, scene=None):
     scene = scene or bpy.context.scene
     key = validate_switch_key(key)
-    if any(candidate != group
-           and validate_switch_key(candidate.get("eiem_key", "")) == key
-           for candidate in switch_groups(scene)):
-        raise ValueError("已有切换组使用快捷键 " + key)
-    if any(str(getattr(control, attribute, "")).strip()
-           and validate_switch_key(getattr(control, attribute)) == key
-           for _, control in shape_controls_in_scene(scene)
-           for attribute in ("hotkey_increase", "hotkey_decrease")):
-        raise ValueError("已有形态键控制使用快捷键 " + key)
     group["eiem_key"] = key
     return key
 
@@ -280,18 +271,6 @@ def set_shape_control_hotkey(obj, control, key, direction, scene=None):
         setattr(control, attribute, "")
         return ""
     key = validate_switch_key(key)
-    if any(validate_switch_key(group.get("eiem_key", "")) == key
-           for group in switch_groups(scene)):
-        raise ValueError("已有网格切换组使用快捷键 " + key)
-    target = (control.as_pointer(), attribute)
-    for _, candidate in shape_controls_in_scene(scene):
-        for candidate_attribute in ("hotkey_increase", "hotkey_decrease"):
-            candidate_key = str(
-                getattr(candidate, candidate_attribute, "")).strip()
-            if ((candidate.as_pointer(), candidate_attribute) != target
-                    and candidate_key
-                    and validate_switch_key(candidate_key) == key):
-                raise ValueError("已有形态键控制使用快捷键 " + key)
     setattr(control, attribute, key)
     return key
 
@@ -451,14 +430,6 @@ def create_switch_group(name, key, objects, scene=None):
             or any(obj.type != "MESH" or not obj.data.get("eiem_section")
                    for obj in objects)):
         raise ValueError("请先选择 EFF 网格部件")
-    if any(validate_switch_key(group.get("eiem_key", "")) == key
-           for group in switch_groups(scene)):
-        raise ValueError("已有切换组使用快捷键 " + key)
-    if any(str(getattr(control, attribute, "")).strip()
-           and validate_switch_key(getattr(control, attribute)) == key
-           for _, control in shape_controls_in_scene(scene)
-           for attribute in ("hotkey_increase", "hotkey_decrease")):
-        raise ValueError("已有形态键控制使用快捷键 " + key)
     root = next(
         (collection for collection in scene.collection.children
          if collection.get("eiem_switch_root")), None)
@@ -535,7 +506,6 @@ def plan_switch_export(mesh_objects, scene=None, include_switches=True):
     }
     group_defs = []
     bindings = {}
-    keys = set()
     for group in groups:
         if group not in used_groups:
             continue
@@ -550,9 +520,6 @@ def plan_switch_export(mesh_objects, scene=None, include_switches=True):
         if not include_switches:
             continue
         key = validate_switch_key(group.get("eiem_key", ""))
-        if key in keys:
-            raise ValueError("导出的多个切换组使用同一快捷键：" + key)
-        keys.add(key)
         group_identity = author_identity(group, bpy.data.collections)
         variable = "$switch_" + group_identity
         state_values = switch_state_values(group)

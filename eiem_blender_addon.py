@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 40, 0),
+    "version": (0, 40, 2),
     "blender": (3, 0, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
@@ -249,21 +249,33 @@ mesh_lod_family = lod.mesh_lod_family
 mesh_export_template = lod.mesh_export_template
 
 
+def _lod_candidates(objects):
+    candidates = list(bpy.data.objects)
+    packages = {str(obj.get('eiem_author_package', '')) for obj in objects}
+    for package in sorted(packages - {''}):
+        manifest = Path(package) / 'source/manifest.json'
+        if manifest.is_file():
+            resources = json.loads(manifest.read_text('utf-8-sig'))['resources']
+            candidates.extend(lod.source_mesh_candidates(package, resources))
+    return candidates
+
+
 def discover_mesh_lods(obj, candidates=None):
     return lod.discover_mesh_lods(
-        obj, candidates if candidates is not None else bpy.data.objects)
+        obj, candidates if candidates is not None else _lod_candidates([obj]))
 
 
 def expand_lod_plan(plan, target_levels, candidates=None):
     return lod.expand_lod_plan(
         plan, target_levels,
-        candidates if candidates is not None else bpy.data.objects,
+        candidates if candidates is not None else _lod_candidates(plan['objects']),
         mesh_source_identity)
 
 
 def lod_levels_for_export(mesh_objects, selected_levels=None, all_levels=False):
+    mesh_objects = list(mesh_objects)
     return lod.lod_levels_for_export(
-        mesh_objects, bpy.data.objects, selected_levels, all_levels)
+        mesh_objects, _lod_candidates(mesh_objects), selected_levels, all_levels)
 
 
 MAGIC_MESH = format_io.MAGIC_MESH
@@ -1805,14 +1817,39 @@ def shared_bone_source_candidates(armature):
     return records
 
 
-def explicit_skeleton_bone_index_paths(armature, paths):
+def _skin_export_context(armature, cache=None):
+    """Share validated skeleton data only within one synchronous export."""
+    key = int(armature.as_pointer())
+    if cache is not None and key in cache:
+        return cache[key]
+    nodes = skeleton_author_nodes(armature)
+    sibling_indices, child_counts = {}, {}
+    # Bone collection order is the serialized child order, including unused
+    # bones. Do not sort names or prune zero-weight siblings.
+    for bone in armature.data.bones:
+        parent = bone.parent.name if bone.parent else None
+        sibling_indices[bone.name] = child_counts.get(parent, 0)
+        child_counts[parent] = sibling_indices[bone.name] + 1
+    context = dict(nodes=nodes,
+                   by_path={record[0]: bone for bone, record, _ in nodes},
+                   by_name={bone.name: record[0] for bone, record, _ in nodes},
+                   records={bone.name: record for bone, record, _ in nodes},
+                   authored={record[0]: bool(source) for _, record, source in nodes},
+                   sibling_indices=sibling_indices, index_paths={})
+    if cache is not None:
+        cache[key] = context
+    return context
+
+
+def explicit_skeleton_bone_index_paths(armature, paths, context=None):
     """Serialize paths for an explicit Mod-owned Skeleton resource.
 
     Ordinary Mesh replacement does not use these paths. They remain in the
     v6 payload so an explicit Skeleton can address its own generated nodes.
     """
-    bones = list(armature.data.bones)
-    by_path = {record[0]: bone for bone, record, _ in skeleton_author_nodes(armature)}
+    context = context if context is not None else _skin_export_context(armature)
+    by_path = context['by_path']
+    memo = context['index_paths']
     result = []
     for path in paths:
         bone = by_path.get(path)
@@ -1827,23 +1864,25 @@ def explicit_skeleton_bone_index_paths(armature, paths):
         root = by_path.get(root_path)
         if root is None:
             raise ValueError("共享骨架中不存在根骨骼路径：" + root_path)
-        indices = []
-        while bone != root:
+        pending = []
+        while bone != root and (root.name, bone.name) not in memo:
             if bone.parent is None:
                 raise ValueError("骨骼不属于其声明的根路径：" + path)
-            siblings = [candidate for candidate in bones
-                        if candidate.parent == bone.parent]
             try:
-                indices.append(siblings.index(bone))
-            except ValueError:
+                index = context['sibling_indices'][bone.name]
+            except KeyError:
                 raise ValueError("无法确定骨骼的同级顺序：" + path)
+            pending.append((bone.name, index))
             bone = bone.parent
-        indices.reverse()
-        result.append("/".join(str(index) for index in indices))
+        value = '' if bone == root else memo[(root.name, bone.name)]
+        for name, index in reversed(pending):
+            value = value + '/' + str(index) if value else str(index)
+            memo[(root.name, name)] = value
+        result.append(value)
     return result
 
 
-def export_skin_binding(obj, armature, source_vertices):
+def export_skin_binding(obj, armature, source_vertices, skin_cache=None):
     """Keep original slots; extend with bones from this shared armature."""
     if not armature:
         # A static consumer can reuse a source Mesh carrying unused skin
@@ -1860,12 +1899,12 @@ def export_skin_binding(obj, armature, source_vertices):
     hashes = [int(x) for x in parse_json_property(obj, "eiem_bone_hashes_json", [])]
     if not original or len(hashes) != len(original):
         raise ValueError("%s 缺少完整的原骨骼绑定信息" % obj.name)
-    author_nodes = skeleton_author_nodes(armature)
-    by_path = {record[0]: bone for bone, record, source in author_nodes}
+    context = _skin_export_context(armature, skin_cache)
+    by_path = context['by_path']
     missing = set(original) - by_path.keys()
     if missing:
         raise ValueError("原骨骼已不在共享骨架中：" + sorted(missing)[0])
-    by_name = {bone.name: path for path, bone in by_path.items()}
+    by_name = context['by_name']
     paths = list(original)
     additions = sorted({by_name[g.name] for g in obj.vertex_groups if g.name in by_name} - original.keys())
     matrices = dict(original)
@@ -1874,7 +1913,9 @@ def export_skin_binding(obj, armature, source_vertices):
             return Matrix([values[row::4] for row in range(4)])
         def flat(value):
             return [value[row][column] for column in range(4) for row in range(4)]
-        pending = list(shared_skin_bindings(armature))
+        if 'bindings' not in context:
+            context['bindings'] = shared_skin_bindings(armature)
+        pending = list(context['bindings'])
         while pending:
             progress = False
             for record in list(pending):
@@ -1899,7 +1940,7 @@ def export_skin_binding(obj, armature, source_vertices):
         world = {}
         def rest(bone):
             if bone.name not in world:
-                record = next(record for b, record, source in author_nodes if b == bone)
+                record = context['records'][bone.name]
                 p, q, s = record[2:]
                 local = Matrix.LocRotScale(Vector(p), Quaternion((q[3],q[0],q[1],q[2])), Vector(s))
                 world[bone.name] = rest(bone.parent) @ local if bone.parent else local
@@ -1958,11 +1999,10 @@ def export_skin_binding(obj, armature, source_vertices):
         skin_by_vertex.append((tuple(w for w,i in influences),tuple(i for w,i in influences)))
     if reduced:
         print("[EFF] %s: %d vertices reduced to the four strongest normalized skin influences" % (obj.name,reduced))
-    catalog = shared_bone_source_candidates(armature)
-    authored_nodes = {
-        record[0]: bool(source)
-        for _bone, record, source in skeleton_author_nodes(armature)
-    }
+    if 'candidates' not in context:
+        context['candidates'] = shared_bone_source_candidates(armature)
+    catalog = context['candidates']
+    authored_nodes = context['authored']
     source_candidates = []
     for path in paths:
         candidates = list(catalog.get(path, []))
@@ -1984,11 +2024,11 @@ def export_skin_binding(obj, armature, source_vertices):
                for candidates in source_candidates]
     return ([skin_by_vertex[i] for i in source_vertices],
             [matrices[p] for p in paths], hashes, paths,
-            explicit_skeleton_bone_index_paths(armature, paths), sources,
+            explicit_skeleton_bone_index_paths(armature, paths, context), sources,
             source_candidates)
 
 
-def write_mesh(path, obj, return_snapshot=False):
+def write_mesh(path, obj, return_snapshot=False, skin_cache=None):
     mesh = obj.data
     mesh.calc_loop_triangles()
     coordinate = mesh.get("eiem_coordinate_space", "unity-y-up-left-handed")
@@ -2072,7 +2112,7 @@ def write_mesh(path, obj, return_snapshot=False):
                      if modifier.type == "ARMATURE" and modifier.object), None)
     (skin, bindposes, bone_hashes, bone_paths, bone_index_paths,
      bone_sources, bone_source_candidates) = export_skin_binding(
-        obj, armature, source_vertices)
+        obj, armature, source_vertices, skin_cache)
     blend_vertices, blend_frames, blend_channels, blend_weights, additional = export_blend_shapes(obj, to_source, source_vertices)
 
     if return_snapshot:
@@ -2143,6 +2183,7 @@ def skeleton_author_nodes(obj):
     A source bone edit is rejected, never silently replaced with stale metadata.
     """
     records, paths, indices, source_world = [], {}, {}, {}
+    seen_paths = set()
     visiting = set()
     def visit(bone):
         if bone.name in indices:
@@ -2156,8 +2197,9 @@ def skeleton_author_nodes(obj):
         parent_path = paths[bone.parent.name] if bone.parent else ""
         path = str(bone.get("eiem_path", bone.name)) if source else (
             parent_path + "/" + bone.name if parent_path else bone.name)
-        if path in paths.values():
+        if path in seen_paths:
             raise ValueError("共享骨架中存在重复路径：" + path + "；复制的骨骼仍带有源身份，请使用新建骨骼")
+        seen_paths.add(path)
         if source:
             p, q, s = (bone.get("eiem_local_" + key) for key in ("position", "rotation", "scale"))
             if p is None or q is None or s is None:
@@ -2856,7 +2898,7 @@ class EFF_PT_material_properties(bpy.types.Panel):
 
 
 class EFF_PG_shape_control(bpy.types.PropertyGroup):
-    shape: StringProperty(name="褰㈡€侀敭")
+    shape: StringProperty(name="形态键")
     enabled: BoolProperty(name='导出控制变量', default=True)
     automatic: BoolProperty(name='使用 Blender 当前权重', default=False)
     identity: StringProperty(options={"HIDDEN"})
@@ -2900,7 +2942,7 @@ class EFF_OT_shape_control(bpy.types.Operator):
 
 class EFF_OT_shape_key_record(bpy.types.Operator):
     bl_idname = "eiem.shape_key_record"
-    bl_label = "褰曞埗褰㈡€侀敭鎸夐敭"
+    bl_label = "录制形态键按键"
     bl_description = "为增大或减小动作录制独立按键；Esc 取消"
     bl_options = {"REGISTER", "UNDO"}
     control_index: IntProperty(options={"HIDDEN"})
@@ -2923,7 +2965,7 @@ class EFF_OT_shape_key_record(bpy.types.Operator):
         if not 0 <= self.control_index < len(controls):
             raise ValueError("形态键控制已改变，请重新操作")
         if self.direction not in {"INCREASE", "DECREASE"}:
-            raise ValueError("褰㈡€侀敭鎸夐敭鏂瑰悜鏃犳晥")
+            raise ValueError("形态键按键方向无效")
         return controls[self.control_index]
 
     def invoke(self, context, event):
@@ -3002,7 +3044,7 @@ def draw_shape_hotkey_rows(layout, control, index):
 
 
 class EFF_PT_shape_controls(bpy.types.Panel):
-    bl_label = "EFF 褰㈡€侀敭鎺у埗"
+    bl_label = "EFF 形态键控制"
     bl_idname = "DATA_PT_eiem_shape_controls"
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"
@@ -3028,9 +3070,9 @@ class EFF_PT_shape_controls(bpy.types.Panel):
             body = box.column()
             body.enabled = control.enabled
             if obj.data.shape_keys:
-                body.prop_search(control, "shape", obj.data.shape_keys, "key_blocks")
+                body.prop_search(control, "shape", obj.data.shape_keys, "key_blocks", text="形态键")
             else:
-                body.label(text="缂哄皯褰㈡€侀敭", icon="ERROR")
+                body.label(text="缺少形态键", icon="ERROR")
             body.prop(control, "automatic")
             key = obj.data.shape_keys.key_blocks.get(control.shape) if obj.data.shape_keys else None
             if control.automatic and key:
@@ -3695,9 +3737,8 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
                 resource_scope=self.resource_scope)
             self.report(
                 {'INFO'},
-                "Exported %(meshes)d Mesh, %(materials)d Material, "
-                "%(textures)d Texture, %(skeletons)d Skeleton, "
-                "%(physics)d Physics" % stats,
+                "已导出 %(meshes)d 个 Mesh、%(materials)d 个材质、"
+                "%(textures)d 张贴图（%(exportSeconds).1f 秒）" % stats,
             )
             return {'FINISHED'}
         except Exception as error:
@@ -3744,8 +3785,8 @@ class EFF_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
                 source_baseline=context.scene.eiem_source_baseline)
             self.report(
                 {'INFO'},
-                "Exported %(meshes)d Mesh, %(materials)d Material, "
-                "%(textures)d Texture" % stats)
+                "已导出 %(meshes)d 个 Mesh、%(materials)d 个材质、"
+                "%(textures)d 张贴图（%(exportSeconds).1f 秒）" % stats)
             return {'FINISHED'}
         except Exception as error:
             self.report({'ERROR'}, str(error)); return {'CANCELLED'}

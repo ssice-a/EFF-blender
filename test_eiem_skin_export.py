@@ -66,6 +66,66 @@ for vertex,name in enumerate(('Root/Pelvis','Root/Pelvis/Foot','Root/Accessory')
 assert result['bindposes'][result['bone_paths'].index('Root/Pelvis')]==poses['Root/Pelvis']
 assert before==[[(g.group,g.weight) for g in v.groups] for v in obj.data.vertices]
 assert json.loads(obj['eiem_bone_palette_json'])==[by_path['Root'],by_path['Root/Unused']]
+
+# One export may process several Meshes on the same rig. Reuse only the
+# skeleton-wide data; per-object weights and source slots remain independent.
+twin=obj.copy(); twin.data=obj.data.copy()
+bpy.context.scene.collection.objects.link(twin)
+cached_file=output/'cached.mesh'; expected=file.read_bytes()
+nodes_fn=addon.skeleton_author_nodes
+donors_fn=addon.shared_bone_source_candidates
+calls={'nodes':0,'donors':0}
+def counted_nodes(armature):
+    calls['nodes']+=1
+    return nodes_fn(armature)
+def counted_donors(armature):
+    calls['donors']+=1
+    return donors_fn(armature)
+addon.skeleton_author_nodes=counted_nodes
+addon.shared_bone_source_candidates=counted_donors
+try:
+    cache={}
+    addon.write_mesh(cached_file,obj,skin_cache=cache)
+    assert cached_file.read_bytes()==expected
+    addon.write_mesh(cached_file,twin,skin_cache=cache)
+    assert cached_file.read_bytes()==expected
+    assert calls=={'nodes':1,'donors':1},calls
+    # Weight edits are never cached with the shared skeleton context.
+    twin.vertex_groups['Foot'].add([0],.25,'REPLACE')
+    addon.write_mesh(cached_file,twin,skin_cache=cache)
+    changed=addon.read_mesh(cached_file)
+    weights,indices=changed['skin'][0]
+    assert abs(weights[0]-.8)<1e-6 and abs(weights[1]-.2)<1e-6,weights
+    assert [changed['bone_paths'][i] for i in indices[:2]]==['Root/Pelvis','Root/Pelvis/Foot']
+    # A distinct Armature must never borrow the first rig's validation.
+    other_rig=rig.copy(); other_rig.data=rig.data.copy()
+    bpy.context.scene.collection.objects.link(other_rig)
+    twin.modifiers[0].object=other_rig
+    addon.write_mesh(cached_file,twin,skin_cache=cache)
+    assert calls=={'nodes':2,'donors':2},calls
+    twin.modifiers[0].object=rig
+    bpy.data.objects.remove(other_rig,do_unlink=True)
+    # The next export starts a fresh context even for an unchanged rig.
+    addon.write_mesh(cached_file,obj,skin_cache={})
+    assert cached_file.read_bytes()==expected
+    assert calls=={'nodes':3,'donors':3},calls
+    bone=rig.data.bones['Pelvis']
+    parent=bone.get('eiem_source_parent')
+    bone['eiem_source_parent']='WrongParent'
+    try:
+        addon.write_mesh(cached_file,obj,skin_cache={})
+        raise AssertionError('edited source bone accepted on the next export')
+    except ValueError as error:
+        assert '父级' in str(error),str(error)
+    finally:
+        if parent is None: del bone['eiem_source_parent']
+        else: bone['eiem_source_parent']=parent
+    assert cached_file.read_bytes()==expected
+finally:
+    addon.skeleton_author_nodes=nodes_fn
+    addon.shared_bone_source_candidates=donors_fn
+    bpy.data.objects.remove(twin,do_unlink=True)
+
 obj['eiem_bone_sources_json'] = json.dumps([
     ['assets/a.mesh', 'MeshA', 3], ['assets/a.mesh', 'MeshA', 7]])
 assert json.loads(obj['eiem_bone_sources_json'])[1][2] == 7

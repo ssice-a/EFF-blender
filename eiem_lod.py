@@ -10,6 +10,26 @@ from collections import defaultdict
 LOD_TOKEN_RE = re.compile(r"(?<![a-z0-9])lod([0-9]+)(?![a-z0-9])", re.IGNORECASE)
 
 
+class _SourceMesh:
+    type = 'MESH'
+
+    def __init__(self, package, row):
+        self.name = row['name']
+        self.data = dict(eiem_section='Mesh' + row['name'], eiem_asset=row['name'],
+                         eiem_source=row['logicalPath'], eiem_target_asset=row['name'],
+                         eiem_target_path=row['logicalPath'])
+        self._values = dict(eiem_author_package=str(package), eiem_render_asset=row['name'],
+                            eiem_render_section='Render' + row['name'])
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
+
+def source_mesh_candidates(package, resources):
+    """Target metadata from the unpacked source, without importing geometry."""
+    return [_SourceMesh(package, row) for row in resources if row['type'] == 'Mesh']
+
+
 class _VariantData:
     """Read-only metadata view over a Blender Mesh for one target LOD."""
 
@@ -210,7 +230,7 @@ def expand_lod_plan(plan, target_levels, candidates, source_identity):
         raise ValueError("所选目标 LOD 在当前导入资源中不存在")
 
     grouped = defaultdict(list)
-    for obj in sorted(variants, key=lambda item: (source_identity(item), item.name)):
+    for obj in sorted(variants, key=lambda item: (source_identity(item), mesh_export_template(item).name)):
         grouped[source_identity(obj)].append(obj)
     return {
         "objects": [obj for values in grouped.values() for obj in values],
@@ -232,4 +252,3 @@ def lod_levels_for_export(mesh_objects, candidates, selected_levels=None,
     if all_levels:
         return sorted(level for level in discovered if 0 <= level <= 4)
     return sorted(set(selected_levels or ()) & discovered)
-

@@ -1,6 +1,7 @@
 """Compile one staged Mod with this add-on's own author tools."""
 from pathlib import Path
 import json
+import math
 import os
 import re
 import shutil
@@ -206,6 +207,17 @@ def compile_reload(destination, context=None):
         raise ValueError('资源编译没有生成完整的 compiled.bin')
     import hashlib
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest().upper()
+    costs = {}
+    for row in result.stdout.splitlines():
+        fields = row.split()
+        if len(fields) == 3 and fields[0] == 'COMPILED-MOD-COST':
+            try:
+                elapsed = float(fields[2])
+            except ValueError:
+                continue
+            if math.isfinite(elapsed) and elapsed >= 0:
+                costs[fields[1]] = elapsed
     return dict(offlineReloadPrepared=True, offlineReloadKey=digest,
                 offlineReloadManifestHash=digest, offlineReloadCache=str(destination),
-                offlineCompiler=protocol.get('compiler', str(compiler)))
+                offlineCompiler=protocol.get('compiler', str(compiler)),
+                offlineCompilerCostsMs=costs)

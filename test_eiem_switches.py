@@ -107,7 +107,7 @@ addon.capture_switch_state(acc_group, addon.switch_states(acc_group)[1])
 accessory.hide_set(False)
 
 # Blender keyboard events are recorded into the finite runtime key vocabulary;
-# duplicate assignments are rejected before changing the current group.
+# duplicate assignments are allowed; the user owns key routing.
 class KeyEvent:
     value = "PRESS"
     ctrl = shift = alt = False
@@ -126,12 +126,9 @@ assert addon.switch_key_from_event(KeyEvent("NUMPAD_ASTERIX")) == "NUMPADMULTIPL
 assert addon.switch_key_from_event(KeyEvent("NUMPAD_SLASH")) == "NUMPADDIVIDE"
 assert addon.switch_key_from_event(KeyEvent("NUMPAD_PERIOD")) == "NUMPADDECIMAL"
 assert addon.set_switch_group_key(top_group, "Ctrl+Shift+F8") == "CTRL+SHIFT+F8"
-try:
-    addon.set_switch_group_key(acc_group, "shift+ctrl+f8")
-    raise AssertionError("duplicate recorded key accepted")
-except ValueError as error:
-    assert "已有切换组" in str(error)
-assert acc_group["eiem_key"] == "F7"
+assert addon.set_switch_group_key(acc_group, "shift+ctrl+f8") == "CTRL+SHIFT+F8"
+assert acc_group["eiem_key"] == top_group["eiem_key"]
+addon.set_switch_group_key(acc_group, "F7")
 assert addon.set_switch_group_key(
     top_group, "Ctrl+Alt+Numpad7") == "CTRL+ALT+NUMPAD7"
 assert top_group["eiem_key"] == "CTRL+ALT+NUMPAD7"
