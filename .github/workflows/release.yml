@@ -12,7 +12,7 @@ jobs:
   package:
     runs-on: windows-latest
     env:
-      FRAMEWORK_TAG: v1.3.3
+      FRAMEWORK_TAG: v1.3.4
     steps:
       - uses: actions/checkout@v4
       - name: Checkout paired framework sources

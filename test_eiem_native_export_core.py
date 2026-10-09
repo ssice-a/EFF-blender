@@ -55,6 +55,45 @@ def addon_function(name, namespace):
 
 
 class NativeExportCoreTests(unittest.TestCase):
+    def test_native_texture_template_allows_two_material_variants(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as folder:
+            images = {}
+            for name, color in [('bar', (255, 0, 0, 255)), ('cloth', (0, 0, 255, 255))]:
+                path = Path(folder) / (name + '.png')
+                Image.new('RGBA', (2, 2), color).save(path)
+                image = Material(name)
+                image.filepath = str(path)
+                images[name] = image
+            native = dict(details=dict(textures=[dict(property='_BaseMap',
+                          pointer=dict(isNull=False, identity='native-tex'))]),
+                          native=dict(typeHash='12' * 16))
+            source = SimpleNamespace(resolve=lambda *args: native, manifest=dict(resources=[
+                dict(identity='native-tex', logicalPath='assets/shared_d', name='Shared_D')]))
+            addon = SimpleNamespace(image_absolute_path=lambda image: image.filepath,
+                write_texture=lambda path, image: shutil.copyfile(image.filepath, path),
+                material_override_payload=lambda mat, *args, **kwargs:
+                    (['texture._BaseMap=' + mat['image']], None))
+            textures, cache, records = {}, {}, []
+            for name in ('bar', 'cloth'):
+                mat = Material('Material' + name, dict(eiem_source='assets/shared_mat',
+                               eiem_name='SharedMaterial', image=name))
+                records.append(exporter.collect_material(addon, source, mat, images,
+                    textures, folder, None, texture_only=True, texture_cache=cache))
+            first, second = (row['textureEdits'][0]['texture'] for row in records)
+            self.assertNotEqual(first, second)
+            self.assertEqual(len(textures), 2)
+            self.assertNotEqual(textures[first]['pixels'], textures[second]['pixels'])
+            self.assertEqual(textures[first]['sourceAsset'], textures[second]['sourceAsset'])
+            self.assertEqual(textures[first]['section'], first)
+            # A later partial export keeps the binding ID while pixels change.
+            Image.new('RGBA', (2, 2), (0, 255, 0, 255)).save(Path(images['bar'].filepath))
+            mat = Material('Materialbar', dict(eiem_source='assets/shared_mat',
+                           eiem_name='SharedMaterial', image='bar'))
+            updated = exporter.collect_material(addon, source, mat, images, {},
+                folder, None, texture_only=True, texture_cache={})
+            self.assertEqual(updated['textureEdits'][0]['texture'], first)
+
     def test_mesh_snapshots_share_only_the_current_exports_skin_context(self):
         calls=[]
         addon=SimpleNamespace(write_mesh=lambda path,obj,**options:
@@ -112,19 +151,21 @@ class NativeExportCoreTests(unittest.TestCase):
             def collect():
                 return exporter.collect_material(addon, source, material, {'slot': image},
                     textures, folder, None, texture_only=True, texture_cache=cache)
-            collect(); collect()
+            first_record = collect(); collect()
+            first = first_record['textureEdits'][0]['texture']
             self.assertEqual(len(calls), 1)
-            self.assertEqual(textures['native-tex']['mipCount'], 3)
+            self.assertEqual(textures[first]['mipCount'], 3)
             # Different native templates can share one Blender image. Pixels
             # are converted once, but each target keeps its own source identity.
             source.manifest['resources'].append(dict(identity='native-detail',
                 logicalPath='assets/detail_d', name='Detail_D'))
             native['details']['textures'][1]['pointer']['identity'] = 'native-detail'
-            collect()
+            detail_record = collect()
+            detail = detail_record['textureEdits'][1]['texture']
             self.assertEqual(len(calls), 1)
-            self.assertEqual(textures['native-detail']['sourceAsset'], 'Detail_D')
-            self.assertEqual(textures['native-detail']['sourcePath'], 'assets/detail_d')
-            self.assertIs(textures['native-detail']['pixels'], textures['native-tex']['pixels'])
+            self.assertEqual(textures[detail]['sourceAsset'], 'Detail_D')
+            self.assertEqual(textures[detail]['sourcePath'], 'assets/detail_d')
+            self.assertIs(textures[detail]['pixels'], textures[first]['pixels'])
             image['eiem_filter'] = 2
             with self.assertRaisesRegex(ValueError, '冲突'):
                 collect()

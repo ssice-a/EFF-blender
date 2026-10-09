@@ -72,6 +72,12 @@ for cycle in range(3):
     handlers = [handler for handler in bpy.app.handlers.depsgraph_update_post
                 if handler.__module__ == module_name + ".eiem_physics_authoring"]
     assert len(handlers) == 1
+    export_tracker = module.eiem_blender_addon._eiem_export_dirty_depsgraph_update
+    load_reset = module.eiem_blender_addon._eiem_export_load_post
+    assert bpy.app.handlers.depsgraph_update_post.count(export_tracker) == 1
+    assert bpy.app.handlers.load_post.count(load_reset) == 1
+    assert hasattr(export_tracker, '_bpy_persistent')
+    assert hasattr(load_reset, '_bpy_persistent')
     native_handlers = [handler for handler in bpy.app.handlers.depsgraph_update_post
                        if handler.__module__ == module_name + ".eiem_physics_native"]
     assert not native_handlers
@@ -94,6 +100,8 @@ for cycle in range(3):
     assert tuple(bpy.data.objects) == scene_objects
 
     addon_utils.disable(module_name, default_set=False)
+    assert export_tracker not in bpy.app.handlers.depsgraph_update_post
+    assert load_reset not in bpy.app.handlers.load_post
     assert not callbacks(bpy.types.TOPBAR_MT_file_import)
     assert not callbacks(bpy.types.TOPBAR_MT_file_export)
     assert not hasattr(bpy.types.Scene, "eiem_switch_active")

@@ -33,6 +33,10 @@ def _cached_mesh_snapshot(addon, obj, skin_cache=None):
     if token_fn is None:
         return addon.write_mesh(None, obj, **options), False
     token = token_fn(obj)
+    if token is None:
+        # A lost tracker also makes older entries unsafe after it is restored.
+        _NATIVE_SNAPSHOT_CACHE.clear()
+        return addon.write_mesh(None, obj, **options), False
     key = (int(obj.as_pointer()), token)
     cached = _NATIVE_SNAPSHOT_CACHE.get(key)
     if cached is not None:
@@ -270,11 +274,17 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
                           filter=int(image.get('eiem_filter', 1)), wrap=int(image.get('eiem_wrap', 0)),
                           aniso=int(image.get('eiem_aniso', 1)), mipBias=float(image.get('eiem_mip_bias', 0)))
             texture_cache[cache_key] = payload
-        record = dict(payload, id=tex['identity'], sourcePath=tex['logicalPath'], sourceAsset=tex['name'])
-        if tex['identity'] in textures and textures[tex['identity']] != record:
-            raise ValueError('同一原生纹理存在冲突修改：' + tex['name'])
-        textures[tex['identity']] = record
-        edits.append(dict(property=prop, texture=tex['identity']))
+        # The game texture is a template, not the identity of an authored
+        # override. Each material binding remains stable across pixel edits,
+        # independent of other variants borrowing the same native texture.
+        binding = hashlib.sha256((mid + '\0' + prop).encode('utf-8')).hexdigest()[:12]
+        tid = 'Texture' + token(tex['name']) + '_' + binding
+        record = dict(payload, id=tid, section=tid,
+                      sourcePath=tex['logicalPath'], sourceAsset=tex['name'])
+        if tid in textures and textures[tid] != record:
+            raise ValueError('同一作者材质的纹理绑定在导出期间发生冲突：' + mid + ' / ' + prop)
+        textures[tid] = record
+        edits.append(dict(property=prop, texture=tid))
     return dict(id=mid, sourcePath=matpath, sourceAsset=matasset,
                 nativeTypeHash=native['native']['typeHash'], textureEdits=edits,
                 fieldData={} if texture_only else material_fields(source.tree(native), overrides, encode))
@@ -410,7 +420,7 @@ def _detach_staging_files(paths):
 
 
 def _partial_output_paths(staging, resource_scope, existing_ini, materials,
-                          textures, parts, identifier):
+                          textures, parts, identifier, texture_paths=None):
     """Return every staged file that update_directory may write in place."""
     paths = [Path(staging) / 'mod.ini']
     if resource_scope in ('MATERIALS', 'TEXTURES'):
@@ -420,8 +430,9 @@ def _partial_output_paths(staging, resource_scope, existing_ini, materials,
                 if section in existing_ini:
                     paths.append(Path(staging) / existing_ini[section]['path'])
         for texture in textures:
-            paths.append(Path(staging) / 'textures' /
-                         (identifier(texture['pixelLabel']) + '.tex'))
+            relative = (texture_paths[texture['id']] if texture_paths is not None else
+                        'textures/' + identifier(texture['pixelLabel']) + '.tex')
+            paths.append(Path(staging) / relative)
     elif resource_scope == 'MESH':
         for part in parts:
             section = identifier(part['object'])
@@ -604,9 +615,12 @@ def export_native_package(addon, destination, mesh_objects, armatures=None,
                         key_switch_enabled=modules['ini_reader'].key_switch_enabled(
                             existing_ini['Mod'].get('key_switch_enabled', '1')) if existing_ini else True)
         else:
+            texture_paths = modules['ini_package'].texture_output_paths(
+                staging, existing_ini, list(textures.values()), list(materials.values()))
             _detach_staging_files(_partial_output_paths(
                 staging, resource_scope, existing_ini, list(materials.values()),
-                list(textures.values()), parts, modules['ini_package'].identifier))
+                list(textures.values()), parts, modules['ini_package'].identifier,
+                texture_paths))
             modules['ini_package'].update_directory(staging,parts=parts,materials=list(materials.values()),
                         textures=list(textures.values()),texture_only=resource_scope == 'TEXTURES',
                         resource_cache=resource_cache)

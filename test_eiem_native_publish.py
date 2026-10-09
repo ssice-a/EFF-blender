@@ -46,6 +46,30 @@ def windows_reader(path, directory=False):
 
 
 class PublishTests(unittest.TestCase):
+    def test_variant_texture_partial_update_detaches_the_planned_collision_path(self):
+        data = fixture_module.DirectoryTests().variant_fixture(same_label=True)
+        root = Path(self.temp.name) / 'variants'
+        root.mkdir()
+        original = export_directory(root, **data)
+        before = {p.relative_to(root): p.read_bytes() for p in root.rglob('*') if p.is_file()}
+        stage = Path(self.temp.name) / 'variant-stage'
+        exporter._clone_staging_tree(root, stage)
+        ini_module = exporter.pack_modules()[0]['ini_package']
+        ini = ini_module.ini_document(stage)
+        textures = [dict(data['textures'][0], pixels=b'\x00\xff\x00\xff')]
+        materials = [data['materials'][1]]
+        planned = ini_module.texture_output_paths(stage, ini, textures, materials)
+        exporter._detach_staging_files(exporter._partial_output_paths(stage, 'TEXTURES',
+            ini, materials, textures, [], ini_module.identifier, planned))
+        update_directory(stage, materials=materials, textures=textures, texture_only=True)
+        self.assertEqual(before, {p.relative_to(root): p.read_bytes() for p in root.rglob('*') if p.is_file()})
+        exporter.publish(stage, root, read_package)
+        updated = {t['id']: t for t in read_package(root)['textures']}
+        second = next(t for t in original['textures'] if t['id'] == 'TextureVariantB')
+        self.assertEqual((root / second['file']).read_bytes(), before[Path(second['file'])])
+        self.assertNotEqual(updated['TextureVariantA']['sha256'],
+                            next(t for t in original['textures'] if t['id'] == 'TextureVariantA')['sha256'])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name) / 'Mod'

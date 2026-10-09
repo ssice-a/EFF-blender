@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 40, 2),
+    "version": (0, 40, 3),
     "blender": (3, 0, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
@@ -38,6 +38,7 @@ _EXPORT_DIRTY_SERIAL = defaultdict(int)
 _EXPORT_IN_PROGRESS = False
 
 
+@bpy.app.handlers.persistent
 def _eiem_export_dirty_depsgraph_update(_scene, depsgraph):
     """Record changed Blender IDs without doing work during an export."""
     if _EXPORT_IN_PROGRESS:
@@ -53,6 +54,14 @@ def _eiem_export_dirty_depsgraph_update(_scene, depsgraph):
         if original is not None and hasattr(original, "as_pointer"):
             owner = original
         _EXPORT_DIRTY_SERIAL[int(owner.as_pointer())] += 1
+
+
+@bpy.app.handlers.persistent
+def _eiem_export_load_post(_filepath):
+    # Blender removes non-persistent handlers when opening a project. Cache
+    # state belongs to one author scene, including its datablock pointers.
+    _EXPORT_DIRTY_SERIAL.clear()
+    native_export._NATIVE_SNAPSHOT_CACHE.clear()
 
 
 def _owner_property_digest(owner):
@@ -158,6 +167,8 @@ def _mesh_slot_digest(obj):
 
 
 def _mesh_resource_token(obj):
+    if _eiem_export_dirty_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
+        return None  # Reuse is unsafe without the edit revision tracker.
     mesh = getattr(obj, "data", None)
     armature = next((modifier.object for modifier in obj.modifiers
                      if modifier.type == "ARMATURE" and modifier.object), None)
@@ -3919,9 +3930,12 @@ classes = (
 
 
 def register():
+    _eiem_export_load_post(None)
     if _eiem_export_dirty_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(
             _eiem_export_dirty_depsgraph_update)
+    if _eiem_export_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_eiem_export_load_post)
     for cls in classes: bpy.utils.register_class(cls)
     physics_authoring.register(globals())
     bpy.types.Mesh.eiem_shape_controls = CollectionProperty(type=EFF_PG_shape_control)
@@ -3944,6 +3958,9 @@ def unregister():
     if _eiem_export_dirty_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(
             _eiem_export_dirty_depsgraph_update)
+    if _eiem_export_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_eiem_export_load_post)
+    _eiem_export_load_post(None)
     physics_authoring.unregister()
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_export)

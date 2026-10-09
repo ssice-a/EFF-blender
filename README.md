@@ -2,9 +2,9 @@
 
 EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以在 Blender 中编辑网格、材质、贴图、款式切换和形态键，然后导出可放入 EFF `plugin/mods` 的 Mod 文件夹。
 
-本次发布 **v0.40.2**，配套 [EFF v1.3.3](https://github.com/ssice-a/EFF/releases/tag/v1.3.3) 与 [AnimeStudio v1.3.1](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.3.1)。Windows x64 发布包包含原生导出核心、资源编译器、来源工具及 Pillow；已在 Blender 5.0.1 / Python 3.11 验证。其他 Python 布局需要对应的依赖构建。
+本次发布 **v0.40.3**，配套 [EFF v1.3.4](https://github.com/ssice-a/EFF/releases/tag/v1.3.4) 与 [AnimeStudio v1.3.1](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.3.1)。Windows x64 发布包包含原生导出核心、资源编译器、来源工具及 Pillow；已在 Blender 5.0.1 / Python 3.11 验证。其他 Python 布局需要对应的依赖构建。
 
-带截图的[简易 Mod 制作教程](https://github.com/ssice-a/EFF/blob/main/Mod%20Tutorial.md)包含安装、解包、材质编辑和所选网格导出步骤。
+带截图的[简易 Mod 制作教程](https://github.com/ssice-a/EFF/blob/main/Mod%20Tutorial.md)包含安装、解包、材质编辑和所选网格导出步骤；也提供[英文版](https://github.com/ssice-a/EFF/blob/main/Mod%20Tutorial_EN.md)。
 
 ## 功能
 
@@ -20,7 +20,7 @@ EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以
 
 ## 安装
 
-从 [Releases](https://github.com/ssice-a/EFF-blender/releases) 下载 `EFF_Blender_v0.40.2.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。更新前保存工程、关闭 Blender，再替换旧插件并重新启动，以释放原生 DLL 和旧 Python 模块。
+从 [Releases](https://github.com/ssice-a/EFF-blender/releases) 下载 `EFF_Blender_v0.40.3.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。更新前保存工程、关闭 Blender，再替换旧插件并重新启动，以释放原生 DLL 和旧 Python 模块。
 
 ## 制作 Mod
 
