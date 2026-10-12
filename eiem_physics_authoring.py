@@ -15,6 +15,7 @@ from mathutils import Matrix, Quaternion, Vector
 if __package__:
     from . import eiem_physics_document as document
     from . import eiem_physics_native as native
+    from . import eiem_physics_editor as editor
 else:
     _spec = importlib.util.spec_from_file_location("eiem_physics_document", Path(__file__).with_name("eiem_physics_document.py"))
     document = importlib.util.module_from_spec(_spec)
@@ -22,6 +23,9 @@ else:
     _spec = importlib.util.spec_from_file_location("eiem_physics_native", Path(__file__).with_name("eiem_physics_native.py"))
     native = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(native)
+    _spec = importlib.util.spec_from_file_location("eiem_physics_editor", Path(__file__).with_name("eiem_physics_editor.py"))
+    editor = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(editor)
 
 API = {}
 _DIRTY_ARMATURES = set()
@@ -49,6 +53,13 @@ def group_of(context):
 
 def physics_group_updated(self, context):
     if context and context.scene:
+        if hasattr(context.scene, "eiem_physics_editor_item"):
+            context.scene.eiem_physics_editor_item = context.scene.eiem_physics_group
+        native.apply_visibility(context.scene)
+
+
+def physics_visibility_updated(self, context):
+    if context and context.scene:
         native.apply_visibility(context.scene)
 
 
@@ -57,6 +68,10 @@ def active_object_updated():
     scene = getattr(bpy.context, "scene", None)
     view_layer = getattr(bpy.context, "view_layer", None)
     obj = view_layer.objects.active if view_layer else None
+    if scene and obj and hasattr(obj, "eiem_physics") and \
+            obj.eiem_physics.kind in ("GROUP", "NATIVE_GROUP", "COLLIDER", "NATIVE_COLLIDER") and \
+            hasattr(scene, "eiem_physics_editor_item"):
+        scene.eiem_physics_editor_item = obj
     if scene and obj and hasattr(obj, "eiem_physics") and \
             obj.eiem_physics.kind in ("GROUP", "NATIVE_GROUP") and \
             scene.eiem_physics_group != obj:
@@ -498,7 +513,7 @@ def validate_group_nodes(rig, pairs):
 
 
 def add_selected_nodes(group, selection):
-    """Explicitly extend one author chain; a second root remains invalid."""
+    """Extend an author group, preserving fixed roots on separate branches."""
     rig = group.eiem_physics.rig
     lookup = bones(rig)
     pairs = []
@@ -737,7 +752,7 @@ def activate_author_full_projection(obj):
     return tree
 
 
-def sync_author_controls_from_native_fields(obj):
+def sync_author_controls_from_native_fields(obj, rebuild_preview=True):
     """Update the compact author controls after fields or projected curves change."""
     if not native.is_parameter_group(obj):
         return
@@ -752,7 +767,8 @@ def sync_author_controls_from_native_fields(obj):
         persist_author_native_fields(obj)
     finally:
         p.ready = True
-    rebuild_group(obj)
+    if rebuild_preview:
+        rebuild_group(obj)
 
 
 def sync_author_radius_controls_to_native_fields(obj):
@@ -1455,6 +1471,9 @@ class EFF_PG_physics(bpy.types.PropertyGroup):
         name="完整原生参数快照", options={"HIDDEN"},
         description="由复制/粘贴保存的完整原生数值与曲线字段；不包含根骨、碰撞体引用或 SelectionData")
     show_structure: bpy.props.BoolProperty(name="结构编辑", default=False)
+    editor_selected: bpy.props.BoolProperty(name="选择为批量操作目标", default=False)
+    editor_hidden: bpy.props.BoolProperty(name="隐藏此条目", default=False, update=physics_visibility_updated)
+    editor_pinned: bpy.props.BoolProperty(name="固定显示此条目", default=False, update=physics_visibility_updated)
 
 
 class EFF_OT_physics_edit(bpy.types.Operator):
@@ -1763,139 +1782,12 @@ def draw_active_group_node(layout, context, group):
         box.label(text="此链位置已有关键点")
 
 
-class EFF_PT_physics(bpy.types.Panel):
-    bl_label = "物理骨骼"
-    bl_idname = "EFF_PT_physics"
-    bl_space_type, bl_region_type, bl_category = "VIEW_3D", "UI", "EFF"
-
-    def draw(self, context):
-        layout = self.layout
-        layout.prop(context.scene, "eiem_physics_group", text="当前组")
-        row = layout.row(align=True)
-        row.menu("EFF_MT_physics_create", text="新建", icon="ADD")
-        group = group_of(context)
-        if group:
-            op = row.operator("eiem.physics_parameters", text="复制参数", icon="COPYDOWN"); op.action = "COPY"
-            op = row.operator("eiem.physics_parameters", text="粘贴参数", icon="PASTEDOWN"); op.action = "PASTE"
-            row.operator("eiem.physics_edit", text="查看", icon="RESTRICT_VIEW_OFF").action = "FOCUS_GROUP"
-            layout.label(text="参数：选中 Empty → 对象属性 → EFF 物理参数", icon="INFO")
-            draw_active_group_node(layout, context, group)
-        structure_header, structure = layout.panel("eiem_physics_structure_tools", default_closed=True)
-        structure_header.label(text="链与碰撞体", icon="BONE_DATA")
-        if structure:
-            if group and group.eiem_physics.kind == "GROUP":
-                structure.operator("eiem.physics_edit", text="选择当前骨链").action = "SELECT_BONES"
-                structure.operator("eiem.physics_edit", text="将所选骨骼加入当前链").action = "ADD_NODES"
-                structure.operator("eiem.physics_edit", text="从当前链移除所选骨骼").action = "REMOVE_NODES"
-            elif native.is_native(group):
-                structure.operator("eiem.select_native_physics_bones", text="选择物理骨骼")
-                structure.operator("eiem.select_native_physics", text="选择引用碰撞体")
-            obj = context.object
-            if obj and obj.eiem_physics.kind in ("COLLIDER", "NATIVE_COLLIDER"):
-                structure.operator("eiem.physics_edit", text="加入当前物理组").action = "LINK"
-                if obj.eiem_physics.kind == "COLLIDER":
-                    structure.operator("eiem.physics_edit", text="绑定到 Rig 活动骨骼").action = "REBIND_ACTIVE"
-                    structure.operator("eiem.physics_edit", text="刷新骨骼绑定").action = "REBIND"
-                    structure.operator("eiem.physics_edit", text="删除碰撞体及引用").action = "DELETE_COLLIDER"
-        view_header, view = layout.panel("eiem_physics_view_settings", default_closed=True)
-        view_header.label(text="显示", icon="HIDE_OFF")
-        if view:
-            view.prop(context.scene, "eiem_physics_visibility", text="范围")
-            view.prop(context.scene, "eiem_physics_preview_style", text="样式")
-            view.prop(context.scene, "eiem_physics_xray", text="穿透模型")
-        file_header, files = layout.panel("eiem_physics_file_tools", default_closed=True)
-        file_header.label(text="文件", icon="FILE_FOLDER")
-        if files:
-            files.operator("eiem.export_physics", text="导出所选物理组")
-
-
-class EFF_PT_physics_object(bpy.types.Panel):
-    bl_label = "EFF 物理参数"
-    bl_idname = "OBJECT_PT_eiem_physics"
-    bl_space_type = "PROPERTIES"
-    bl_region_type = "WINDOW"
-    bl_context = "object"
-
-    @classmethod
-    def poll(cls, context):
-        return bool(context.object and hasattr(context.object, "eiem_physics") and
-                    context.object.eiem_physics.kind != "NONE")
-
-    def draw(self, context):
-        layout, obj, data = self.layout, context.object, context.object.eiem_physics
-        if native.is_native(obj):
-            native.draw(layout, context, obj)
-            return
-        layout.prop(data, "label", text="名称")
-        layout.label(text=("作者 v5 物理组" if data.kind == "GROUP" else "作者碰撞体") +
-                     " · 数据保存在此 Empty", icon="OUTLINER_OB_EMPTY")
-        if data.kind == "GROUP":
-            if native.is_parameter_group(obj):
-                native.draw_group_parameter_controls(layout, obj)
-            else:
-                parameter_box = layout.box(); parameter_box.label(text="整组共享参数", icon="PREFERENCES")
-                for path, label in native.COMMON_PARAMETERS:
-                    parameter_box.prop(data, path.rsplit(".", 1)[-1], text=label)
-                radius_box = layout.box(); radius_box.label(text="模拟点碰撞半径", icon="MESH_UVSPHERE")
-                radius_box.prop(data, "node_radius")
-                radius_box.prop(data, "radius_use_curve")
-                node = native.curve_mapping_node(obj, native.NODE_RADIUS_PARAMETER)
-                if node is not None:
-                    native.draw_curve_distribution(
-                        radius_box, obj, native.NODE_RADIUS_PARAMETER,
-                        bool(data.radius_use_curve))
-            lookup = {str(b.get("eiem_physics_id")): b for b in data.rig.data.bones
-                      if b.get("eiem_physics_id")} if data.rig else {}
-            names = [lookup[node.bone_id].name if node.bone_id in lookup else "骨骼已删除"
-                     for node in data.nodes]
-            layout.label(text="骨链：" + " → ".join(names[:5]) + ("…" if len(names) > 5 else ""), icon="BONE_DATA")
-            collider_box = layout.box(); collider_box.label(
-                text="碰撞集合：%d 个（本物理组使用）" % len(data.colliders), icon="MESH_CAPSULE")
-            for index, ref in enumerate(data.colliders):
-                row = collider_box.row(align=True)
-                row.label(text=ref.object.eiem_physics.label if ref.object else "碰撞体已删除")
-                if ref.object:
-                    op = row.operator("eiem.physics_edit", text="", icon="RESTRICT_SELECT_OFF")
-                    op.action, op.target = "SELECT_COLLIDER", ref.object.name_full
-                op = row.operator("eiem.physics_edit", text="", icon="X")
-                op.action, op.index = "UNLINK", index
-            candidate = collider_box.row(align=True)
-            candidate.prop(data, "collider_candidate", text="")
-            candidate.operator("eiem.physics_edit", text="加入", icon="ADD").action = "LINK_CANDIDATE"
-            if any(ref.object and ref.object.eiem_physics.kind == "NATIVE_COLLIDER" for ref in data.colliders):
-                collider_box.label(text="源碰撞体将在导出时转换为可移植碰撞体", icon="INFO")
-            layout.prop(data, "show_structure", icon="TRIA_DOWN" if data.show_structure else "TRIA_RIGHT",
-                        emboss=False)
-            if data.show_structure:
-                for node in data.nodes:
-                    node_box = layout.row(); node_box.prop(node, "role", text=lookup[node.bone_id].name if node.bone_id in lookup else "已删除")
-            if native.is_parameter_group(obj):
-                native.draw_parameter_fields(layout, obj, "BeyondBoneCloth",
-                                             allow_refresh=True, include_disabled=False)
-        elif data.kind == "COLLIDER":
-            lookup = {str(b.get("eiem_physics_id")): b.name for b in data.rig.data.bones
-                      if b.get("eiem_physics_id")} if data.rig else {}
-            layout.label(text="绑定骨骼：" + lookup.get(data.bone_id, "已删除"), icon="CONSTRAINT_BONE")
-            layout.prop(data, "shape", text="形状")
-            layout.prop(data, "radius")
-            if data.shape == "CAPSULE":
-                layout.prop(data, "separate_radii")
-                if data.separate_radii:
-                    layout.prop(data, "end_radius")
-                layout.prop(data, "aligned_on_center")
-                layout.prop(data, "span")
-            layout.prop(obj, "location", text="骨骼局部位移")
-            layout.prop(obj, "rotation_quaternion", text="局部旋转")
-            users = [owner.name for owner in bpy.data.objects if owner.eiem_physics.kind == "GROUP" and
-                     any(ref.object == obj for ref in owner.eiem_physics.colliders)]
-            layout.label(text="引用组：" + ("、".join(users) if users else "无"))
 
 
 CLASSES = (EFF_PG_physics_node, EFF_PG_physics_reference, EFF_PG_physics,
            EFF_OT_physics_edit, EFF_OT_physics_parameters,
            EFF_OT_physics_export, EFF_OT_physics_import,
-           EFF_MT_physics_create,
-           EFF_PT_physics, EFF_PT_physics_object)
+           EFF_MT_physics_create)
 
 
 def register(api):
@@ -1908,6 +1800,7 @@ def register(api):
         update=physics_group_updated)
     bpy.types.Scene.eiem_physics_parameter_clipboard = StringProperty(options={"HIDDEN"})
     native.register(api["physics_authoring"], api)
+    editor.register(api["physics_authoring"], native)
     if not bpy.app.timers.is_registered(rebuild_existing_author_groups):
         bpy.app.timers.register(rebuild_existing_author_groups, first_interval=.05)
     if depsgraph_physics_updated not in bpy.app.handlers.depsgraph_update_post:
@@ -1927,6 +1820,7 @@ def unregister():
     if bpy.app.timers.is_registered(rebuild_existing_author_groups):
         bpy.app.timers.unregister(rebuild_existing_author_groups)
     _DIRTY_ARMATURES.clear()
+    editor.unregister()
     native.unregister()
     del bpy.types.Scene.eiem_physics_parameter_clipboard
     del bpy.types.Scene.eiem_physics_group

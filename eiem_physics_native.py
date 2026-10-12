@@ -102,6 +102,7 @@ NODE_RADIUS_VISUAL_FIELDS = {NODE_RADIUS_BASE_FIELD,
 NODE_RADIUS_CURVE_FIELD_PREFIX = NODE_RADIUS_PARAMETER + ".curve."
 NODE_RADIUS_PREVIEW_MARKER = "native-node-radius"
 NODE_SAMPLE_CACHE = "eiem_physics_node_samples"
+SELECTION_PREVIEW_ERROR = "eiem_physics_selection_preview_error"
 CURVE_MAPPING_TREE_MARKER = "eiem_physics_curve_mapping_tree"
 CURVE_MAPPING_PARAMETER = "eiem_physics_curve_parameter"
 CURVE_MAPPING_SIGNATURE = "eiem_physics_curve_mapping_signature"
@@ -838,9 +839,10 @@ def apply_curve_mapping(obj, parameter):
     mark_curve_mapping_edited(obj, parameter)
     node[CURVE_MAPPING_SOURCE_SIGNATURE] = source_curve_signature(keys)
     node[CURVE_MAPPING_SIGNATURE] = curve_mapping_signature(node)
+    changes_geometry = parameter in (NODE_RADIUS_PARAMETER, ANGLE_CURVE_PARAMETER)
     if obj.eiem_physics.kind == "GROUP" and AUTHOR is not None:
-        AUTHOR.sync_author_controls_from_native_fields(obj)
-    else:
+        AUTHOR.sync_author_controls_from_native_fields(obj, rebuild_preview=changes_geometry)
+    elif changes_geometry:
         schedule_group_preview(obj)
     return len(keys)
 
@@ -1175,37 +1177,126 @@ def component_local_graph(payload, component):
     return by_id, order, children, origins
 
 
-def group_local_selection_graph(obj, include_mapping=False):
-    """Resolve a preview graph by matching serialized points to source Transform origins.
+class SelectionPreviewError(ValueError):
+    """A source record can be valid without a provable point-to-bone preview."""
 
-    The match is geometric and one-to-one. It does not make SelectionData array
-    order an export/runtime identity contract.
+
+def require_selection_preview(condition, message):
+    if not condition:
+        raise SelectionPreviewError("Physics: " + message)
+
+
+def unique_selection_points(positions, origins):
+    candidates = {index: [identity for identity, point in origins.items()
+                          if (position - point).length <= 1e-4]
+                  for index, position in enumerate(positions)}
+    require_selection_preview(all(candidates.values()), "Selection 点无法匹配到本组 Transform")
+    require_selection_preview(all(len(items) == 1 for items in candidates.values()),
+                              "Selection 共点无法确定唯一骨骼；保留源选择数据")
+    mapping = {items[0]: index for index, items in candidates.items()}
+    require_selection_preview(len(mapping) == len(positions), "Selection 点与 Transform 不能一一匹配")
+    return mapping
+
+
+def preview_array(value, layout):
+    """Decode only a structurally valid serialized native array, without size caps."""
+    count, length = value["count"], value["length"]
+    stride = struct.calcsize(layout)
+    require_selection_preview(type(count) is int and type(length) is int and 0 <= count <= length,
+                              "预构建数组的元素范围无效")
+    data = bytes(value["arrayBytes"])
+    require_selection_preview(len(data) == length * stride, "预构建数组的字节布局无效")
+    return list(struct.iter_unpack(layout, data[:count * stride]))
+
+
+def prebuild_selection_graph(payload, component, positions, attributes):
+    """Use saved proxy points and explicit skin/Transform references for preview.
+
+    Selection order is independent of proxy order. Only a unique geometric
+    match is accepted, allowing one common translation between saved poses;
+    individual points, roles and topology must still agree. Nothing is written
+    back to SelectionData or to the game's prebuild data.
     """
+    saved = component["fields"]["serializeData2"]["preBuildData"]
+    try:
+        proxy = saved["preBuildData"]["proxyMesh"]
+        points = [Vector(row) for row in preview_array(proxy["localPositions"], "<3f")]
+        weights = preview_array(proxy["boneWeights"], "<4f4i")
+        skin = [row[0] for row in preview_array(proxy["skinBoneTransformIndices"], "<i")]
+        flags = [row[0] for row in preview_array(proxy["attributes"], "<B")]
+        transforms = saved["uniquePreBuildData"]["proxyMesh"]["transformData"]["transformArray"]
+        count = len(points)
+        require_selection_preview(count == len(positions) and count > 0 and len(weights) == len(flags) == count,
+                                  "预构建点集合与 Selection 不一致")
+        require_selection_preview(all(math.isfinite(value) for point in points for value in point),
+                                  "预构建点坐标无效")
+        prefix = "$.serializeData2.preBuildData.uniquePreBuildData.proxyMesh.transformData.transformArray["
+        references = {int(ref["field"][len(prefix):-1]): ref
+                      for ref in component["references"]
+                      if ref["field"].startswith(prefix) and ref["field"].endswith("]")
+                      and ref["type"] == "Transform" and not ref["isNull"]}
+        physical_paths = set(source.group_transform_paths(payload, component))
+        valid = {t["identity"] for t in payload["transforms"] if t["bone"] in physical_paths}
+        identities = {}
+        for index, weight in enumerate(weights):
+            require_selection_preview(abs(weight[0] - 1.0) <= 1e-6 and
+                                      all(abs(value) <= 1e-6 for value in weight[1:4]),
+                                      "预构建点不是单骨骼绑定")
+            bone_index = weight[4]
+            require_selection_preview(0 <= bone_index < len(skin), "预构建蒙皮槽无效")
+            slot = skin[bone_index]
+            require_selection_preview(0 <= slot < len(transforms) and slot in references,
+                                      "预构建 Transform 引用缺失")
+            ref, pointer = references[slot], transforms[slot]
+            require_selection_preview(ref["resolved"] and pointer["m_FileID"] == ref["fileId"] and
+                                      pointer["m_PathID"] == ref["pathId"], "预构建 Transform 引用记录不一致")
+            identity = ref["identity"]
+            require_selection_preview(identity in valid and identity not in identities.values(),
+                                      "预构建骨骼不属于本组或重复绑定")
+            identities[index] = identity
+        shift = (sum(positions, Vector()) - sum(points, Vector())) / count
+        vertex_mapping = unique_selection_points(positions, {i: point + shift for i, point in enumerate(points)})
+        require_selection_preview(all(flags[vertex] == attributes[index] for vertex, index in vertex_mapping.items()),
+                                  "预构建角色与 Selection 不一致")
+        def packed(key, layout):
+            data = bytes(proxy[key])
+            require_selection_preview(len(data) == count * struct.calcsize(layout), "预构建拓扑数组布局无效")
+            return [row[0] for row in struct.iter_unpack(layout, data)]
+        source_parents, source_depths = packed("vertexParentIndices", "<i"), packed("vertexDepths", "<f")
+        require_selection_preview(all(-1 <= parent < count for parent in source_parents) and
+                                  all(math.isfinite(depth) and 0.0 <= depth <= 1.0 for depth in source_depths),
+                                  "预构建父链或深度无效")
+        parents, depths, mapping = [-1] * count, [0.0] * count, {}
+        for vertex, index in vertex_mapping.items():
+            visited, parent = {vertex}, source_parents[vertex]
+            while parent >= 0:
+                require_selection_preview(parent not in visited, "预构建父链存在环")
+                visited.add(parent); parent = source_parents[parent]
+            parent = source_parents[vertex]
+            parents[index] = vertex_mapping[parent] if parent >= 0 else -1
+            depths[index] = source_depths[vertex]
+            mapping[identities[vertex]] = index
+        return positions, attributes, parents, depths, mapping
+    except SelectionPreviewError:
+        raise
+    except (KeyError, TypeError, ValueError, OverflowError, struct.error) as error:
+        raise SelectionPreviewError("Physics: 预构建绑定布局无法确认") from error
+
+
+def group_local_selection_graph(obj, include_mapping=False):
+    """Resolve a read-only preview; array order is never treated as bone identity."""
     payload, component = snapshot(obj), current_record(obj)
     selection = component["fields"]["serializeData2"]["selectionData"]
     positions = [Vector(tuple(point[axis] for axis in "xyz")) for point in selection["positions"]]
     attributes = [int(attribute["Value"]) for attribute in selection["attributes"]]
-    by_id, order, children, origins = component_local_graph(payload, component)
-    roots = source.referenced_sources(component, source.ROOT_REFERENCE, "Transform")
-    transform_ids, seen, pending = [], set(), list(roots)
-    while pending:
-        identity = pending.pop(0)
-        if identity in seen:
-            continue
-        seen.add(identity); transform_ids.append(identity)
-        pending.extend(children.get(identity, ()))
-
-    candidates = {index: sorted(((positions[index] - point).length, order[identity], identity)
-                                for identity in transform_ids for point in (origins[identity],)
-                                if (positions[index] - point).length <= 1e-4)
-                  for index in range(len(positions))}
-    source.require(all(candidates.values()), "Selection 点无法匹配到本组 Transform")
-    mapping, available = {}, set(transform_ids)
-    for index in sorted(range(len(positions)), key=lambda value: (len(candidates[value]), value)):
-        choices = [item for item in candidates[index] if item[2] in available]
-        source.require(bool(choices), "Selection 点与 Transform 不能一一匹配")
-        identity = choices[0][2]
-        mapping[identity] = index; available.remove(identity)
+    by_id, _, _, origins = component_local_graph(payload, component)
+    physical_paths = set(source.group_transform_paths(payload, component))
+    try:
+        mapping = unique_selection_points(positions, {identity: point for identity, point in origins.items()
+                                                     if by_id[identity]["bone"] in physical_paths})
+    except SelectionPreviewError:
+        result = prebuild_selection_graph(payload, component, positions, attributes)
+        return result if include_mapping else result[:4]
 
     parents = [-1] * len(positions)
     for identity, index in mapping.items():
@@ -1259,7 +1350,9 @@ def native_bone_sample(obj, bone):
     except (TypeError, ValueError, json.JSONDecodeError):
         samples = {}
     path = str(bone.get("eiem_path", ""))
-    if path not in samples:
+    if obj.get(SELECTION_PREVIEW_ERROR):
+        return None
+    if NODE_SAMPLE_CACHE not in obj:
         samples = cache_native_bone_samples(obj)
     sample = samples.get(path)
     return dict(sample, bone=bone, path=path) if sample is not None else None
@@ -1322,6 +1415,9 @@ def rebuild_angle_preview(obj, graph=None):
     for child in list(obj.children):
         if child.get("eiem_physics_preview") == ANGLE_PREVIEW_MARKER:
             remove_visual(child)
+    if obj.get(SELECTION_PREVIEW_ERROR):
+        obj["eiem_physics_angle_preview"] = "unmapped-selection"
+        return None
     action = obj.animation_data.action if obj.animation_data else None
     if action and action.get(CURVE_ACTION_MARKER) == obj.eiem_native_physics.source_key:
         ensure_curve_preview_timer()
@@ -1355,23 +1451,40 @@ def rebuild(obj):
             remove_visual(child)
     c = current_record(obj)
     if c["type"] == "BeyondBoneCloth":
-        positions, attributes, parents, depths, mapping = group_local_selection_graph(
-            obj, include_mapping=True)
-        cache_native_bone_samples(obj, (positions, attributes, parents, depths, mapping))
-        samples = {key: [] for key in ("FIXED", "MOVE")}
-        ignored = []
-        for index, (position, attribute, depth) in enumerate(zip(positions, attributes, depths)):
-            if attribute & 1:
-                samples["FIXED"].append((index, position, node_collision_radius(obj, depth), depth))
-            elif attribute & 2:
-                samples["MOVE"].append((index, position, node_collision_radius(obj, depth), depth))
-            else:
-                ignored.append(position)
-        for role, role_samples in samples.items():
-            make_node_radius_visual(obj, role_samples, COLORS[role], obj.name + " " + role + " 碰撞半径")
-        # IGNORE points are topology context rather than simulated particles;
-        # retain a small neutral marker instead of assigning them a physical radius.
-        make_node_visual(obj, ignored, COLORS["IGNORE"], obj.name + " IGNORE")
+        try:
+            graph = group_local_selection_graph(obj, include_mapping=True)
+        except SelectionPreviewError as error:
+            obj[SELECTION_PREVIEW_ERROR] = str(error)
+            obj[NODE_SAMPLE_CACHE] = "{}"
+            # A preview failure must not invalidate a fully decoded source
+            # component. Show its serialized points without inventing bone
+            # identities, chain depths or curve-dependent collision radii.
+            selection = c["fields"]["serializeData2"]["selectionData"]
+            points = {key: [] for key in ("FIXED", "MOVE", "IGNORE")}
+            for point, attribute in zip(selection["positions"], selection["attributes"]):
+                role = "FIXED" if attribute["Value"] & 1 else "MOVE" if attribute["Value"] & 2 else "IGNORE"
+                points[role].append(Vector(tuple(point[axis] for axis in "xyz")))
+            for role, positions in points.items():
+                make_node_visual(obj, positions, COLORS[role], obj.name + " " + role + " 源点标记")
+            graph = None
+        else:
+            if SELECTION_PREVIEW_ERROR in obj:
+                del obj[SELECTION_PREVIEW_ERROR]
+            positions, attributes, parents, depths, mapping = graph
+            cache_native_bone_samples(obj, graph)
+            samples = {key: [] for key in ("FIXED", "MOVE")}
+            ignored = []
+            for index, (position, attribute, depth) in enumerate(zip(positions, attributes, depths)):
+                if attribute & 1:
+                    samples["FIXED"].append((index, position, node_collision_radius(obj, depth), depth))
+                elif attribute & 2:
+                    samples["MOVE"].append((index, position, node_collision_radius(obj, depth), depth))
+                else:
+                    ignored.append(position)
+            for role, role_samples in samples.items():
+                make_node_radius_visual(obj, role_samples, COLORS[role], obj.name + " " + role + " 碰撞半径")
+            # IGNORE points are topology context, not simulated particles.
+            make_node_visual(obj, ignored, COLORS["IGNORE"], obj.name + " IGNORE")
         # Source selection positions and attributes stay paired as serialized.
         # Hierarchy lines are visual context, not a guessed selection->bone map.
         payload = snapshot(obj)
@@ -1384,7 +1497,7 @@ def rebuild(obj):
             if t["parent"] in descendants:
                 segments.append(([list(origins[t["parent"]]), list(origins[key])], False))
         make_link_visual(obj, segments, COLORS["LINK"], obj.name + " 层级连线")
-        rebuild_angle_preview(obj, (positions, attributes, parents, depths))
+        rebuild_angle_preview(obj, graph[:4] if graph is not None else None)
     else:
         geometry = source.collider_geometry(c)
         label = {"SPHERE":"球体", "CAPSULE":"胶囊", "PLANE":"无限平面"}[geometry["shape"]]
@@ -1683,6 +1796,9 @@ def apply_visibility(scene):
     mode = getattr(scene, "eiem_physics_visibility", "CURRENT")
     active = current_group(scene)
     current = related_objects(active) if mode == "CURRENT" else set()
+    selected = getattr(scene, "eiem_physics_editor_item", None)
+    if mode == "CURRENT" and selected and selected.eiem_physics.kind in ("GROUP", "NATIVE_GROUP", "COLLIDER", "NATIVE_COLLIDER"):
+        current.add(selected)
     xray = getattr(scene, "eiem_physics_xray", False)
     for obj in scene.objects:
         if not hasattr(obj, "eiem_physics") or obj.eiem_physics.kind == "NONE":
@@ -1692,6 +1808,7 @@ def apply_visibility(scene):
                 mode == "GROUPS" and kind in ("GROUP", "NATIVE_GROUP") or
                 mode == "COLLIDERS" and kind in ("COLLIDER", "NATIVE_COLLIDER") or
                 mode == "CURRENT" and obj in current)
+        show = mode != "NONE" and (show or obj.eiem_physics.editor_pinned) and not obj.eiem_physics.editor_hidden
         obj.hide_set(not show)
         obj.show_in_front = xray
         for child in obj.children:
@@ -1766,9 +1883,12 @@ class EFF_OT_native_bones(bpy.types.Operator):
     bl_label = "选择源物理骨骼"
     bl_options = {"REGISTER", "UNDO"}
     root_source: StringProperty()
+    target: StringProperty(options={"HIDDEN"})
     def execute(self, context):
         try:
-            obj = context.object if is_native(context.object) else AUTHOR.group_of(context)
+            obj = bpy.data.objects.get(self.target) if self.target else (
+                context.object if is_native(context.object) and context.object.eiem_physics.kind == "NATIVE_GROUP"
+                else AUTHOR.group_of(context))
             source.require(obj and obj.eiem_physics.kind == "NATIVE_GROUP", "请选择源物理组")
             value, component = snapshot(obj), current_record(obj)
             paths = set(group_root_paths(value, component, self.root_source) if self.root_source else
@@ -2016,8 +2136,8 @@ def draw_curve_distribution(layout, obj, parameter, enabled=True):
     controls = layout.column()
     values = controls.column()
     values.enabled = bool(enabled)
-    values.prop(root, "location", index=1, text="根部倍率")
-    values.prop(tip, "location", index=1, text="末端倍率")
+    values.prop(root, "location", index=1, text="深度 0 倍率")
+    values.prop(tip, "location", index=1, text="深度 1 倍率")
     style = values.row(align=True)
     style.label(text="变化方式")
     linear = curve_mapping_is_linear(node)
@@ -2035,7 +2155,7 @@ def draw_curve_distribution(layout, obj, parameter, enabled=True):
         editor = controls.column()
         editor.enabled = bool(enabled)
         keys = editor.box()
-        keys.label(text="链位置 0 为根端，1 为末端")
+        keys.label(text="0 为固定起点，1 为组内最长基线末端")
         for index, point in enumerate(points):
             point_box = keys.box()
             header = point_box.row(align=True)
@@ -2054,50 +2174,6 @@ def draw_curve_distribution(layout, obj, parameter, enabled=True):
         add.prop(state, "new_curve_key_position", text="新关键点位置")
         op = add.operator("eiem.physics_curve_key", text="添加", icon="ADD")
         op.action, op.parameter, op.position = "ADD", parameter, state.new_curve_key_position
-
-
-def draw_group_parameter_controls(layout, obj):
-    """Draw the one supported day-to-day editor in a fixed order."""
-    p = obj.eiem_native_physics
-    common = {field.label: field for field in p.fields}
-    box = layout.box(); box.label(text="物理组参数", icon="PREFERENCES")
-    for key, label in COMMON_PARAMETERS:
-        field = common.get(key)
-        if field:
-            API["draw_eiem_rna_property"](
-                box, field, "value" if field.floating else "integer", label, factor=.42)
-
-    curve_box = layout.box(); curve_box.label(text="沿骨链位置变化", icon="FCURVE")
-    curve_box.prop(p, "active_curve", text="参数")
-    index = min(max(int(p.active_curve), 0), len(CURVE_PARAMETERS) - 1)
-    parameter, label = CURVE_PARAMETERS[index]
-    base = common.get(parameter + ".value")
-    enabled = common.get(parameter + ".useCurve")
-    if base:
-        API["draw_eiem_rna_property"](
-            curve_box, base, "value" if base.floating else "integer", "基础值", factor=.42)
-    if enabled:
-        curve_box.prop(p, "curve_enabled")
-    for path, extra_label in CURVE_CONTEXT_FIELDS.get(parameter, ()):
-        field = common.get(path)
-        if field:
-            if path.rsplit(".", 1)[-1].startswith("use"):
-                curve_box.prop(p, "context_enabled", text=extra_label)
-            else:
-                API["draw_eiem_rna_property"](
-                    curve_box, field, "value" if field.floating else "integer", extra_label, factor=.42)
-    node = curve_mapping_node(obj, parameter)
-    if node is not None:
-        draw_curve_distribution(
-            curve_box, obj, parameter,
-            bool(p.curve_enabled) if enabled else True)
-    else:
-        curve_box.label(text="曲线数据尚未建立，请重新选择此物理组", icon="ERROR")
-    if parameter == ANGLE_CURVE_PARAMETER and bool(native_number(obj, ANGLE_ENABLED_FIELD)):
-        curve_box.label(text="黄色锥体显示每段当前允许角度", icon="MESH_CONE")
-        preview = str(obj.get("eiem_physics_angle_preview", ""))
-        if preview.startswith("error:"):
-            curve_box.label(text=preview[6:], icon="ERROR")
 
 
 def draw_parameter_fields(layout, obj, source_type, allow_refresh=False, include_disabled=False):
@@ -2129,69 +2205,6 @@ def draw_parameter_fields(layout, obj, source_type, allow_refresh=False, include
         trailing.label(text=value)
 
 
-def draw(layout, context, obj):
-    c = record(obj); p = obj.eiem_native_physics
-    layout.prop(obj.eiem_physics, "label")
-    layout.label(text=("物理组（可包含多条骨链）" if c["type"] == "BeyondBoneCloth" else "共享碰撞体"), icon="OUTLINER_OB_EMPTY")
-    layout.label(text="绑定骨骼：" + (c.get("bone") or "Prefab 根"))
-    layout.prop(p, "disabled")
-    if c["type"] == "BeyondBoneCloth":
-        sel = c["fields"]["serializeData2"]["selectionData"]
-        value = snapshot(obj)
-        bones = source.group_transform_paths(value, c)
-        roots = source.referenced_sources(c, source.ROOT_REFERENCE, "Transform")
-        collider_ids = source.group_collider_sources(c)
-        layout.label(text="%d 个根节点 · %d 根物理 Transform · %d 个选择点" %
-                     (len(roots), len(bones), len(sel["positions"])))
-        layout.label(text="锥体按静止位置匹配 Transform；不把数组序号当作骨骼编号", icon="INFO")
-        layout.label(text="绿色层级连线是物理链方向；bone tail 是源 Transform 局部 +Y 轴", icon="INFO")
-        layout.label(text="%d 个关联碰撞体 · 橙色固定 / 蓝色运动 / 灰色忽略" % len(collider_ids))
-        draw_group_parameter_controls(layout, obj)
-        by_id = {item["identity"]: item for item in value["transforms"]}
-        chain_box = layout.box(); chain_box.label(text="组内根链（共享本组参数）", icon="BONE_DATA")
-        for index, root_source in enumerate(roots):
-            row = chain_box.row(align=True)
-            path = by_id[root_source]["bone"] if root_source in by_id else "根节点已丢失"
-            row.label(text="%d. %s" % (index + 1, path.rsplit("/", 1)[-1] or "Prefab 根"))
-            operator = row.operator("eiem.select_native_physics_bones", text="选择此链", icon="RESTRICT_SELECT_OFF")
-            operator.root_source = root_source
-        collider_box = layout.box(); collider_box.label(text="本组使用的碰撞体", icon="MESH_UVSPHERE")
-        referenced = {ref.object.eiem_native_physics.source_key: ref.object for ref in obj.eiem_physics.colliders
-                      if ref.object and is_native(ref.object)}
-        all_colliders = {item.eiem_native_physics.source_key: item for item in bpy.data.objects
-                         if is_native(item) and item.eiem_physics.kind == "NATIVE_COLLIDER" and
-                         item.eiem_physics.rig == obj.eiem_physics.rig and
-                         item.eiem_native_physics.source_text == obj.eiem_native_physics.source_text}
-        for source_key in collider_ids:
-            collider = referenced.get(source_key) or all_colliders.get(source_key)
-            row = collider_box.row(align=True)
-            if collider:
-                geometry = source.collider_geometry(current_record(collider))
-                shape = {"SPHERE":"球", "CAPSULE":"胶囊", "PLANE":"平面"}[geometry["shape"]]
-                row.label(text="%s · %s" % (shape, collider.name))
-                operator = row.operator("eiem.select_native_physics", text="选择", icon="RESTRICT_SELECT_OFF")
-                operator.target = source_key
-            else:
-                row.label(text="碰撞体引用已丢失", icon="ERROR")
-    else:
-        geometry = source.collider_geometry(current_record(obj))
-        users = []
-        for group in native_group_objects(obj):
-            if c["source"] in source.group_collider_sources(record(group)): users.append(group.name)
-        shape = {"SPHERE":"球体", "CAPSULE":"胶囊", "PLANE":"无限平面"}[geometry["shape"]]
-        layout.label(text="原生外形：%s · 被 %d 个物理组引用" % (shape, len(users)), icon="INFO")
-        if geometry["shape"] == "CAPSULE":
-            layout.label(text="外部长 %.4g · 两端球心距 %.4g" %
-                         (geometry["length"], geometry["segmentLength"]))
-            axis = "XYZ"[geometry["axis"]] + ("（反向）" if geometry["reverse"] else "")
-            layout.label(text="局部 %s：Start 在正端，End 在负端" % axis, icon="ORIENTATION_LOCAL")
-        if users: layout.label(text="、".join(users[:4]) + ("…" if len(users) > 4 else ""))
-        layout.prop(obj, "location", text="中心偏移")
-        for field in p.fields:
-            if field.label.startswith(("center.", "size.")) or field.label in ("direction", "reverseDirection", "radiusSeparation", "alignedOnCenter"):
-                API["draw_eiem_rna_property"](layout, field, "value" if field.floating else "integer", field.label)
-    draw_parameter_fields(layout, obj, c["type"],
-                          allow_refresh=c["type"] == "BeyondBoneCloth", include_disabled=True)
 
 
 CLASSES = (EFF_PG_native_field, EFF_PG_native_physics, EFF_OT_native_import,

@@ -4,11 +4,13 @@ import importlib.util
 import json
 import os
 import shutil
+import struct
 from pathlib import Path
 import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+import numpy as np
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -55,6 +57,169 @@ def addon_function(name, namespace):
 
 
 class NativeExportCoreTests(unittest.TestCase):
+    def test_mesh_part_ids_keep_unicode_names_distinct_and_stable(self):
+        names = ['MeshS_actor_liino_cloth_02_lod0_3.丝袜上',
+                 'MeshS_actor_liino_cloth_02_lod0_3.丝袜下']
+        self.assertEqual(exporter.token(names[0]), exporter.token(names[1]))
+        ids = [exporter.mesh_part_id(name, slot, 2)
+               for name in names for slot in (1, 2)]
+        self.assertEqual(len(set(ids)), 4)
+        self.assertEqual(ids, [exporter.mesh_part_id(name, slot, 2)
+                              for name in names for slot in (1, 2)])
+        self.assertNotEqual(exporter.mesh_part_id('MeshCloth left', 0, 1),
+                            exporter.mesh_part_id('MeshCloth_left', 0, 1))
+        self.assertEqual(exporter.mesh_part_id('MeshCloth.001', 0, 1),
+                         'MeshCloth.001')
+        self.assertEqual(exporter.mesh_part_id('MeshCloth.001', 1, 2),
+                         'MeshCloth.001_mat1')
+
+    def test_empty_point_attribute_returns_an_empty_stream(self):
+        function = addon_function('get_point_attribute', {})
+
+        class EmptyData(list):
+            def foreach_get(self, member, values):
+                assert values == []
+
+        data = EmptyData()
+        attribute = SimpleNamespace(domain='POINT', data=data)
+        mesh = SimpleNamespace(attributes={'SourceNormal': attribute}, vertices=[])
+        self.assertEqual(function(mesh, 'SourceNormal', 'vector'), [])
+        self.assertEqual(function(mesh, 'SourceNormal', 'value'), [])
+
+    def test_generated_tangent_batch_preserves_scalar_float32_frames(self):
+        function = addon_function('_orthogonalize_missing_tangents', {'np': np})
+        rng = np.random.default_rng(173)
+        tangents = rng.normal(size=(4096, 4))
+        tangents[:, 3] = np.where(tangents[:, 3] < 0, -1, 1)
+        normals = rng.normal(size=(4096, 3))
+        expected = []
+        for value, normal in zip(tangents, normals):
+            tx, ty, tz, sign = map(float, value)
+            nx, ny, nz = map(float, normal)
+            dot = (tx*nx + ty*ny + tz*nz) / (nx*nx + ny*ny + nz*nz)
+            tx -= nx*dot; ty -= ny*dot; tz -= nz*dot
+            scale = (tx*tx + ty*ty + tz*tz) ** -.5
+            expected.append((tx*scale, ty*scale, tz*scale, sign))
+        actual = function('cloth', tangents, normals)
+        self.assertEqual(np.asarray(actual, dtype='<f4').tobytes(),
+                         np.asarray(expected, dtype='<f4').tobytes())
+
+    def test_generated_tangent_batch_reports_first_invalid_corner(self):
+        function = addon_function('_orthogonalize_missing_tangents', {'np': np})
+        tangents = [(1, 0, 0, -1)] * 4
+        normals = [(0, 0, 1)] * 4
+        normals[1] = (1, 0, 0)
+        tangents[3] = (0, 0, 0, 0)
+        with self.assertRaisesRegex(ValueError, 'cloth corner 1 tangent is parallel'):
+            function('cloth', tangents, normals)
+        with self.assertRaisesRegex(ValueError, 'cloth corner 0 cannot generate'):
+            function('cloth', [(float('nan'), 0, 0, 1)], [(0, 0, 1)])
+
+    def test_material_keywords_and_tags_are_serialized_with_shader_edits(self):
+        codec = exporter.pack_modules()[0]['type_tree']
+        string = lambda name: codec.Schema('string', name, True)
+        strings = lambda name: codec.Schema('vector', name, False, [
+            codec.Schema('Array', 'Array', False, [
+                codec.Schema('int', 'size', False), string('data')])])
+        tags = codec.Schema('map', 'stringTagMap', False, [
+            codec.Schema('Array', 'Array', False, [
+                codec.Schema('int', 'size', False),
+                codec.Schema('pair', 'data', False, [string('first'), string('second')])])])
+        schema = codec.Schema('Material', 'Base', False, [
+            strings('m_ValidKeywords'), strings('m_InvalidKeywords'), tags,
+            codec.Schema('int', 'm_CustomRenderQueue', False)])
+        tree = codec.from_data(schema, dict(
+            m_ValidKeywords=['_NORMALMAP', '_ALPHATEST_ON'],
+            m_InvalidKeywords=['OTHER', '_EMISSION'],
+            stringTagMap=[dict(first='RenderType', second='Opaque'),
+                          dict(first='OtherTag', second='unchanged')],
+            m_CustomRenderQueue=2000))
+        edits = {'keyword._EMISSION': '1', 'keyword._ALPHABLEND_ON': 'true',
+                 'keyword._ALPHATEST_ON': '0', 'tag.RenderType': 'Transparent',
+                 'render_queue': '3000'}
+        changed = exporter.material_fields(tree, edits, codec.encode)
+        self.assertEqual([x.data for x in tree['m_ValidKeywords'].items()],
+                         ['_NORMALMAP', '_EMISSION', '_ALPHABLEND_ON'])
+        self.assertEqual([x.data for x in tree['m_InvalidKeywords'].items()], ['OTHER'])
+        self.assertEqual(tree['stringTagMap'].items()[0]['second'].data, 'Transparent')
+        self.assertEqual(tree['stringTagMap'].items()[1]['second'].data, 'unchanged')
+        self.assertEqual(set(changed), {'m_ValidKeywords', 'm_InvalidKeywords',
+                                       'stringTagMap', 'm_CustomRenderQueue'})
+        self.assertEqual(exporter.material_fields(tree, edits, codec.encode), {})
+
+    def test_material_legacy_keyword_string_and_invalid_toggle(self):
+        codec = exporter.pack_modules()[0]['type_tree']
+        schema = codec.Schema('Material', 'Base', False, [
+            codec.Schema('string', 'm_ShaderKeywords', True)])
+        tree = codec.from_data(schema, dict(m_ShaderKeywords='_NORMALMAP _ALPHATEST_ON'))
+        exporter.material_fields(tree, {'keyword._EMISSION': '1',
+                                       'keyword._ALPHATEST_ON': 'false'}, codec.encode)
+        self.assertEqual(tree['m_ShaderKeywords'].data, '_NORMALMAP _EMISSION')
+        with self.assertRaisesRegex(ValueError, '0/1'):
+            exporter.material_fields(tree, {'keyword._EMISSION': 'banana'}, codec.encode)
+
+    def test_material_render_queue_changes_native_queue_not_shader_properties(self):
+        codec = exporter.pack_modules()[0]['type_tree']
+        schema = codec.Schema('Material', 'Base', False, [
+            codec.Schema('int', 'm_CustomRenderQueue', False),
+            codec.Schema('int', 'm_LightmapFlags', False),
+        ])
+        tree = codec.from_data(schema, dict(m_CustomRenderQueue=3000, m_LightmapFlags=4))
+        self.assertEqual(exporter.material_fields(tree, {'render_queue': '3000'}, codec.encode), {})
+        changed = exporter.material_fields(tree, {'render_queue': '2999'}, codec.encode)
+        self.assertEqual(changed, {'m_CustomRenderQueue': struct.pack('<i', 2999)})
+        self.assertEqual(tree['m_LightmapFlags'].plain(), 4)
+        self.assertEqual(exporter.material_fields(tree, {'render_queue': '-1'}, codec.encode),
+                         {'m_CustomRenderQueue': struct.pack('<i', -1)})
+
+    def test_material_render_queue_rejects_invalid_values(self):
+        codec = exporter.pack_modules()[0]['type_tree']
+        schema = codec.Schema('Material', 'Base', False, [
+            codec.Schema('int', 'm_CustomRenderQueue', False),
+        ])
+        for value in ('2999.5', 2999.5, 'invalid', '-2', '5001'):
+            with self.subTest(value=value):
+                tree = codec.from_data(schema, dict(m_CustomRenderQueue=3000))
+                with self.assertRaisesRegex(ValueError, '渲染队列'):
+                    exporter.material_fields(tree, {'render_queue': value}, codec.encode)
+                self.assertEqual(tree['m_CustomRenderQueue'].plain(), 3000)
+
+    def test_material_texture_transforms_preserve_native_pointer(self):
+        codec = exporter.pack_modules()[0]['type_tree']
+        scalar = lambda name: codec.Schema('float', name, False)
+        vector = lambda name: codec.Schema('Vector2f', name, False, [scalar('x'), scalar('y')])
+        pointer = codec.Schema('PPtr<Texture>', 'm_Texture', False, [
+            codec.Schema('int', 'm_FileID', False), codec.Schema('SInt64', 'm_PathID', False)])
+        envs = codec.Schema('map', 'm_TexEnvs', False, [codec.Schema('Array', 'Array', False, [
+            codec.Schema('int', 'size', False), codec.Schema('pair', 'data', False, [
+                codec.Schema('string', 'first', True), codec.Schema('UnityTexEnv', 'second', False,
+                    [pointer, vector('m_Scale'), vector('m_Offset')])])])])
+        schema = codec.Schema('Material', 'Base', False, [codec.Schema('UnityPropertySheet',
+                              'm_SavedProperties', False, [envs])])
+        tree = codec.from_data(schema, dict(m_SavedProperties=dict(m_TexEnvs=[dict(
+            first='_BaseMap', second=dict(m_Texture=dict(m_FileID=3, m_PathID=123),
+            m_Scale=dict(x=1,y=1), m_Offset=dict(x=0,y=0)))])))
+        edits={'texture_scale._BaseMap':'2,3', 'texture_offset._BaseMap':'0.2,-0.3'}
+        changed=exporter.material_fields(tree, edits, codec.encode)
+        env=tree['m_SavedProperties']['m_TexEnvs'].items()[0]['second']
+        self.assertEqual(env['m_Texture'].plain(),dict(m_FileID=3,m_PathID=123))
+        self.assertEqual(env['m_Scale'].plain(),dict(x=2,y=3))
+        self.assertEqual(set(changed),{'m_SavedProperties'})
+        self.assertEqual(exporter.material_fields(tree, edits, codec.encode),{})
+        with self.assertRaisesRegex(ValueError,'有限分量'):
+            exporter.material_fields(tree, {'texture_offset._BaseMap':'nan,0'},codec.encode)
+
+    def test_material_render_queue_flows_from_blender_override(self):
+        namespace = dict(json=json, parse_json_property=lambda material, key, default:
+                         json.loads(material.get(key, json.dumps(default))))
+        payload = addon_function('material_override_payload', namespace)
+        material = Material('Inner', dict(eiem_source='assets/source.mat',
+                            eiem_baseline_json=json.dumps({'source': 'assets/source.mat'}),
+                            eiem_render_queue=2999))
+        values, images = payload(material, {}, force=True)
+        self.assertIn('render_queue=2999', values)
+        self.assertEqual(images, set())
+
     def test_native_texture_template_allows_two_material_variants(self):
         from PIL import Image
         with tempfile.TemporaryDirectory() as folder:
@@ -110,6 +275,43 @@ class NativeExportCoreTests(unittest.TestCase):
         self.assertIs(calls[2][1]['skin_cache'],next_export)
         self.assertIsNot(calls[2][1]['skin_cache'],cache)
 
+    def test_native_mesh_encoding_reuses_snapshot_and_validates_source_before_hit(self):
+        calls, checked = [], []
+        owner = SimpleNamespace(as_pointer=lambda: 42, token='first', vertices=[1, 2, 3])
+        addon = SimpleNamespace(_mesh_resource_token=lambda obj: obj.token,
+                               write_mesh=lambda *args, **kwargs: {'vertices': owner.vertices})
+        def native_mesh(tree, author, name):
+            calls.append((author['vertices'], name))
+            return {'field': bytes(author['vertices'])}, {}
+        modules = {'mesh': SimpleNamespace(native_mesh=native_mesh),
+                   'delta_apply': SimpleNamespace(GEOMETRY_FIELDS=['field'])}
+        source = SimpleNamespace(rows={'CAB': {'snapshot': {'sha256': 'proof'}}},
+                                 file=lambda target: checked.append(target),
+                                 tree=lambda target: object())
+        target = {'identity': 'mesh', 'native': {'cab': 'CAB', 'typeHash': 'schema'}}
+        exporter._NATIVE_SNAPSHOT_CACHE.clear()
+        snapshot, _ = exporter._cached_mesh_snapshot(addon, owner)
+        encode = lambda value: value
+        first = exporter.native_mesh_fields(modules, source, target, snapshot,
+                                            snapshot, 0, 'Mesh', encode)
+        self.assertEqual(exporter.native_mesh_fields(modules, source, target, snapshot,
+                         snapshot, 0, 'Mesh', encode), first)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(checked), 2)
+        owner.token = 'edited'; owner.vertices = [4, 5, 6]
+        edited, _ = exporter._cached_mesh_snapshot(addon, owner)
+        self.assertNotEqual(exporter.native_mesh_fields(modules, source, target, edited,
+                            edited, 0, 'Mesh', encode), first)
+        self.assertEqual(len(calls), 2)
+        source.rows['CAB']['snapshot']['sha256'] = 'changed-source'
+        exporter.native_mesh_fields(modules, source, target, edited, edited, 0, 'Mesh', encode)
+        self.assertEqual(len(calls), 3)
+        def invalid(target):
+            raise ValueError('source snapshot hash')
+        source.file = invalid
+        with self.assertRaisesRegex(ValueError, 'source snapshot hash'):
+            exporter.native_mesh_fields(modules, source, target, edited, edited, 0, 'Mesh', encode)
+
     def test_material_uses_its_own_source_and_reuses_loaded_package(self):
         class Source:
             def __init__(self, package, core):
@@ -153,7 +355,7 @@ class NativeExportCoreTests(unittest.TestCase):
                     textures, folder, None, texture_only=True, texture_cache=cache)
             first_record = collect(); collect()
             first = first_record['textureEdits'][0]['texture']
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 0)  # Clean disk image bypasses Blender PNG writing.
             self.assertEqual(textures[first]['mipCount'], 3)
             # Different native templates can share one Blender image. Pixels
             # are converted once, but each target keeps its own source identity.
@@ -162,21 +364,50 @@ class NativeExportCoreTests(unittest.TestCase):
             native['details']['textures'][1]['pointer']['identity'] = 'native-detail'
             detail_record = collect()
             detail = detail_record['textureEdits'][1]['texture']
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 0)
             self.assertEqual(textures[detail]['sourceAsset'], 'Detail_D')
             self.assertEqual(textures[detail]['sourcePath'], 'assets/detail_d')
             self.assertIs(textures[detail]['pixels'], textures[first]['pixels'])
             image['eiem_filter'] = 2
             with self.assertRaisesRegex(ValueError, '冲突'):
                 collect()
-            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(calls), 0)
             image.pop('eiem_filter')
             stamp = path.stat()
             Image.new('RGBA', (4, 4), (90, 20, 10, 255)).save(path)
             os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1000000000))
             with self.assertRaisesRegex(ValueError, '冲突'):
                 collect()
-            self.assertEqual(len(calls), 3)
+            self.assertEqual(len(calls), 0)
+
+    def test_empty_native_texture_slot_uses_an_existing_schema(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'emission.png'
+            Image.new('RGBA',(2,2),(255,0,0,255)).save(path)
+            image=Material('Emission'); image.filepath=str(path)
+            native=dict(details=dict(textures=[dict(property='_EmissionMap',pointer=dict(isNull=True)),
+                         dict(property='_BaseMap',pointer=dict(isNull=False,identity='base'))]),native=dict(typeHash='12'*16))
+            source=SimpleNamespace(resolve=lambda *args:native,manifest=dict(resources=[dict(identity='base',name='Base_D',logicalPath='assets/base')]))
+            addon=SimpleNamespace(material_override_payload=lambda *args,**kwargs:(['texture._EmissionMap=image'],None))
+            mat=Material('MaterialNew',dict(eiem_source='assets/mat',eiem_name='Template'))
+            textures={}
+            record=exporter.collect_material(addon,source,mat,{'image':image},textures,folder,None,texture_only=True)
+            self.assertEqual(record['textureEdits'][0]['property'],'_EmissionMap')
+            texture=textures[record['textureEdits'][0]['texture']]
+            self.assertEqual(texture['sourceAsset'],'Base_D')
+            prior=dict(texture,file='textures/emission.tex')
+            existing=dict(textures=[prior],_resources={'textures/emission.tex':dict(blocks=dict(pixels=texture['pixels']))})
+            with patch.object(Image.Image,'resize',side_effect=AssertionError('unchanged texture regenerated mipmaps')):
+                reused={}
+                exporter.collect_material(addon,source,mat,{'image':image},reused,folder,None,
+                                          texture_only=True,existing_package=existing)
+            self.assertTrue(next(iter(reused.values()))['retained'])
+            image.is_dirty=True
+            writes=[]
+            addon.write_texture=lambda output,owner:(writes.append(owner),shutil.copyfile(owner.filepath,output))
+            exporter.collect_material(addon,source,mat,{'image':image},{},folder,None,texture_only=True)
+            self.assertEqual(len(writes),1)
 
     def test_partial_staging_hardlinks_are_detached_before_writes(self):
         with tempfile.TemporaryDirectory() as folder:

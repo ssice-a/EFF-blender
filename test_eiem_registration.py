@@ -49,6 +49,7 @@ for cycle in range(3):
     assert [item.identifier for item in resource_scope.enum_items] == ['ALL', 'MESH', 'MATERIALS', 'TEXTURES']
     assert bpy.ops.eiem.export_mesh_only.get_rna_type() is not None
     assert bpy.ops.eiem.import_material.get_rna_type() is not None
+    assert bpy.ops.eiem.import_animation.get_rna_type() is not None
     assert bpy.ops.eiem.import_physics.get_rna_type() is not None
     assert bpy.ops.eiem.export_physics.get_rna_type() is not None
     assert bpy.ops.eiem.physics_parameters.get_rna_type() is not None
@@ -61,7 +62,8 @@ for cycle in range(3):
     assert bpy.ops.eiem.shape_key_record.get_rna_type() is not None
     assert hasattr(bpy.types, "EFF_UL_switch_states")
     assert hasattr(bpy.types, "VIEW3D_PT_eiem_updates")
-    assert hasattr(bpy.types, "OBJECT_PT_eiem_physics")
+    assert hasattr(bpy.types, "EFF_PT_physics_editor")
+    assert not hasattr(bpy.types, "EFF_PT_physics_object")
     assert hasattr(bpy.types, "EFF_MT_physics_create")
     assert not hasattr(bpy.types, "EFF_MT_physics_copy")
     assert hasattr(bpy.types.Object, "eiem_physics")

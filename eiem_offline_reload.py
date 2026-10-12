@@ -16,7 +16,7 @@ STRUCTURES = dict(
     resource='block-directory/le64/sha256/type-tree',
     current='key+manifest-sha256/tsv')
 MOD_SET_STRUCTURE = 'authors+shared-inputs/transaction'
-COMPILED_MOD = 'compiled-mod/source-author-spans+object-layouts+type-dictionary+relocations/le64/sha256'
+COMPILED_MOD = 'native-view-index+assembly-dictionary+verified-source-stamps+per-input-proofs/le64/sha256'
 MANIFEST_ENCODING = 'self-described-roots/le64'
 LEGACY_ENCODINGS = {
     'EFF_NATIVE_PACK_V35_1': 'legacy-root-markers/le64',
@@ -24,6 +24,7 @@ LEGACY_ENCODINGS = {
 COMPILER_ARGUMENTS = ['author', 'baseline', 'cache']
 LEGACY_ARGUMENTS = [*COMPILER_ARGUMENTS, 'assembly']
 STATIC_SOURCE_INPUTS = 'mod-static-catalog/selected-sources'
+SOURCE_PREPARATION = 'in-process/index-vfs+author-declarations'
 
 
 def _structures(value):
@@ -59,6 +60,12 @@ def _require_manifest_reader(produced, consumer):
     accepted = consumer.get('manifestInputs', [MANIFEST_ENCODING, *LEGACY_ENCODINGS.values()])
     if encoding not in accepted:
         raise ValueError('DLL 无法读取编译器输出的清单字段布局：' + str(encoding))
+    view = produced.get('compiledInputView')
+    if view is not None and consumer.get('compiledInputView') != view:
+        raise ValueError('DLL 无法读取编译器输出的原生输入读取布局，请同步部署 DLL：' + str(view))
+    runtime = produced.get('compiledRuntimeIndex')
+    if runtime is not None and consumer.get('compiledRuntimeIndex') != runtime:
+        raise ValueError('DLL 无法读取编译器输出的运行索引布局，请同步部署 DLL：' + str(runtime))
 
 
 def _compiler_protocol(path, expected=None):
@@ -149,13 +156,10 @@ def reload_context(destination):
 
 
 def prepare_static_sources(destination, source_package, context, previous=None):
-    compiler, baseline, cache, game = context
-    protocol = _compiler_protocol(compiler, _game_protocol(game))
-    if protocol.get('staticSourceInputs') != STATIC_SOURCE_INPUTS:
-        return  # Existing prepared static baselines remain readable.
+    """Seed the descriptor and locate the index; the compiler does discovery."""
     # Full exports start with an empty staging directory. Seed the previous
-    # descriptor so the source tool can validate its request hash and reuse it;
-    # changed declarations still take the tool's normal discovery path.
+    # descriptor so the compiler can validate its request hash and reuse it;
+    # changed declarations still take its normal discovery path.
     descriptor = Path(destination) / 'source-inputs.bin'
     if previous is not None and not descriptor.is_file():
         prior = Path(previous) / 'source-inputs.bin'
@@ -170,22 +174,12 @@ def prepare_static_sources(destination, source_package, context, previous=None):
             if candidate.is_file():
                 index = candidate
                 break
-    # An unchanged descriptor can be reused by the tool without opening an
+    # An unchanged descriptor can be reused by the compiler without opening an
     # index. An index is required only for initial or changed source identities.
-    index = index or source_package / 'index/endfield_assets.eidx'
-    tool = Path(__file__).parent / 'nativepack/eff_source_prepare.exe'
-    if not tool.is_file():
-        raise ValueError('缺少静态来源准备工具，请安装配套插件工具')
-    command = [str(tool), '--prepare-static-sources', str(game), str(index), str(destination), str(compiler)]
-    result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace',
-                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), check=False)
-    if result.returncode:
-        raise ValueError('静态来源准备失败，作者文件尚未发布：' + (result.stderr or result.stdout)[-1600:])
-    if not (Path(destination) / 'source-inputs.bin').is_file():
-        raise ValueError('静态来源工具没有生成 source-inputs.bin')
+    return index or source_package / 'index/endfield_assets.eidx'
 
 
-def compile_reload(destination, context=None):
+def compile_reload(destination, context=None, previous=None, source_index=None):
     context = context if context is not None else reload_context(destination)
     if context is None:
         return dict(offlineReloadPrepared=False, offlineReloadReason='workspace-author-export')
@@ -196,6 +190,14 @@ def compile_reload(destination, context=None):
         raise ValueError('插件或 DLL 不支持独立 Mod 编译结构，请更新配套文件')
     destination = Path(destination).resolve()
     command = [str(compiler), '--export-mod', str(destination), str(game)]
+    if source_index is not None:
+        if protocol.get('sourcePreparation') != SOURCE_PREPARATION:
+            raise ValueError('插件缺少支持进程内来源查询的编译器，请安装完整插件包')
+        command.extend(['--source-index', str(Path(source_index).resolve())])
+    if (previous is not None and
+            protocol.get('compiledCacheInputs') == 'validated-previous-mod' and
+            (Path(previous) / 'compiled.bin').is_file()):
+        command.extend(['--previous-mod', str(Path(previous).resolve())])
     result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace',
                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), check=False)
     if result.returncode:

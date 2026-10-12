@@ -2,7 +2,7 @@
 
 EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以在 Blender 中编辑网格、材质、贴图、款式切换和形态键，然后导出可放入 EFF `plugin/mods` 的 Mod 文件夹。
 
-本次发布 **v0.40.3**，配套 [EFF v1.3.4](https://github.com/ssice-a/EFF/releases/tag/v1.3.4) 与 [AnimeStudio v1.3.1](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.3.1)。Windows x64 发布包包含原生导出核心、资源编译器、来源工具及 Pillow；已在 Blender 5.0.1 / Python 3.11 验证。其他 Python 布局需要对应的依赖构建。
+本次发布 **v0.41.0**，配套 [EFF v1.4.0](https://github.com/ssice-a/EFF/releases/tag/v1.4.0) 与 [AnimeStudio v1.4.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.4.0)。Windows x64 插件包含原生导出核心、统一资源编译器及 Pillow；已在 Blender 5.0.1 / Python 3.11 验证。当前包支持 Windows x64 / Blender 5.0，内置依赖使用 Python 3.11 ABI；不同 Python ABI 需要另行构建依赖。
 
 带截图的[简易 Mod 制作教程](https://github.com/ssice-a/EFF/blob/main/Mod%20Tutorial.md)包含安装、解包、材质编辑和所选网格导出步骤；也提供[英文版](https://github.com/ssice-a/EFF/blob/main/Mod%20Tutorial_EN.md)。
 
@@ -20,13 +20,25 @@ EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以
 
 ## 安装
 
-从 [Releases](https://github.com/ssice-a/EFF-blender/releases) 下载 `EFF_Blender_v0.40.3.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。更新前保存工程、关闭 Blender，再替换旧插件并重新启动，以释放原生 DLL 和旧 Python 模块。
+从 [Releases](https://github.com/ssice-a/EFF-blender/releases) 下载 `EFF_Blender_v0.41.0.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。更新前保存工程、关闭 Blender，再替换旧插件并重新启动，以释放原生 DLL 和旧 Python 模块。
 
 ## 制作 Mod
+
+### 导入表情动画
+
+在 AnimeStudio 中勾选表情动画资源及一个角色的 SkeletalMorph Avatar，使用 **Export → Format specific → EFF → Checked facial animations as EFF library...** 导出 `.eanim`。此步骤不需要 PostModel，也不扫描整个游戏的模型。
+
+Blender 中选中已经导入的 EFF 骨架或绑定该骨架的网格，选择 **文件 → 导入 → EFF 动画（选中骨架）**。可按类型或名称筛选；默认保留骨架正在使用的 Action。导入的 Action 名称以 `EFF_` 开头，在动作编辑器中选择。重复导入相同内容会复用已导入的动作，不覆盖作者修改；需要的来源辅助骨骼会补入，工程不会自动保存。
+
+目前还原 SkeletalMorph 的骨骼情绪姿态、口型和动态片段。静态姿态只有一帧；动态曲线按来源时间采样。Shader 表情参数、随机眨眼调度及游戏动画资源替换导出不在此入口中。动画文件无需放入游戏 Mod。
+
+位置、导出步骤和格式说明见 [表情动画说明](docs/facial-animation.md)。
 
 1. 在 AnimeStudio 中导出 EFF 源包。
 2. 在 Blender 选择 **文件 → 导入 → EFF Mod 包**，打开源包中的 `mod.ini`。
 3. 编辑模型、材质和贴图。需要款式切换时，在 **3D 视图 → N → EFF → 网格切换**中创建切换组并设置默认状态。
+
+   **材质属性 → EFF 材质**按功能分组，提供开关、数字和 RGBA 控件；可搜索参数，通过“添加空贴图槽”绑定来源材质已有的空槽。关闭发光、描边会收起详细参数，已有贴图保留显示。设置示例见[材质说明](docs/material-effects.md)。
 4. 需要形态键时，在网格数据属性的 **EFF 形态键控制**中点击“接管当前形态键”。这会把已有的 Blender 形态键登记为导出滑块；它不会修改顶点，也不会自动创建游戏快捷键。快捷键需要在同一面板中单独录制。
 5. 选择要导出的 EFF 网格，在 EFF 面板或 **文件 → 导出** 中选择“导出所选 Mod”。首次选择“全部资源”；后续可以选择“仅 Mesh”“仅材质与贴图”或“仅贴图”更新已有完整 Mod。完整导出窗口中的“导出按键切换”默认勾选；取消后只导出默认款式，不导出款式和形态键快捷键，但仍保留形态键及其滑块。
 6. 在 EFF 导出区域填写 Mod 文件夹名，然后在文件浏览器中选择父目录；插件创建或刷新同名文件夹，把 `mod.ini`、`meshes/`、`materials/` 和 `textures/` 写入其中，再在暂存目录中完成独立编译和校验后发布。需要直接在游戏中使用时，父目录选择游戏的 `plugin/mods/`。文件浏览器里的文件名不决定 Mod 名称。
@@ -34,15 +46,29 @@ EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以
 
 导出需要游戏安装路径，请设置 `EFF_RELOAD_GAME` 环境变量指向当前游戏目录；如果输出目录本身位于 `plugin/mods/<Mod>` 下，插件会从目录结构推断游戏目录。插件不保存开发者本机的游戏路径，也不会把固定的 Mod 名称写入代码。
 
-插件只调用自己安装目录内的原生作者核心、编译器和约 3 MiB 的 `eff_source_prepare.exe`，不从游戏或开发目录借用文件。Mod 包含独立作者资源、来源描述和压缩 `compiled.bin`；不复制完整游戏原包。实测 LZY 输出从 131.17 MiB 增至约 142.42 MiB。
+插件只调用自己安装目录内的原生作者核心和 `eff_resource_pack.exe`。来源查询与资源编译在同一个编译进程内完成，不从游戏或开发目录借用工具，也不需要单独的来源查询程序。Mod 包含独立作者资源、来源描述和压缩 `compiled.bin`；不复制完整游戏原包。输出大小随作者资源、依赖和共享修改变化。旧 compiled.bin 请使用这套配套工具重新导出。
 
 导出只处理当前选择的资源。请保留 AnimeStudio 源包和 `.blend` 工程，避免覆盖源资源。
 
 多个作者包可以在 Blender 中共存，同名材质和贴图保持精确来源归属。每个导出 Mod 的 INI 是作者规则入口；F10 统一加载整个 mods 目录，包括多角色的增删与资源修改。全 LOD 导出会把当前作者几何映射到各目标 LOD，不会自动减面。
 
+材质已有的浮点、整数、颜色和四分量参数可在“材质属性 → EFF 材质 → 材质参数”中编辑。材质自定义属性 `eiem_render_queue` 可指定实际渲染队列，在 EFF 面板中显示为“渲染队列”；导出直接写入原生材质的 `m_CustomRenderQueue`，取值为 -1（使用 Shader 默认队列）或 0 至 5000。它与 Shader 辅助属性 `_QueueOffset` 不同。数值修改使用“仅材质与贴图”或“全部资源”导出；新增材质变体或重新分配 Mesh 的材质需要完整导出。共用一个材质的部件共用队列，固定内外层的独立顺序需要不同材质变体。
+
+Shader 功能开关也属于材质数据。可添加自定义属性 `eiem_keyword.<实际关键字>`，用 `1` / `0` 启用或禁用；导出写入原生 keyword 字段。例如游戏 CharacterNPR 的发光需要 `_UseEmission=1` 和 `eiem_keyword._EMISSION=1`，并设置发光贴图、颜色和亮度。仅把图片放入 `_EmissionMap` 不会自动启用发光。透明混合还需要匹配的关键字、混合状态和渲染队列；不能只修改贴图的 Alpha。渲染标签可通过 `eiem_tag.<标签名>` 编辑，例如 `eiem_tag.RenderType`。
+
+导出完成提示的贴图数按实际写入的不同 `.tex` 文件计数。多个材质绑定可共用一个贴图文件；未修改的游戏贴图保持游戏资源引用。
+
+透明裁剪、混合透明、自发光及呼吸/流光的字段和操作步骤见[材质效果设置](docs/material-effects.md)。呼吸和流光的参数存在性已核对，动态效果仍需在游戏验证。
+
 保留源包的 `source/manifest.json` 和 `source/serialized/` 供精确来源和字段模板读取；普通 Blender 导出不读取 `source/streams/` 的原始载荷快照。新解包贴图使用短名称，旧包的哈希名称按自己的 INI/manifest 继续使用，不能只改文件名而不更新引用。游戏 Mod 无需携带原包快照或全局索引。
 
-Physics 参数和预览仍可在作者工具中编辑，新增 Physics 尚未接通完整游戏模拟链。当前测试不代表所有角色或二三十个 Mod 的性能已经验证。
+Physics 参数和预览仍可在作者工具中编辑，新增骨链、球/胶囊碰撞体已接入离线编译，游戏内模拟及物理退出/F10 尚未实机验收。当前测试不代表所有角色或二三十个 Mod 的性能已经验证。
+
+物理编辑集中在 **3D 视图 → EFF → 物理**，按结构、动力、碰撞和高级组织参数；旧对象属性物理面板已移除。列表可搜索物理组/碰撞体，勾选多个组作为参数批量目标。九类曲线在对应参数旁展开，支持复制全部或当前区参数，以及保存当前工程的命名预设。“复制全部参数”包含可导出的原生参数，而不只包含面板中的常用参数。复制、粘贴和工程预设仅操作参数与曲线，目标链保留自己的碰撞体引用；旧剪贴板携带的碰撞引用也不会被应用。碰撞集合在目标链的“碰撞”页面单独配置。
+
+选中新建物理组后点击“删除物理链”，会删除该组和它生成的预览、曲线控件，可撤销；骨骼与共享碰撞体保留。游戏源物理组使用“禁用游戏组件”，避免仅从 Blender 删除后游戏仍加载原组件。参数复制不复制骨骼拓扑、Transform 引用、动画或游戏运行时权重；新链的分段、长度、根部绑定和动画不同，运动效果仍可能不同。新增链当前使用 BoneCloth，其他模拟类型不会被静默转换为同一种物理。
+
+碰撞体的固定显示、隐藏及穿透显示只影响 Blender 预览。源碰撞体中心使用 Blender 局部坐标，胶囊使用总长和两端半径。未确认的源结构写回仍保留来源数据；“导出物理作者数据”用于独立作者交换资源。要编译新增骨链，请同时选择受其蒙皮的 Mesh 与骨架，再使用“全部资源”导出；也可显式选择物理组。只选 Mesh 不会自动包含隐藏物理组。新增节点须绑定已确认的来源骨架；球/胶囊碰撞体会生成附属 Transform，平面和既有物理结构的修改暂不属于本轮编译范围。
 
 ## 更新
 

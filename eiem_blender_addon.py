@@ -1,8 +1,8 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 40, 3),
-    "blender": (3, 0, 0),
+    "version": (0, 41, 0),
+    "blender": (5, 0, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
 }
@@ -192,7 +192,9 @@ if __package__:
     from . import eiem_lod as lod
     from . import eiem_native_export as native_export
     from . import eiem_physics_authoring as physics_authoring
+    from . import eiem_material_editor as material_editor
     from . import eiem_blender_controls as controls
+    from . import eiem_animation as animation_io
 else:
     _release_spec = importlib.util.spec_from_file_location(
         "eiem_release", Path(__file__).with_name("eiem_release.py"))
@@ -214,10 +216,21 @@ else:
         "eiem_physics_authoring", Path(__file__).with_name("eiem_physics_authoring.py"))
     physics_authoring = importlib.util.module_from_spec(_physics_spec)
     _physics_spec.loader.exec_module(physics_authoring)
+    _material_spec = importlib.util.spec_from_file_location(
+        "eiem_material_editor", Path(__file__).with_name("eiem_material_editor.py"))
+    material_editor = importlib.util.module_from_spec(_material_spec)
+    _material_spec.loader.exec_module(material_editor)
     _controls_spec = importlib.util.spec_from_file_location(
         "eiem_blender_controls", Path(__file__).with_name("eiem_blender_controls.py"))
     controls = importlib.util.module_from_spec(_controls_spec)
     _controls_spec.loader.exec_module(controls)
+
+
+if not __package__:
+    _animation_spec = importlib.util.spec_from_file_location(
+        "eiem_animation", Path(__file__).with_name("eiem_animation.py"))
+    animation_io = importlib.util.module_from_spec(_animation_spec)
+    _animation_spec.loader.exec_module(animation_io)
 
 
 # Preserve the standalone add-on's public Python surface for authoring scripts
@@ -498,6 +511,8 @@ def get_point_attribute(mesh, name, member):
     attribute = mesh.attributes.get(name)
     if not attribute or attribute.domain != "POINT" or len(attribute.data) != len(mesh.vertices):
         return None
+    if not attribute.data:
+        return []
     if hasattr(attribute.data, "foreach_get"):
         if member == "value":
             values = [0.0] * len(attribute.data)
@@ -1298,12 +1313,14 @@ def mesh_vertex_coordinates(mesh):
     return [tuple(values[index:index + 3]) for index in range(0, len(values), 3)]
 
 
-def export_corner_map(mesh, channels):
+def export_corner_map(mesh, channels, include_loose=True):
     """Split only serialized vertices, using all CORNER streams together.
 
     Original vertex IDs (including loose vertices) remain in place. Additional
     corner variants are appended; every point stream uses source_vertices,
     while triangle indices and corner streams use the corresponding loop map.
+    Native snapshots omit loose vertices after corner splitting, before any
+    point, skin or shape stream is mapped. The editable writer keeps them.
     No Blender data is changed. Float32 keys avoid merging distinct authored
     values or inventing a tolerance-dependent UV/normal average.
     """
@@ -1345,6 +1362,13 @@ def export_corner_map(mesh, channels):
                 source_loops[target] = loop_index
             seen[key] = target
         loop_vertices[loop_index] = target
+    if not include_loose and None in source_loops:
+        kept = [i for i, loop in enumerate(source_loops) if loop is not None]
+        remap = np.full(len(source_vertices), -1, dtype=np.int64)
+        remap[kept] = np.arange(len(kept))
+        source_vertices = [source_vertices[i] for i in kept]
+        source_loops = [source_loops[i] for i in kept]
+        loop_vertices = remap[loop_vertices].tolist()
     return source_vertices, source_loops, loop_vertices
 
 
@@ -1422,6 +1446,42 @@ def mesh_export_colors(mesh):
     else:
         values = [tuple(item.color) for item in attribute.data]
     return attribute.domain, values
+
+
+def _orthogonalize_missing_tangents(mesh_name, generated, normals):
+    """Batch only generated frames; authored tangent bits never enter here."""
+    frames = np.asarray(generated, dtype=np.float64).reshape(-1, 4).copy()
+    normals = np.asarray(normals, dtype=np.float64).reshape(-1, 3)
+    if len(frames) != len(normals):
+        raise ValueError(mesh_name + ' tangent/normal corner count differs')
+    if not len(frames):
+        return []
+    valid_frame = (np.isfinite(frames).all(axis=1) &
+                   (frames[:, :3] != 0).any(axis=1) &
+                   ((frames[:, 3] == -1) | (frames[:, 3] == 1)))
+    nx, ny, nz = normals.T
+    tx, ty, tz = frames[:, :3].T
+    normal_length = nx*nx + ny*ny + nz*nz
+    dot = np.zeros(len(frames), dtype=np.float64)
+    np.divide(tx*nx + ty*ny + tz*nz, normal_length, out=dot,
+              where=normal_length > 0)
+    tx -= nx*dot; ty -= ny*dot; tz -= nz*dot
+    tangent_length = tx*tx + ty*ty + tz*tz
+    valid_basis = ((normal_length > 0) & (tangent_length > 0) &
+                   np.isfinite(normals).all(axis=1) & np.isfinite(tangent_length))
+    invalid = np.flatnonzero(~(valid_frame & valid_basis))
+    if len(invalid):
+        corner = int(invalid[0])
+        if not valid_frame[corner]:
+            raise ValueError('%s corner %d cannot generate a usable tangent; check UV0 and normals' %
+                             (mesh_name, corner))
+        raise ValueError('%s corner %d tangent is parallel to its exported normal' %
+                         (mesh_name, corner))
+    scale = np.power(tangent_length, -.5)
+    frames[:, :3] *= scale[:, None]
+    # Keep contiguous storage through corner splitting and stream gathering.
+    # A nested Python list here costs more than the numeric work on large rigs.
+    return frames
 
 
 def mesh_export_tangents(mesh, source_normals, normal_corners, preserve_normals):
@@ -1580,31 +1640,9 @@ def mesh_export_tangents(mesh, source_normals, normal_corners, preserve_normals)
     # of loops.  The general branch below remains for partially authored
     # tangent attributes.
     if all_missing:
-        normal_values = source_normals if preserve_normals else normal_corners
-        for loop_index in range(len(mesh.loops)):
-            value = generated[loop_index]
-            tx, ty, tz, sign = value
-            if (not all(math.isfinite(x) for x in value) or
-                    (tx == 0.0 and ty == 0.0 and tz == 0.0) or sign not in (-1, 1)):
-                raise ValueError("%s corner %d cannot generate a usable tangent; check UV0 and normals" %
-                                 (mesh.name, loop_index))
-            vertex = loop_vertices[loop_index]
-            normal = normal_values[vertex] if preserve_normals else normal_values[loop_index]
-            nx, ny, nz = normal
-            normal_length = nx * nx + ny * ny + nz * nz
-            if normal_length == 0.0:
-                raise ValueError("%s corner %d tangent is parallel to its exported normal" %
-                                 (mesh.name, loop_index))
-            dot = (tx * nx + ty * ny + tz * nz) / normal_length
-            tx -= nx * dot
-            ty -= ny * dot
-            tz -= nz * dot
-            tangent_length = tx * tx + ty * ty + tz * tz
-            if tangent_length == 0.0:
-                raise ValueError("%s corner %d tangent is parallel to its exported normal" %
-                                 (mesh.name, loop_index))
-            scale = tangent_length ** -0.5
-            generated[loop_index] = (tx * scale, ty * scale, tz * scale, sign)
+        normal_values = (np.asarray(source_normals)[loop_vertices]
+                         if preserve_normals else normal_corners)
+        generated = _orthogonalize_missing_tangents(mesh.name, generated, normal_values)
     else:
         for loop_index in missing:
             value = generated[loop_index]
@@ -1917,7 +1955,15 @@ def export_skin_binding(obj, armature, source_vertices, skin_cache=None):
         raise ValueError("原骨骼已不在共享骨架中：" + sorted(missing)[0])
     by_name = context['by_name']
     paths = list(original)
-    additions = sorted({by_name[g.name] for g in obj.vertex_groups if g.name in by_name} - original.keys())
+    # An empty vertex group is not a skinning dependency. In particular, a
+    # copied garment can carry names of new physics chains it never uses.
+    # Read RNA influences once and reuse them for final slot assignment.
+    group_names = [group.name for group in obj.vertex_groups]
+    weighted_vertices = [[(int(g.group), float(g.weight)) for g in vertex.groups
+                          if g.weight > 0] for vertex in obj.data.vertices]
+    used_groups = {index for influences in weighted_vertices for index, weight in influences}
+    additions = sorted({by_name[group_names[index]] for index in used_groups
+                        if 0 <= index < len(group_names) and group_names[index] in by_name} - original.keys())
     matrices = dict(original)
     if additions:
         def matrix(values):
@@ -1972,7 +2018,6 @@ def export_skin_binding(obj, armature, source_vertices, skin_cache=None):
     # the exported influences. Large clothing meshes can have hundreds of
     # thousands of vertex/group pairs, so keep the same validation while
     # constructing the final influence list in one pass.
-    group_names = [group.name for group in obj.vertex_groups]
     group_slots = {index: slot[name] for index, name in enumerate(group_names)
                    if name in slot}
     skin_by_vertex = []
@@ -1980,10 +2025,7 @@ def export_skin_binding(obj, armature, source_vertices, skin_cache=None):
     used = {loop.vertex_index for loop in obj.data.loops}
     for vertex in obj.data.vertices:
         influences = []
-        for group in vertex.groups:
-            if group.weight <= 0:
-                continue
-            group_index = int(group.group)
+        for group_index, weight in weighted_vertices[vertex.index]:
             influence_slot = group_slots.get(group_index)
             if influence_slot is None:
                 group_name = (group_names[group_index]
@@ -1992,7 +2034,7 @@ def export_skin_binding(obj, armature, source_vertices, skin_cache=None):
                 raise ValueError(
                     "%s \u9876\u70b9 %d \u7684\u9876\u70b9\u7ec4 %s \u5728\u5171\u4eab\u9aa8\u67b6\u4e2d\u4e0d\u5b58\u5728" %
                     (obj.name, vertex.index, group_name))
-            influences.append((float(group.weight), influence_slot))
+            influences.append((weight, influence_slot))
         if not influences and vertex.index in used:
             raise ValueError("%s 顶点 %d 没有骨骼权重" % (obj.name, vertex.index))
         influences.sort(key=lambda pair:(-pair[0],pair[1]))
@@ -2065,58 +2107,79 @@ def write_mesh(path, obj, return_snapshot=False, skin_cache=None):
         corner_channels.append(normal_corners)
     if color_domain == "CORNER":
         corner_channels.append(color_values)
-    if tangent_corners:
+    if len(tangent_corners):
         corner_channels.append(tangent_corners)
-    source_vertices, source_loops, loop_vertices = export_corner_map(mesh, corner_channels)
+    source_vertices, source_loops, loop_vertices = export_corner_map(
+        mesh, corner_channels, include_loose=not return_snapshot)
 
-    coordinates = mesh_vertex_coordinates(mesh)
-    vertices = [coord for source in source_vertices for coord in to_source(coordinates[source])]
+    coordinates = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+    mesh.vertices.foreach_get('co', coordinates)
+    reflected = is_unity_left_handed(coordinate)
+    vertex_values = coordinates.reshape(-1, 3)[source_vertices].astype(np.float64)
+    if reflected:
+        vertex_values[:, 0] *= -1
+    vertices = vertex_values.ravel().tolist()
     normal_values = [source_normals[source] if preserve_normals else
                      normal_corners[loop] if loop is not None else tuple(mesh.vertices[source].normal)
                      for source, loop in zip(source_vertices, source_loops)]
-    normals = [coord for value in normal_values for coord in to_source(value)]
+    normal_array = np.asarray(normal_values, dtype=np.float64).reshape(-1, 3).copy()
+    if reflected:
+        normal_array[:, 0] *= -1
+    normals = normal_array.ravel().tolist()
 
     tangents = []
     if tangent_points:
-        for source, loop in zip(source_vertices, source_loops):
-            value = tangent_corners[loop] if tangent_corners and loop is not None else tangent_points[source]
-            tangents.extend(to_source(value[:3]))
-            tangents.append(value[3])
+        tangent_array = np.asarray(tangent_points, dtype=np.float64)[source_vertices].copy()
+        if len(tangent_corners):
+            present = np.fromiter((i is not None for i in source_loops), dtype=np.bool_, count=len(source_loops))
+            loop_indices = np.fromiter((i for i in source_loops if i is not None), dtype=np.int64)
+            tangent_array[present] = np.asarray(tangent_corners, dtype=np.float64)[loop_indices]
+        if reflected:
+            tangent_array[:, 0] *= -1
+        tangents = tangent_array.ravel().tolist()
+    source_ids = np.asarray(source_vertices, dtype=np.int64)
+    corner_ids = np.fromiter((loop if loop is not None else -1 for loop in source_loops),
+                             dtype=np.int64, count=len(source_loops))
+    corner_mask = corner_ids >= 0
     colors = []
     if color_values:
-        for source, loop in zip(source_vertices, source_loops):
-            value = color_values[source] if color_domain == "POINT" else (
-                color_values[loop] if loop is not None else (0.0, 0.0, 0.0, 0.0))
-            colors.extend(value)
+        color_array = np.asarray(color_values, dtype=np.float64)
+        if color_domain == "POINT":
+            colors = color_array[source_ids].ravel().tolist()
+        else:
+            output_colors = np.zeros((len(source_ids), 4), dtype=np.float64)
+            output_colors[corner_mask] = color_array[corner_ids[corner_mask]]
+            colors = output_colors.ravel().tolist()
     uv_layers = []
     for channel in uv_channels:
         values = []
         if channel is not None:
             dimension, xy, zw = channel
-            for source, loop in zip(source_vertices, source_loops):
-                values.extend(xy[loop] if loop is not None else (0.0, 0.0))
-                if dimension > 2:
-                    values.extend(zw[source][:dimension - 2])
+            output_uvs = np.zeros((len(source_ids), dimension), dtype=np.float64)
+            output_uvs[corner_mask, :2] = np.asarray(xy)[corner_ids[corner_mask]]
+            if dimension > 2:
+                output_uvs[:, 2:] = np.asarray(zw)[source_ids, :dimension - 2]
+            values = output_uvs.ravel().tolist()
         uv_layers.append(values)
 
     indices = []
-    submesh_indices = {}
-    for tri in mesh.loop_triangles:
-        submesh = int(mesh.polygons[tri.polygon_index].material_index)
-        triangle = tuple(loop_vertices[loop] for loop in tri.loops)
-        if is_unity_left_handed(coordinate):
-            triangle = (triangle[0], triangle[2], triangle[1])
-        submesh_indices.setdefault(submesh, []).extend(triangle)
+    triangle_loops = np.empty(len(mesh.loop_triangles)*3, dtype=np.int32)
+    mesh.loop_triangles.foreach_get('loops', triangle_loops)
+    triangle_materials = np.empty(len(mesh.loop_triangles), dtype=np.int32)
+    mesh.loop_triangles.foreach_get('material_index', triangle_materials)
+    triangle_vertices = np.asarray(loop_vertices)[triangle_loops].reshape(-1, 3)
+    if reflected:
+        triangle_vertices = triangle_vertices[:, (0, 2, 1)]
     submeshes = []
     # A submesh's position is its material slot. Keep empty slots before an
     # occupied slot instead of renumbering faces after the user deletes them.
-    for submesh in range(max(submesh_indices, default=-1) + 1):
-        values = submesh_indices.get(submesh, [])
+    for submesh in range(int(triangle_materials.max()) + 1 if len(triangle_materials) else 0):
+        submesh_vertices = triangle_vertices[triangle_materials == submesh].ravel()
+        values = submesh_vertices.tolist()
         start = len(indices)
         indices.extend(values)
-        used_vertices = set(values)
-        first_vertex = min(used_vertices) if used_vertices else 0
-        vertex_count = max(used_vertices) - first_vertex + 1 if used_vertices else 0
+        first_vertex = int(submesh_vertices.min()) if len(values) else 0
+        vertex_count = int(submesh_vertices.max()) - first_vertex + 1 if len(values) else 0
         submeshes.append((0, start, len(values), 0, first_vertex, vertex_count))
 
     armature = next((modifier.object for modifier in obj.modifiers
@@ -2571,9 +2634,11 @@ def plan_mesh_only_export(mesh_objects):
 
 def selected_eiem_physics(context=None):
     context = context or bpy.context
+    selected_rigs = {obj for obj in context.selected_objects if obj.type == 'ARMATURE'}
     return sorted(
-        (obj for obj in context.selected_objects
-         if obj.eiem_physics.kind == "GROUP"),
+        (obj for obj in bpy.data.objects
+         if obj.eiem_physics.kind == "GROUP" and
+         (obj.select_get() or obj.eiem_physics.rig in selected_rigs)),
         key=lambda obj: str(obj.eiem_physics.identity),
     )
 
@@ -2601,11 +2666,13 @@ def material_override_payload(material, images_by_section, force=False):
     overrides = []
     referenced_images = set()
     for key, raw_value in material.items():
-        if not key.startswith("eiem_") or key in reserved:
+        if not key.startswith("eiem_") or key in reserved or key.startswith('eiem_editor_'):
             continue
         property_name = key[5:]
         value = str(raw_value)
         if property_name.startswith("texture."):
+            if not value.strip():
+                continue  # An empty authored slot inherits the source value.
             if value == str(baseline.get(property_name, "")) and value.replace("\\", "/").lower().startswith("assets/"):
                 continue  # unchanged game logical texture: inherited from the cloned source
             original = str(baseline.get(property_name, "") if has_baseline else
@@ -2773,47 +2840,6 @@ def draw_eiem_rna_property(layout, owner, key, label, factor=0.24):
     value_column.prop(owner, key, text="")
 
 
-def material_property_groups(material):
-    """Return stable, user-facing groups without exposing bookkeeping JSON."""
-    keys = [key for key in material.keys()
-            if key.startswith("eiem_") and
-            key not in EFF_INTERNAL_MATERIAL_PROPERTIES]
-    texture_paths = [key for key in keys if key.startswith("eiem_texture.")]
-    texture_transforms = [
-        key for key in keys
-        if key.startswith(("eiem_texture_scale.", "eiem_texture_offset."))
-    ]
-    identity = {
-        "eiem_section", "eiem_name", "eiem_shader", "eiem_format",
-        "eiem_version", "eiem_target_path", "eiem_target_asset",
-    }
-    parameters = [
-        key for key in keys
-        if key not in identity and key != "eiem_source" and
-        key not in texture_paths and key not in texture_transforms
-    ]
-    resource = [key for key in (
-        "eiem_section", "eiem_name", "eiem_shader", "eiem_version",
-        "eiem_format", "eiem_target_path", "eiem_target_asset",
-    ) if key in material]
-    return texture_paths, texture_transforms, parameters, resource
-
-
-def material_property_label(key):
-    value = key[5:] if key.startswith("eiem_") else key
-    for prefix, suffix in (
-        ("texture_scale.", ' 缩放'),
-        ("texture_offset.", ' 偏移'),
-        ("texture.", ""),
-        ("float.", ""),
-        ("int.", ""),
-        ("value4.", ""),
-    ):
-        if value.startswith(prefix):
-            return value[len(prefix):] + suffix
-    return value
-
-
 class EFF_OT_import_material(ImportHelper, bpy.types.Operator):
     bl_idname = "eiem.import_material"
     bl_label = '导入 EFF 材质'
@@ -2851,61 +2877,7 @@ class EFF_PT_material_properties(bpy.types.Panel):
         if material is None or not material.get("eiem_section"):
             layout.label(text="导入后分配到当前材质槽，不覆盖原材质数据块")
             return
-        texture_paths, texture_transforms, parameters, resource = \
-            material_property_groups(material)
-
-        # Texture paths are the most common edit and deliberately occupy the
-        # first block. The short label is the real shader property name.
-        box = layout.box()
-        heading = box.row()
-        heading.alignment = "LEFT"
-        heading.label(text="贴图路径")
-        if texture_paths:
-            for key in texture_paths:
-                draw_eiem_property(box, material, key,
-                                   material_property_label(key))
-        else:
-            row = box.row()
-            row.alignment = "LEFT"
-            row.label(text="该材质没有贴图参数")
-
-        draw_eiem_property(layout, material, "eiem_source", "源材质")
-
-        if texture_transforms:
-            box = layout.box()
-            heading = box.row()
-            heading.alignment = "LEFT"
-            heading.label(text='贴图变换')
-            for key in texture_transforms:
-                draw_eiem_property(box, material, key,
-                                   material_property_label(key))
-
-        if parameters:
-            box = layout.box()
-            heading = box.row()
-            heading.alignment = "LEFT"
-            heading.label(text='材质参数')
-            for key in parameters:
-                draw_eiem_property(box, material, key,
-                                   material_property_label(key))
-
-        if resource:
-            box = layout.box()
-            heading = box.row()
-            heading.alignment = "LEFT"
-            heading.label(text='资源信息')
-            labels = {
-                "eiem_section": "资源段",
-                "eiem_name": "材质名",
-                "eiem_shader": "Shader",
-                "eiem_version": '格式版本',
-                "eiem_format": '格式',
-                "eiem_version": "格式版本",
-                "eiem_format": "格式",
-            }
-            for key in resource:
-                draw_eiem_property(box, material, key,
-                                   labels.get(key, material_property_label(key)))
+        material_editor.draw(layout, material)
 
 
 class EFF_PG_shape_control(bpy.types.PropertyGroup):
@@ -3653,6 +3625,39 @@ def draw_lod_options(layout, operator):
         row.prop(operator, prop)
 
 
+class EFF_OT_import_animation(ImportHelper, bpy.types.Operator):
+    bl_idname = 'eiem.import_animation'
+    bl_label = '导入 EFF 动画到选中骨架'
+    bl_options = {'REGISTER', 'UNDO'}
+    filename_ext = '.eanim'
+    filter_glob: StringProperty(default='*.eanim', options={'HIDDEN'})
+    kind: EnumProperty(name='动画类型', default='ALL', items=(
+        ('ALL', '全部', '所有兼容的动画与姿态'),
+        ('EMOTION', '情绪姿态', '静态情绪基础姿态'),
+        ('POSE', '局部姿态', '口型及局部表情'),
+        ('ANIM', '动态片段', '随时间变化的骨骼动画')))
+    name_filter: StringProperty(name='名称包含', description='留空导入全部；可填写 blink、happy 等筛选')
+    preview: BoolProperty(name='预览首个动作', default=False,
+                         description='启用后替换当前骨架正在使用的 Action；原 Action 仍保留')
+
+    def draw(self, context):
+        self.layout.prop(self, 'kind')
+        self.layout.prop(self, 'name_filter')
+        self.layout.prop(self, 'preview')
+
+    def execute(self, context):
+        try:
+            rig = animation_io.target_armature(context)
+            result = animation_io.import_animations(self.filepath, rig,
+                unity_transform_matrix_to_blender_basis(), self.kind, self.name_filter, self.preview)
+            self.report({'INFO'}, '导入 %d 个动作，复用 %d 个，补入 %d 条来源辅助骨骼' %
+                        (result['created'], result['reused'], len(result['helpers'])))
+            return {'FINISHED'}
+        except Exception as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+
+
 class EFF_OT_import(ImportHelper, bpy.types.Operator):
     bl_idname = "eiem.import_package"
     bl_label = "Import EFF package"
@@ -3892,6 +3897,7 @@ class EFF_OT_ignore_update_release(bpy.types.Operator):
 
 def menu_import(self, context):
     self.layout.operator(EFF_OT_import.bl_idname, text="EFF Mod 包")
+    self.layout.operator(EFF_OT_import_animation.bl_idname, text='EFF 动画（选中骨架）')
 
 
 def menu_export(self, context):
@@ -3921,6 +3927,7 @@ classes = (
     EFF_PT_switches,
     EFF_PT_updates,
     EFF_OT_import,
+    EFF_OT_import_animation,
     EFF_OT_export,
     EFF_OT_export_mesh_only,
     EFF_PT_material_properties,
@@ -3937,6 +3944,7 @@ def register():
     if _eiem_export_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_eiem_export_load_post)
     for cls in classes: bpy.utils.register_class(cls)
+    material_editor.register()
     physics_authoring.register(globals())
     bpy.types.Mesh.eiem_shape_controls = CollectionProperty(type=EFF_PG_shape_control)
     bpy.types.Collection.eiem_switch_state_index = IntProperty(
@@ -3962,6 +3970,7 @@ def unregister():
         bpy.app.handlers.load_post.remove(_eiem_export_load_post)
     _eiem_export_load_post(None)
     physics_authoring.unregister()
+    material_editor.unregister()
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_export)
     del bpy.types.Scene.eiem_switch_active

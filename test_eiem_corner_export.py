@@ -124,9 +124,12 @@ m['eiem_blend_shapes_json'] = json.dumps([{'name':'Inflate', 'hash':123, 'frames
     {'key':'Inflate', 'source_name':'Inflate', 'weight':100,
      'normal_attribute':'MorphNormal', 'tangent_attribute':'MorphTangent'}]}])
 before = snapshot(obj)
-stats = addon.export_package(output / 'package', [obj], [])
-assert stats['meshes'] == 1
-result = addon.read_mesh(next((output / 'package/meshes').glob('*.mesh')))
+# This generated fixture has no game source baseline. Exercise the editable
+# writer directly; the public package facade now compiles native resources.
+mesh_file = output / 'package/meshes/corners.mesh'
+mesh_file.parent.mkdir(parents=True)
+addon.write_mesh(mesh_file, obj)
+result = addon.read_mesh(mesh_file)
 assert result['vertex_count'] == 7, result['vertex_count']
 assert result['bone_hashes'] == [10,20,30]
 assert result['bone_paths'] == ['Root','Tip','Unused']
@@ -151,7 +154,7 @@ package_before = {p.relative_to(output / 'package'): p.read_bytes()
 m['eiem_blend_additional_json'] = '[[0,1,0]]'
 m['eiem_original_vertex_count'] = 7
 try:
-    addon.export_package(output / 'package', [obj], [])
+    addon.write_mesh(mesh_file, obj)
     raise AssertionError('Unknown additional-normal mapping was accepted')
 except ValueError as error:
     assert 'additional normals' in str(error)
@@ -189,5 +192,55 @@ for channel in ('vertices','normals','tangents','colors'):
     assert floats(roundtrip[channel]) == floats(raw[channel]), channel
 for channel in range(8):
     assert floats(roundtrip['uvs'][channel]) == floats(raw['uvs'][channel]), channel
+
+# Compact a loose vertex in the middle of the original IDs, before mapping
+# every stream. Skin and shape records must follow the same map as triangles,
+# normals, tangents, UVs and colors; the editable source remains unchanged.
+loose_mesh = bpy.data.meshes.new('NativeLooseStreams')
+loose_mesh.from_pydata([(0,0,0), (9,9,9), (1,0,0), (0,1,0)], [], [(0,2,3)])
+loose_mesh['eiem_coordinate_space'] = 'unity-y-up-left-handed'
+uv = loose_mesh.uv_layers.new(name='UV0')
+color = loose_mesh.color_attributes.new(name='Color', type='FLOAT_COLOR', domain='CORNER')
+for loop, value in enumerate(((0,0), (1,0), (0,1))):
+    uv.data[loop].uv = value
+    color.data[loop].color = (loop*.25, .5, .75, 1)
+loose_obj = bpy.data.objects.new('NativeLooseStreams', loose_mesh)
+bpy.context.scene.collection.objects.link(loose_obj)
+for k, v in obj.items():
+    loose_obj[k] = v
+for name in ('Root', 'Tip', 'Unused'):
+    loose_obj.vertex_groups.new(name=name)
+for index, weight in enumerate((.25, 1., .5, .75)):
+    loose_obj.vertex_groups[0].add([index], weight, 'REPLACE')
+    loose_obj.vertex_groups[1].add([index], 1-weight, 'REPLACE')
+loose_obj.modifiers.new('Skin', 'ARMATURE').object = rig
+addon.set_point_attribute(loose_mesh, 'EFF_SourceNormal', 'FLOAT_VECTOR', [(0,0,1)]*4, 'vector')
+loose_mesh['eiem_normal_baseline_crc'] = addon.normal_state_crc(loose_mesh)
+addon.set_point_attribute(loose_mesh, 'EFF_Tangent', 'FLOAT_VECTOR',
+                          [(1,0,0), (1,0,.0656), (1,0,0), (1,0,0)], 'vector')
+addon.set_point_attribute(loose_mesh, 'EFF_TangentSign', 'FLOAT', [1]*4, 'value')
+loose_obj.shape_key_add(name='Basis')
+key = loose_obj.shape_key_add(name='Move')
+for index in range(4):
+    key.data[index].co.z += (index+1)*.125
+before = snapshot(loose_obj)
+addon.write_mesh(output / 'loose-streams.mesh', loose_obj)
+editable = addon.read_mesh(output / 'loose-streams.mesh')
+native = addon.write_mesh(None, loose_obj, return_snapshot=True)
+assert native['vertex_count'] == 3 and native['indices'] == [0,2,1]
+kept = [0,2,3]
+for field, width in (('vertices',3), ('normals',3), ('tangents',4), ('colors',4)):
+    expected = [v for index in kept for v in editable[field][index*width:(index+1)*width]]
+    assert floats(native[field]) == floats(expected), field
+assert floats(native['uvs'][0]) == floats([v for index in kept for v in editable['uvs'][0][index*2:index*2+2]])
+assert native['skin'] == [(tuple(editable['skin'][index][0]), tuple(editable['skin'][index][1])) for index in kept]
+assert native['bone_paths'] == editable['bone_paths']
+assert native['bindposes'] == editable['bindposes']
+assert native['blend_frames'][0][1:3] == (0,3)
+expected_shapes = [(kept.index(v[0]), *v[1:]) for v in editable['blend_vertices'] if v[0] in kept]
+assert native['blend_vertices'] == expected_shapes
+assert native['blend_channels'] == editable['blend_channels']
+assert native['blend_weights'] == editable['blend_weights']
+assert before == snapshot(loose_obj), 'Native compaction changed the author mesh'
 addon.unregister()
 print('EFF_CORNER_EXPORT_OK')

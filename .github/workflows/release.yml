@@ -12,7 +12,7 @@ jobs:
   package:
     runs-on: windows-latest
     env:
-      FRAMEWORK_TAG: v1.3.4
+      FRAMEWORK_TAG: v1.4.0
     steps:
       - uses: actions/checkout@v4
       - name: Checkout paired framework sources
@@ -25,16 +25,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '9.0.x'
-      - name: Build add-on-owned compiler and source preparer
+      - name: Verify author export and publication contracts
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "$pwd/framework/tools/Blender;$pwd/framework/tools"
+          python -m unittest test_eiem_native_export_core test_eiem_native_publish test_eiem_offline_reload test_eiem_release
+          if ($LASTEXITCODE -ne 0) { throw 'Author export tests failed' }
+      - name: Build add-on-owned compiler with source discovery
         shell: pwsh
         run: |
           cmd /c framework\tools\build_resource_pack.cmd v35
           if ($LASTEXITCODE -ne 0) { throw 'Author compiler build failed' }
-          framework/tools/build_static_sources.ps1
-          if ($LASTEXITCODE -ne 0) { throw 'Source preparer build failed' }
       - name: Build author core and Python dependencies
         shell: pwsh
         run: |

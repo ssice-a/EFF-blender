@@ -14,6 +14,7 @@ class OfflineExportTests(unittest.TestCase):
     def protocol(self):
         return dict(format=module.EXPECTED_PROTOCOL, compiledMod=module.COMPILED_MOD,
                     staticSourceInputs=module.STATIC_SOURCE_INPUTS,
+                    sourcePreparation='in-process/index-vfs+author-declarations',
                     structures=dict(module.STRUCTURES),compiler='arbitrary-label',abi=999)
 
     def test_compile_only_requested_staged_mod(self):
@@ -31,6 +32,24 @@ class OfflineExportTests(unittest.TestCase):
                 self.assertTrue(module.compile_reload(stage,(game/'local-compiler.exe',stage/'compiled.bin',stage,game))['offlineReloadPrepared'])
             self.assertEqual(sentinel.read_bytes(),b'other Mod');self.assertEqual(len(calls),2)
             self.assertFalse((game/'plugin/resource-reload-cache').exists())
+
+    def test_previous_snapshot_is_read_only_and_requires_declared_support(self):
+        for support in (None, 'unknown-layout', 'validated-previous-mod'):
+            with self.subTest(support=support), tempfile.TemporaryDirectory() as folder:
+                game=Path(folder);stage=game/'stage';stage.mkdir();previous=game/'published';previous.mkdir()
+                prior=previous/'compiled.bin';prior.write_bytes(b'previous result')
+                declaration=self.protocol();declaration['compiledCacheInputs']=support
+                def invoke(command, **kwargs):
+                    if command[-1]=='--protocol':
+                        return SimpleNamespace(returncode=0,stdout=json.dumps(declaration),stderr='')
+                    expected=[str(game/'compiler'),'--export-mod',str(stage.resolve()),str(game)]
+                    if support=='validated-previous-mod':expected+=['--previous-mod',str(previous.resolve())]
+                    self.assertEqual(command,expected)
+                    (stage/'compiled.bin').write_bytes(b'new result')
+                    return SimpleNamespace(returncode=0,stdout='COMPILED-MOD-PUBLISHED',stderr='')
+                with patch.object(module.subprocess,'run',side_effect=invoke):
+                    module.compile_reload(stage,(game/'compiler',None,None,game),previous=previous)
+                self.assertEqual(prior.read_bytes(),b'previous result')
 
     def test_game_and_workspace_exports_use_addon_compiler_only(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -64,20 +83,42 @@ class OfflineExportTests(unittest.TestCase):
                     with self.assertRaises(ValueError):module.compile_reload(stage,(game/'compiler',None,None,game))
                 self.assertEqual(old.read_bytes(),b'previous')
 
-    def test_source_preparation_uses_local_tool_and_seeds_previous_descriptor(self):
+    def test_source_preparation_seeds_descriptor_without_starting_a_second_tool(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=Path(folder);addon=root/'addon';tool=addon/'nativepack/eff_source_prepare.exe';tool.parent.mkdir(parents=True);tool.touch()
+            root=Path(folder);addon=root/'addon'
             game=root/'game';stage=root/'stage';stage.mkdir();prior=root/'prior';prior.mkdir();(prior/'source-inputs.bin').write_bytes(b'prior')
             source=root/'workspace/character.eff';source.mkdir(parents=True);index=root/'workspace/index/endfield_assets.eidx';index.parent.mkdir();index.touch()
-            def invoke(command,**kwargs):
-                if command[-1]=='--protocol':return SimpleNamespace(returncode=0,stdout=json.dumps(self.protocol()),stderr='')
-                self.assertEqual(command,[str(tool),'--prepare-static-sources',str(game),str(index),str(stage),str(addon/'compiler')])
-                self.assertEqual((stage/'source-inputs.bin').read_bytes(),b'prior');(stage/'source-inputs.bin').write_bytes(b'current')
-                return SimpleNamespace(returncode=0,stdout='',stderr='')
-            with patch.object(module,'__file__',str(addon/'eiem_offline_reload.py')),patch.object(module.subprocess,'run',side_effect=invoke),patch.dict(module.os.environ,{},clear=True):
-                module.prepare_static_sources(stage,source,(addon/'compiler',None,None,game),previous=prior)
+            with patch.object(module,'__file__',str(addon/'eiem_offline_reload.py')),patch.object(module.subprocess,'run') as run,patch.dict(module.os.environ,{},clear=True):
+                selected_index=module.prepare_static_sources(stage,source,(addon/'compiler',None,None,game),previous=prior)
+                run.assert_not_called()
+                self.assertEqual(selected_index,index.resolve())
             self.assertEqual((prior/'source-inputs.bin').read_bytes(),b'prior')
-            self.assertEqual((stage/'source-inputs.bin').read_bytes(),b'current')
+            self.assertEqual((stage/'source-inputs.bin').read_bytes(),b'prior')
+
+    def test_source_discovery_and_compile_share_one_process(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);stage=root/'stage';stage.mkdir();compiler=root/'compiler';index=root/'index.eidx'
+            calls=[]
+            def invoke(command,**kwargs):
+                calls.append(command)
+                if command[-1]=='--protocol':return SimpleNamespace(returncode=0,stdout=json.dumps(self.protocol()),stderr='')
+                self.assertEqual(command,[str(compiler),'--export-mod',str(stage.resolve()),str(root),'--source-index',str(index.resolve())])
+                (stage/'compiled.bin').write_bytes(b'one complete candidate')
+                return SimpleNamespace(returncode=0,stdout='COMPILED-MOD-COST source-index 125\nCOMPILED-MOD-COST total 250\nCOMPILED-MOD-PUBLISHED',stderr='')
+            with patch.object(module.subprocess,'run',side_effect=invoke):
+                result=module.compile_reload(stage,(compiler,None,None,root),source_index=index)
+            self.assertEqual(result['offlineCompilerCostsMs']['source-index'],125)
+            self.assertEqual(len([call for call in calls if '--export-mod' in call]),1)
+
+    def test_combined_discovery_requires_an_actual_compiler_capability(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);stage=root/'stage';stage.mkdir();(stage/'compiled.bin').write_bytes(b'previous')
+            declaration=self.protocol();declaration.pop('sourcePreparation')
+            with patch.object(module.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=json.dumps(declaration),stderr='')) as run:
+                with self.assertRaisesRegex(ValueError,'进程内来源查询'):
+                    module.compile_reload(stage,(root/'compiler',None,None,root),source_index=root/'index.eidx')
+                self.assertEqual(run.call_count,1)
+            self.assertEqual((stage/'compiled.bin').read_bytes(),b'previous')
 
     def test_failed_protocol_query_never_guesses_from_executable_markers(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -135,6 +176,15 @@ class OfflineExportTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, '清单字段布局'):
                     module._compiler_protocol(compiler, old)
                 self.assertEqual(module._compiler_protocol(compiler, current)['structures']['manifestEncoding'], rules)
+
+    def test_runtime_index_requires_matching_reader(self):
+        index = module.COMPILED_MOD
+        produced = dict(compiledRuntimeIndex=index)
+        with self.assertRaisesRegex(ValueError, '运行索引'):
+            module._require_manifest_reader(produced, {})
+        with self.assertRaisesRegex(ValueError, '运行索引'):
+            module._require_manifest_reader(produced, dict(compiledRuntimeIndex='different-layout'))
+        module._require_manifest_reader(produced, dict(compiledRuntimeIndex=index))
 
 
 if __name__=='__main__':unittest.main()

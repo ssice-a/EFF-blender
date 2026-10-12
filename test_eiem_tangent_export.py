@@ -187,6 +187,31 @@ for index in corner_indices(custom_result):
 no_uv = make_object('NoUV', uv=False)
 assert export(no_uv, 'no-uv')['tangents'] == []
 
+# Loose vertices can retain a stale source tangent after geometry edits. They
+# are not rendered and must not make native frame packing reject the faces.
+# The editable exchange writer still preserves them for a lossless roundtrip.
+loose = make_object('LooseStaleTangent')
+addon.set_point_attribute(loose.data, 'EFF_SourceNormal', 'FLOAT_VECTOR',
+                          [(0, 0, 1)] * 6, 'vector')
+loose.data['eiem_normal_baseline_crc'] = addon.normal_state_crc(loose.data)
+addon.set_point_attribute(loose.data, 'EFF_Tangent', 'FLOAT_VECTOR',
+                          [(1, 0, 0)] * 5 + [(1, 0, .0656)], 'vector')
+addon.set_point_attribute(loose.data, 'EFF_TangentSign', 'FLOAT', [1] * 6, 'value')
+before_loose = (len(loose.data.vertices), tuple(tuple(v.co) for v in loose.data.vertices))
+native_snapshot = addon.write_mesh(None, loose, return_snapshot=True)
+sys.path.insert(0, str(addon_path.parent.parent))
+import numpy as np
+from nativepack import mesh as native_codec
+_, precision = native_codec.pack_frames(np.asarray(native_snapshot['normals']).reshape(-1, 3),
+                                        np.asarray(native_snapshot['tangents']).reshape(-1, 4))
+assert precision['tangentMaxError'] <= .015
+assert native_snapshot['vertex_count'] == 5
+assert sorted(set(native_snapshot['indices'])) == list(range(5))
+assert before_loose == (len(loose.data.vertices), tuple(tuple(v.co) for v in loose.data.vertices))
+editable = export(loose, 'loose-stale-tangent')
+assert editable['vertex_count'] == 6
+assert editable['tangents'][20:24] == [-1, 0, float(np.float32(.0656)), 1]
+
 # Partially missing source data cannot be repaired without the derivative UV.
 for layer in list(mixed.data.uv_layers):
     mixed.data.uv_layers.remove(layer)

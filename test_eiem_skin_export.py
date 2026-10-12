@@ -21,7 +21,8 @@ nodes = [('Root', -1, (0, 0, 0), (0, 0, 0, 1), (1, 1, 1)),
          ('Root/Unused', 0, (0, 1, 0), (0, 0, 0, 1), (1, 1, 1)),
          ('Root/Pelvis', 0, (0, 2, 0), (0, 0, 0, 1), (1, 1, 1)),
          ('Root/Pelvis/Foot', 2, (0, -1, 0), (0, 0, 0, 1), (1, 1, 1)),
-         ('Root/Accessory', 0, (1, 0, 0), (0, 0, 0, 1), (1, 1, 1))]
+         ('Root/Accessory', 0, (1, 0, 0), (0, 0, 0, 1), (1, 1, 1)),
+         ('Root/NewUnusedChain', 0, (2, 0, 0), (0, 0, 0, 1), (1, 1, 1))]
 rig = addon.make_armature('SkeletonTest', {'coordinate':'unity-y-up-left-handed', 'nodes':nodes}, bpy.context.scene.collection)
 by_path = {b['eiem_path']: i for i,b in enumerate(rig.data.bones)}
 poses = {n[0]:flat(Matrix.Translation((0,-y,0))) for n,y in zip(nodes, (0,1,2,1,0))}
@@ -48,6 +49,8 @@ for name in ('Root','Unused','Pelvis','Foot','Accessory'):
 obj.vertex_groups['Pelvis'].add([0],1,'REPLACE')
 obj.vertex_groups['Foot'].add([1],1,'REPLACE')
 obj.vertex_groups['Accessory'].add([2],1,'REPLACE')
+before=[[(g.group,g.weight) for g in v.groups] for v in obj.data.vertices]
+obj.vertex_groups.new(name='NewUnusedChain').add([0],0,'REPLACE')
 before=[[(g.group,g.weight) for g in v.groups] for v in obj.data.vertices]
 file=output/'expanded.mesh'
 addon.write_mesh(file,obj)

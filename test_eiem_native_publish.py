@@ -101,6 +101,29 @@ class PublishTests(unittest.TestCase):
         self.assertIn('source-inputs.bin',result['_files'])
         self.assertEqual((self.root/'source-inputs.bin').read_bytes(),b'new sources')
 
+    def test_retained_texture_flag_with_different_bytes_does_not_overwrite_source(self):
+        ini_module=exporter.pack_modules()[0]['ini_package']
+        textures=[dict(t,retained=True,pixels=b'\x03\x07\x0b\x0d') for t in self.data['textures']]
+        before=self.hashes()
+        ini=ini_module.ini_document(self.stage)
+        planned=ini_module.texture_output_paths(self.stage,ini,textures)
+        exporter._detach_staging_files(exporter._partial_output_paths(self.stage,'TEXTURES',ini,
+            [],textures,[],ini_module.identifier,planned))
+        update_directory(self.stage,textures=textures,texture_only=True)
+        self.assertEqual(self.hashes(),before,'a retained pixel payload skipped detaching a different file')
+        self.assertTrue(any(t['_written'] for t in textures))
+
+    def test_retained_texture_keeps_verified_file_and_reports_zero_writes(self):
+        ini_module=exporter.pack_modules()[0]['ini_package']
+        textures=[dict(t,retained=True) for t in self.data['textures']]
+        ini=ini_module.ini_document(self.stage)
+        planned=ini_module.texture_output_paths(self.stage,ini,textures)
+        paths=exporter._partial_output_paths(self.stage,'TEXTURES',ini,[],textures,[],
+                                            ini_module.identifier,planned)
+        self.assertFalse(any(p.suffix=='.tex' for p in paths))
+        update_directory(self.stage,textures=textures,texture_only=True)
+        self.assertTrue(all(not t['_written'] for t in textures))
+
     def test_compiled_rules_are_published_on_first_and_repeated_export(self):
         (self.stage/'compiled.bin').write_bytes(b'new compiled rules')
         fresh = Path(self.temp.name) / 'first-compiled'

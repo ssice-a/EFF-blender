@@ -1,4 +1,5 @@
-"""Real Blender authoring and export test, only inside a caller's temp folder."""
+"""Real Blender switch authoring/planning test in a caller's temp folder.
+Native publication and format 2 are covered by the native export/INI tests."""
 import importlib.util
 import json
 import sys
@@ -192,117 +193,28 @@ assert len(addon.switch_groups()) == 2
 assert top_group["eiem_key"] == "CTRL+ALT+NUMPAD7"
 selected = [obj, top, accessory, variant]
 plan = addon.plan_switch_export(selected)
-package = output / "package"
-stats = addon.export_package(package, selected, [])
-assert stats == {"meshes": 1, "materials": 2, "textures": 0, "skeletons": 0,
-                 "physics": 0, "prefabs": 0}, stats
-text = (package / "mod.ini").read_text(encoding="utf-8")
-assert text.count("asset=SourceAsset") >= 1
-assert "handling=skip" not in text
-assert text.count("[KeySwitch") == 2
-assert text.count("[KeyShape") == 2
-assert "key=CTRL+ALT+NUMPAD7" in text
-assert "key=F8" in text and "key=F9" in text
-assert text.count("speed=0.5") == 2
-assert "type=hold" in text and "=" + str(1) in text
-assert "||" in text
-assert text.count("[Render") == 1
-assert "submesh_visible." in text
-assert "partner." not in text
-payloads = [addon.read_mesh(p) for p in (package / "meshes").glob("*.mesh")]
-assert len(payloads) == 1 and len(payloads[0]["indices"]) == 18
-for p in payloads:
-    assert len(p["bindposes"]) == 3 and p["bone_hashes"] == [10, 20, 30]
-    assert p["bone_paths"] == ["Root", "Tip", "Unused"]
-    assert len(p["skin"]) == p["vertex_count"]
-
-# Skin edits must invalidate the session cache.  A stale cache here would
-# silently ship the previous vertex-group weights and bone palette.
-cached_mesh, = (package / "meshes").glob("*.mesh")
-before_skin = addon.read_mesh(cached_mesh)["skin"]
-accessory.vertex_groups[0].add([0], .25, "REPLACE")
-addon.export_package(package, selected, [])
-after_skin = addon.read_mesh(cached_mesh)["skin"]
-assert before_skin != after_skin
-
-# Shape-key coordinates are serialized into the same Mesh resource.  They
-# need their own content fingerprint because changing a key can leave the
-# owning ID's revision unchanged in Blender.
-before_shape_bytes = cached_mesh.read_bytes()
-shape_block = accessory.data.shape_keys.key_blocks["StockingBlend"]
-shape_block.data[0].co.z += .125
-addon.export_package(package, selected, [])
-after_shape_bytes = cached_mesh.read_bytes()
-assert before_shape_bytes != after_shape_bytes
-shape_block.data[0].co.z -= .125
-
-# Export checkbox off keeps the authored default appearance and shape sliders,
-# without exporting any key bindings. It does not change the saved project.
-static_package = output / "without-switches"
-assert bpy.ops.eiem.export_package.get_rna_type().properties[
-    "include_switches"].default is True
-assert addon.export_package(static_package, selected, [],
-                            include_switches=False)["meshes"] == 1
-static_ini = (static_package / "mod.ini").read_text(encoding="utf-8")
-assert "[KeySwitch" not in static_ini and "[KeyShape" not in static_ini
-assert "[KeyModUI]" not in static_ini and "$switch_" not in static_ini
-assert "submesh_visible." not in static_ini
-assert "[ShapeControl" in static_ini and "shape." in static_ini
+# Current authoring semantics are independent of native source preparation.
+# This synthetic scene intentionally has no manifest and must not be published.
+assert bpy.ops.eiem.export_package.get_rna_type().properties["include_switches"].default is True
+static_plan = addon.plan_switch_export(selected, include_switches=False)
+assert not static_plan["groups"]
 assert len(addon.plan_switch_export(selected)["groups"]) == 2
-
-# The off option must also allow an intentionally unused/invalid key binding.
-acc_group["eiem_key"] = "Ctrl+Ctrl+F7"
-assert addon.export_package(output / "without-keys", selected, [],
-                            include_switches=False)["meshes"] == 1
-acc_group["eiem_key"] = "F7"
-
-# Preview state is never export selection: default off still exports geometry.
 empty_state = next(state for state in addon.switch_states(top_group)
                    if state.name == "款式 2")
 addon.set_switch_default(top_group, empty_state)
 addon.preview_switch(top_group, empty_state)
-addon.export_package(output / "default-off", selected, [])
-default_static = addon.plan_switch_export(selected, include_switches=False)
-assert top in default_static["hidden"] and variant in default_static["hidden"]
-addon.export_package(output / "default-off-static", selected, [],
-                     include_switches=False)
-assert "[KeySwitch" not in (output / "default-off-static/mod.ini").read_text(
-    encoding="utf-8")
+static_plan = addon.plan_switch_export(selected, include_switches=False)
+assert top in static_plan["hidden"] and variant in static_plan["hidden"]
+addon.restore_switch_preview()
 addon.set_switch_default(top_group, addon.switch_states(top_group)[0])
 
-# Validation errors must leave a previously working package untouched.
-baseline = {str(p.relative_to(package)): p.read_bytes() for p in package.rglob("*") if p.is_file()}
-def unchanged_on_error():
-    try:
-        addon.export_package(package, selected, [])
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected export validation error")
-    assert baseline == {str(p.relative_to(package)): p.read_bytes() for p in package.rglob("*") if p.is_file()}
-
+# Same-key groups are valid, and overlapping membership retains both bindings.
 acc_group["eiem_key"] = "CTRL+ALT+NUMPAD7"
-unchanged_on_error()
+assert len(addon.plan_switch_export(selected)["groups"]) == 2
 acc_group["eiem_key"] = "F7"
-acc_group["eiem_key"] = "Ctrl+Ctrl+F7"
-unchanged_on_error()
-acc_group["eiem_key"] = "F7"
-# A Mesh may belong to several switch groups. The overlap is exported as
-# unconditional visibility metadata so the runtime can apply last-operation
-# precedence without creating another Renderer.
 addon.switch_states(acc_group)[0].objects.link(top)
-overlap_plan = addon.plan_switch_export(selected)
-assert len(overlap_plan["bindings"][top]) == 2
-overlap_package = output / "overlap"
-addon.export_package(overlap_package, selected, [])
-overlap_text = (overlap_package / "mod.ini").read_text(encoding="utf-8")
-assert "visibility.0.variable=" in overlap_text
-assert "visibility.0.masks=" in overlap_text
-assert "visibility.0.controlled=" in overlap_text
+assert len(addon.plan_switch_export(selected)["bindings"][top]) == 2
 addon.switch_states(acc_group)[0].objects.unlink(top)
-top["eiem_bone_paths_json"] = '["Root","Missing","Unused"]'
-unchanged_on_error()
-top["eiem_bone_paths_json"] = '["Root","Tip","Unused"]'
 
 # UI operator properties may retain the name of a state deleted by the prior
 # click. The list-side minus must always resolve its current active index.
@@ -361,8 +273,5 @@ addon.unregister()
 addon.register()
 assert len(addon.plan_switch_export(selected)["groups"]) == 1
 
-# Exported switch conditions are executable EFF syntax rather than ordinary
-# INI keys.  They must not prevent the same package from being imported again.
-assert addon.import_package(package, clean=True) == 1
 addon.unregister()
-print("EFF_SWITCHES_OK", stats)
+print("EFF_SWITCHES_OK authoring, persistence, preview and planning")
