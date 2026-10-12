@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build and release
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -15,6 +24,8 @@ jobs:
       FRAMEWORK_TAG: v1.4.0
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - name: Checkout paired framework sources
         uses: actions/checkout@v4
         with:
@@ -28,6 +39,8 @@ jobs:
       - name: Verify author export and publication contracts
         shell: pwsh
         run: |
+          python -m pip install --only-binary=:all: numpy Pillow==12.3.0
+          if ($LASTEXITCODE -ne 0) { throw 'Test dependency installation failed' }
           $env:PYTHONPATH = "$pwd/framework/tools/Blender;$pwd/framework/tools"
           python -m unittest test_eiem_native_export_core test_eiem_native_publish test_eiem_offline_reload test_eiem_release
           if ($LASTEXITCODE -ne 0) { throw 'Author export tests failed' }
@@ -54,7 +67,7 @@ jobs:
                       and any(isinstance(target, ast.Name) and target.id == 'bl_info'
                               for target in node.targets))
           expected = 'v' + '.'.join(map(str, info['version']))
-          actual = os.environ['GITHUB_REF_NAME']
+          actual = os.environ['RELEASE_TAG']
           if actual != expected:
               raise SystemExit(f'Tag {actual} does not match Blender {expected}')
           PY
@@ -68,8 +81,9 @@ jobs:
           python framework/tools/diagnostics/bundle_blender_native_export.py --output $package --compiler framework/bin/resource-pack-v35/eff_resource_pack.exe --abi 35
           if ($LASTEXITCODE -ne 0) { throw 'Canonical Blender bundle failed' }
           Copy-Item README.md,LICENSE,THIRD_PARTY_NOTICES -Destination $package
-          Compress-Archive -Path $package -DestinationPath "EFF_Blender_${{ github.ref_name }}.zip"
+          Compress-Archive -Path $package -DestinationPath "EFF_Blender_${{ env.RELEASE_TAG }}.zip"
       - uses: softprops/action-gh-release@v2
         with:
-          files: EFF_Blender_${{ github.ref_name }}.zip
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: EFF_Blender_${{ env.RELEASE_TAG }}.zip
           body_path: RELEASE_NOTES.md
