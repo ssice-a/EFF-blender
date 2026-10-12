@@ -198,7 +198,7 @@ class PublishTests(unittest.TestCase):
 
         def fail_ini_once(source, target):
             nonlocal blocked
-            if Path(target) == self.root / 'mod.ini' and not blocked:
+            if Path(target).resolve() == (self.root / 'mod.ini').resolve() and not blocked:
                 blocked = True
                 raise PermissionError('fixture INI publication denied')
             return replace(source, target)

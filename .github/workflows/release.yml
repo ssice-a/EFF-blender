@@ -86,6 +86,12 @@ jobs:
           # Source tests require the add-on-owned core. Use this freshly built
           # bundle rather than an installed developer copy or game tools.
           Copy-Item ../EFF_Blender/nativepack -Destination tools/Blender/nativepack -Recurse
+          # Canonical temp paths also keep failure-injection fixtures in older
+          # tags consistent when Windows exposes RUNNER~1 short-path aliases.
+          $testTemp = Join-Path $pwd '.author-test-temp'
+          New-Item -ItemType Directory -Force $testTemp | Out-Null
+          $env:TEMP = $testTemp
+          $env:TMP = $testTemp
           $env:PYTHONPATH = "$pwd/tools/Blender;$pwd/tools"
           python -m unittest test_eiem_native_export_core test_eiem_native_publish test_eiem_offline_reload test_eiem_release
           if ($LASTEXITCODE -ne 0) { throw 'Author export tests failed' }
