@@ -36,15 +36,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Verify author export and publication contracts
-        working-directory: framework
+      - name: Install test dependencies
         shell: pwsh
         run: |
           python -m pip install --only-binary=:all: numpy Pillow==12.3.0
           if ($LASTEXITCODE -ne 0) { throw 'Test dependency installation failed' }
-          $env:PYTHONPATH = "$pwd/tools/Blender;$pwd/tools"
-          python -m unittest test_eiem_native_export_core test_eiem_native_publish test_eiem_offline_reload test_eiem_release
-          if ($LASTEXITCODE -ne 0) { throw 'Author export tests failed' }
       - name: Build add-on-owned compiler with source discovery
         shell: pwsh
         run: |
@@ -83,6 +79,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Canonical Blender bundle failed' }
           Copy-Item README.md,LICENSE,THIRD_PARTY_NOTICES -Destination $package
           Compress-Archive -Path $package -DestinationPath "EFF_Blender_${{ env.RELEASE_TAG }}.zip"
+      - name: Verify author export and publication contracts
+        working-directory: framework
+        shell: pwsh
+        run: |
+          # Source tests require the add-on-owned core. Use this freshly built
+          # bundle rather than an installed developer copy or game tools.
+          Copy-Item ../EFF_Blender/nativepack -Destination tools/Blender/nativepack -Recurse
+          $env:PYTHONPATH = "$pwd/tools/Blender;$pwd/tools"
+          python -m unittest test_eiem_native_export_core test_eiem_native_publish test_eiem_offline_reload test_eiem_release
+          if ($LASTEXITCODE -ne 0) { throw 'Author export tests failed' }
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
