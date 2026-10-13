@@ -193,7 +193,7 @@ class PublishTests(unittest.TestCase):
         (self.stage/'compiled.bin').write_bytes(b'new compiled rules')
         before = self.hashes()
         self.change_texture(rename=True)
-        replace = os.replace
+        replace = exporter._replace_published_file
         blocked = False
 
         def fail_ini_once(source, target):
@@ -203,7 +203,7 @@ class PublishTests(unittest.TestCase):
                 raise PermissionError('fixture INI publication denied')
             return replace(source, target)
 
-        with patch.object(os, 'replace', side_effect=fail_ini_once):
+        with patch.object(exporter, '_replace_published_file', side_effect=fail_ini_once):
             with self.assertRaisesRegex(PermissionError, 'INI publication denied'):
                 exporter.publish(self.stage, self.root, read_package)
         self.assertEqual(self.hashes(), before)

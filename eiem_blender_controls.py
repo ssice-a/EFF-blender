@@ -349,10 +349,7 @@ def preview_switch(group, state, context=None):
 def assign_switch_meshes(state, objects, scene=None):
     scene = scene or bpy.context.scene
     objects = list(objects)
-    if (not objects
-            or any(obj.type != "MESH" or not obj.data.get("eiem_section")
-                   for obj in objects)):
-        raise ValueError("请在物体模式选择已绑定 EFF 源资源的网格")
+    validate_switch_meshes(objects)
     restore_switch_preview(objects)
     target_group = next(
         (group for group in switch_groups(scene)
@@ -385,10 +382,7 @@ def add_switch_members(group, objects, scene=None, state=None):
     if not group or not group.get("eiem_switch_group"):
         raise ValueError("当前切换组不存在")
     objects = list(objects)
-    if (not objects
-            or any(obj.type != "MESH" or not obj.data.get("eiem_section")
-                   for obj in objects)):
-        raise ValueError("请在物体模式选择已绑定 EFF 资源的网格")
+    validate_switch_meshes(objects)
     states = switch_states(group)
     if not states:
         raise ValueError("当前切换组没有款式")
@@ -422,14 +416,81 @@ def remove_switch_members(group, objects, scene=None, context=None):
     return objects
 
 
+def validate_switch_meshes(objects):
+    if not objects:
+        raise ValueError("请先选择 EFF 网格部件")
+    non_meshes = [obj.name for obj in objects if obj.type != "MESH"]
+    if non_meshes:
+        raise ValueError("所选包含非网格物体：" + "、".join(non_meshes))
+    unbound = [obj.name for obj in objects if not obj.data.get("eiem_section")]
+    if unbound:
+        raise ValueError("以下网格的来源绑定缺失：" + "、".join(unbound)
+                         + "；保留原 Renderer 信息的副本可点击‘恢复来源绑定’")
+
+
+def restore_mesh_source_binding(obj, scene=None):
+    """Recover only source metadata, using the retained exact import identity.
+
+    Replacing a Mesh data-block can lose its ID properties while its Object
+    retains the original package/Prefab/Renderer. Mesh names and geometry do
+    not decide ownership. Never copy another Mesh's controls or vertex data.
+    """
+    scene = scene or bpy.context.scene
+    if obj is None or obj.type != "MESH":
+        raise ValueError("请选择需要恢复来源绑定的网格")
+    if obj.data.get("eiem_section"):
+        raise ValueError(obj.name + " 已有来源绑定")
+    keys = ("eiem_author_package", "eiem_prefab_path", "eiem_render_section",
+            "eiem_render_asset")
+    identity = tuple(str(obj.get(key, "")) for key in keys)
+    if not all(identity):
+        raise ValueError(obj.name + " 未保留完整原 Renderer 来源，需明确指定来源网格")
+    candidates = [other for other in scene.objects
+                  if other.type == "MESH" and other != obj
+                  and other.data.get("eiem_section")
+                  and tuple(str(other.get(key, "")) for key in keys) == identity]
+    source_keys = ("eiem_section", "eiem_source", "eiem_asset", "eiem_target_path",
+                   "eiem_target_asset", "eiem_coordinate_space")
+    snapshots = {tuple(str(other.data.get(key, "")) for key in source_keys)
+                 for other in candidates}
+    if len(snapshots) != 1:
+        raise ValueError(obj.name + " 没有唯一且一致的原 Renderer 来源绑定")
+    source = candidates[0].data
+    if (not source.get("eiem_source") or not source.get("eiem_asset")
+            or not source.get("eiem_coordinate_space")
+            or str(source.get("eiem_target_asset") or source.get("eiem_asset")) != identity[3]):
+        raise ValueError(obj.name + " 的原 Renderer 与源 Mesh 声明不一致")
+    values = {key: source[key] for key in source_keys if key in source}
+    # Keep sparse UV/attribute channel semantics only when those exact mapped
+    # channels still exist on the edited Mesh. Do not copy geometry baselines.
+    uv_slots = parse_json_property(source, "author_uv_slots_json", [])
+    if all(obj.data.uv_layers.get(slot.get("layer", "")) is not None
+           and (not slot.get("zw") or obj.data.attributes.get(slot["zw"]) is not None)
+           for slot in uv_slots):
+        for key in ("author_uv_slots_json", "author_uv_dimensions_json", "eiem_uv_dimensions_json"):
+            if key in source and key not in obj.data:
+                values[key] = source[key]
+    mapping = parse_json_property(source, "author_attribute_map_json", {})
+    if all(obj.data.attributes.get(name) is not None
+           and source.attributes.get(name) is not None
+           and (obj.data.attributes[name].domain, obj.data.attributes[name].data_type)
+               == (source.attributes[name].domain, source.attributes[name].data_type)
+           for category in mapping.values() for name in category.values()):
+        if "author_attribute_map_json" in source and "author_attribute_map_json" not in obj.data:
+            values["author_attribute_map_json"] = source["author_attribute_map_json"]
+    for key, value in values.items():
+        if key in obj.data and obj.data[key] != value:
+            raise ValueError(obj.name + " 已有字段与恢复来源冲突：" + key)
+    for key, value in values.items():
+        obj.data[key] = value
+    return str(source["eiem_section"])
+
+
 def create_switch_group(name, key, objects, scene=None):
     scene = scene or bpy.context.scene
     objects = list(objects)
     key = validate_switch_key(key)
-    if (not objects
-            or any(obj.type != "MESH" or not obj.data.get("eiem_section")
-                   for obj in objects)):
-        raise ValueError("请先选择 EFF 网格部件")
+    validate_switch_meshes(objects)
     root = next(
         (collection for collection in scene.collection.children
          if collection.get("eiem_switch_root")), None)

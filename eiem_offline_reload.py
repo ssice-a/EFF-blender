@@ -6,6 +6,9 @@ import os
 import re
 import shutil
 import subprocess
+import hashlib
+import contextlib
+import struct
 
 EXPECTED_PROTOCOL = 'EFF_OFFLINE_PACKAGE_PROTOCOL'
 EXPECTED_COMPILER = 'EFF_NATIVE_PACK_V35_1'
@@ -25,6 +28,93 @@ COMPILER_ARGUMENTS = ['author', 'baseline', 'cache']
 LEGACY_ARGUMENTS = [*COMPILER_ARGUMENTS, 'assembly']
 STATIC_SOURCE_INPUTS = 'mod-static-catalog/selected-sources'
 SOURCE_PREPARATION = 'in-process/index-vfs+author-declarations'
+EXPORT_CARRYOVER = 'validated-source-selection+published-discoveries'
+
+
+@contextlib.contextmanager
+def publication_lock(destination):
+    """Share the runtime block writer's mutex, only during final publication."""
+    if os.name != 'nt':
+        yield
+        return
+    import ctypes
+    from ctypes import wintypes
+    path = str((Path(destination).resolve() / 'compiled.bin').resolve()).replace('\\', '/')
+    path = path.translate(str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'))
+    name = 'Local\\EFFModBlocks-' + hashlib.sha256(path.encode('utf-8')).hexdigest().upper()
+    api = ctypes.WinDLL('kernel32', use_last_error=True)
+    api.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    api.CreateMutexW.restype = wintypes.HANDLE
+    api.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    api.WaitForSingleObject.restype = wintypes.DWORD
+    api.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = api.CreateMutexW(None, False, name)
+    if not handle:
+        raise OSError(ctypes.get_last_error(), '无法取得 Mod 发布锁')
+    acquired = False
+    try:
+        result = api.WaitForSingleObject(handle, 0xffffffff)
+        if result not in (0, 0x80):
+            raise OSError(ctypes.get_last_error(), 'Mod 发布锁等待失败')
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            api.ReleaseMutex(handle)
+        api.CloseHandle(handle)
+
+
+def published_revision(destination):
+    """Read the committed block identity without hashing all source payloads."""
+    path = Path(destination).resolve() / 'compiled.bin'
+    if not path.is_file():
+        return None
+    with path.open('rb') as stream:
+        status = os.fstat(stream.fileno())
+        header = stream.read(192)
+        if header[:16] == b'EFF_MOD_BLOCKS/1':
+            valid = []
+            for number in range(2):
+                slot = header[16 + number * 88:16 + (number + 1) * 88]
+                if len(slot) != 88 or hashlib.sha256(slot[:56]).digest() != slot[56:]:
+                    continue
+                generation, offset, size = struct.unpack_from('<QQQ', slot)
+                if not generation or offset < 192 or offset > status.st_size or size > status.st_size - offset:
+                    continue
+                stream.seek(offset)
+                digest = hashlib.sha256()
+                remaining = size
+                while remaining:
+                    data = stream.read(min(1024 * 1024, remaining))
+                    if not data:
+                        raise ValueError('Mod 提交索引被截断，保留上一发布')
+                    digest.update(data)
+                    remaining -= len(data)
+                if digest.digest() == slot[24:56]:
+                    valid.append((generation, digest.hexdigest()))
+            if not valid:
+                raise ValueError('Mod 没有可读的已提交代际，不能丢弃新增命中')
+            generation, digest = max(valid)
+            return (status.st_dev, status.st_ino, 'blocks', generation, digest)
+        stream.seek(0)
+        digest = hashlib.sha256()
+        for data in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(data)
+        return (status.st_dev, status.st_ino, 'packet', digest.hexdigest())
+
+
+def publish_reload(staging, destination, publisher, context, source_index, compiled):
+    """Optimistically merge a concurrent discovery before swapping author files."""
+    for attempt in range(3):
+        with publication_lock(destination):
+            if published_revision(destination) == compiled.get('offlinePreviousRevision'):
+                return publisher(), compiled
+        if attempt == 2:
+            break
+        # Compilation must run outside the game writer's mutex.
+        compiled = compile_reload(staging, context, previous=destination, source_index=source_index)
+    raise ValueError('游戏在导出期间持续补写命中，暂存结果未发布；上一完整 Mod 保持')
 
 
 def _structures(value):
@@ -174,8 +264,9 @@ def prepare_static_sources(destination, source_package, context, previous=None):
             if candidate.is_file():
                 index = candidate
                 break
-    # An unchanged descriptor can be reused by the compiler without opening an
-    # index. An index is required only for initial or changed source identities.
+    # The compiler validates the current layered game identity against the
+    # index header before reusing a descriptor; a full index read is needed
+    # only when declarations or the installed resource catalog have changed.
     return index or source_package / 'index/endfield_assets.eidx'
 
 
@@ -190,13 +281,23 @@ def compile_reload(destination, context=None, previous=None, source_index=None):
         raise ValueError('插件或 DLL 不支持独立 Mod 编译结构，请更新配套文件')
     destination = Path(destination).resolve()
     command = [str(compiler), '--export-mod', str(destination), str(game)]
+    if (destination/'mod.ini').is_file() and '[ShapeAnimation' in (destination/'mod.ini').read_text(encoding='utf-8-sig'):
+        expected='sampled-shape-weight-clips/le32/1'
+        if protocol.get('structures',{}).get('shapeAnimation')!=expected or consumer is not None and consumer.get('structures',{}).get('shapeAnimation')!=expected:
+            raise ValueError('当前编译器或游戏 DLL 未声明形态动画支持，请安装配套版本；上一 Mod 保留')
     if source_index is not None:
         if protocol.get('sourcePreparation') != SOURCE_PREPARATION:
             raise ValueError('插件缺少支持进程内来源查询的编译器，请安装完整插件包')
         command.extend(['--source-index', str(Path(source_index).resolve())])
-    if (previous is not None and
-            protocol.get('compiledCacheInputs') == 'validated-previous-mod' and
-            (Path(previous) / 'compiled.bin').is_file()):
+    revision = None
+    if previous is not None:
+        with publication_lock(previous):
+            revision = published_revision(previous)
+    if revision is not None:
+        if protocol.get('compiledExportCarryover') != EXPORT_CARRYOVER:
+            raise ValueError('编译器不支持继承已提交的 PFB 命中，不能覆盖旧 Mod；请更新 Blender 配套编译器')
+        if revision[2] == 'blocks' and consumer is not None and consumer.get('compiledModStore') != 'EFF_MOD_BLOCKS/1':
+            raise ValueError('当前 DLL 不支持该 Mod 的来源块存储，保留上一发布；需要配套 reader 迁移')
         command.extend(['--previous-mod', str(Path(previous).resolve())])
     result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace',
                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), check=False)
@@ -207,7 +308,6 @@ def compile_reload(destination, context=None, previous=None, source_index=None):
     artifact = destination / 'compiled.bin'
     if not artifact.is_file():
         raise ValueError('资源编译没有生成完整的 compiled.bin')
-    import hashlib
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest().upper()
     costs = {}
     for row in result.stdout.splitlines():
@@ -222,4 +322,5 @@ def compile_reload(destination, context=None, previous=None, source_index=None):
     return dict(offlineReloadPrepared=True, offlineReloadKey=digest,
                 offlineReloadManifestHash=digest, offlineReloadCache=str(destination),
                 offlineCompiler=protocol.get('compiler', str(compiler)),
+                offlinePreviousRevision=revision,
                 offlineCompilerCostsMs=costs)

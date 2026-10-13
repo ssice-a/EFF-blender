@@ -55,6 +55,7 @@ for cycle in range(3):
     assert bpy.ops.eiem.physics_parameters.get_rna_type() is not None
     assert bpy.ops.eiem.physics_curve_key.get_rna_type() is not None
     assert bpy.ops.eiem.switch_key_record.get_rna_type() is not None
+    assert bpy.ops.eiem.mesh_restore_source.get_rna_type() is not None
     assert bpy.ops.eiem.switch_state_drag.get_rna_type() is not None
     assert bpy.ops.eiem.switch_member_add.get_rna_type() is not None
     assert bpy.ops.eiem.switch_member_remove.get_rna_type() is not None

@@ -2,7 +2,7 @@
 
 EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以在 Blender 中编辑网格、材质、贴图、款式切换和形态键，然后导出可放入 EFF `plugin/mods` 的 Mod 文件夹。
 
-本次发布 **v0.41.0**，配套 [EFF v1.4.0](https://github.com/ssice-a/EFF/releases/tag/v1.4.0) 与 [AnimeStudio v1.4.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.4.0)。Windows x64 插件包含原生导出核心、统一资源编译器及 Pillow；已在 Blender 5.0.1 / Python 3.11 验证。当前包支持 Windows x64 / Blender 5.0，内置依赖使用 Python 3.11 ABI；不同 Python ABI 需要另行构建依赖。
+本次发布 **v0.42.0**，配套 [EFF v1.5.0](https://github.com/ssice-a/EFF/releases/tag/v1.5.0) 与 [AnimeStudio v1.5.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.5.0)。Windows x64 插件包含原生导出核心、统一资源编译器及 Pillow；已在 Blender 5.0.1 / Python 3.11 验证。当前包支持 Windows x64 / Blender 5.0，内置依赖使用 Python 3.11 ABI；不同 Python ABI 需要另行构建依赖。
 
 带截图的[简易 Mod 制作教程](https://github.com/ssice-a/EFF/blob/main/Mod%20Tutorial.md)包含安装、解包、材质编辑和所选网格导出步骤；也提供[英文版](https://github.com/ssice-a/EFF/blob/main/Mod%20Tutorial_EN.md)。
 
@@ -11,6 +11,7 @@ EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以
 - 导入和编辑 EFF 网格、材质、贴图、骨骼、LOD 与物理资源。
 - 支持多个部件、材质槽和形态键。
 - 为形态键提供 Blender 滑块，并可按需录制游戏快捷键。
+- 将 Shape Keys Action 导出为形态动画，独立播放组支持快捷键播放/停止、循环；游戏 Ins 面板提供暂停与实时速度倍率。
 - 创建款式切换组，设置默认款式和游戏快捷键。
 - 导出 format 2 完整 Mod，或更新已有 Mod 的 Mesh、材质和贴图；导出按键切换选项默认开启。
 - 分资源导出复用当前会话 Mesh 快照；同一次导出复用共享骨架的路径、供体及绑定信息；仅贴图导出保留已有完整 Mod 的其他资源。
@@ -20,7 +21,7 @@ EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以
 
 ## 安装
 
-从 [Releases](https://github.com/ssice-a/EFF-blender/releases) 下载 `EFF_Blender_v0.41.0.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。更新前保存工程、关闭 Blender，再替换旧插件并重新启动，以释放原生 DLL 和旧 Python 模块。
+从 [Releases](https://github.com/ssice-a/EFF-blender/releases) 下载 `EFF_Blender_v0.42.0.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。更新前保存工程、关闭 Blender，再替换旧插件并重新启动，以释放原生 DLL 和旧 Python 模块。
 
 ## 制作 Mod
 
@@ -43,6 +44,17 @@ Blender 中选中已经导入的 EFF 骨架或绑定该骨架的网格，选择 
 5. 选择要导出的 EFF 网格，在 EFF 面板或 **文件 → 导出** 中选择“导出所选 Mod”。首次选择“全部资源”；后续可以选择“仅 Mesh”“仅材质与贴图”或“仅贴图”更新已有完整 Mod。完整导出窗口中的“导出按键切换”默认勾选；取消后只导出默认款式，不导出款式和形态键快捷键，但仍保留形态键及其滑块。
 6. 在 EFF 导出区域填写 Mod 文件夹名，然后在文件浏览器中选择父目录；插件创建或刷新同名文件夹，把 `mod.ini`、`meshes/`、`materials/` 和 `textures/` 写入其中，再在暂存目录中完成独立编译和校验后发布。需要直接在游戏中使用时，父目录选择游戏的 `plugin/mods/`。文件浏览器里的文件名不决定 Mod 名称。
 7. 等待导出和离线准备完成，进入游戏后按 **F10** 热重载。按 **Ins** 独立勾选哪些 Mod 接收按键，默认全部启用，允许多个 Mod 同时响应。也可在各 `mod.ini` 的 `[Mod]` 中设置 `key_switch_enabled=0` 或 `1`。实际全局快捷键以游戏 `plugin/eff.ini` 为准。
+
+### 形态键动画
+
+本次发布已接入此功能，请同时更新配套编译器和 DLL。
+
+1. 选中带 EFF 来源的网格，在形态键的 **value** 上插入关键帧。动作属于 Shape Keys 数据块；网格 Object 的位置、旋转 Action 不能用于此处。
+2. 打开 **3D 视图 → N → EFF → 形态动画**，点击“从当前动画创建播放组”。它读取当前 Shape Keys Action、KEY slot 与范围；手动换 Action 后选择对应插槽并“读取动作频道”。
+3. 勾选参与播放的频道，设置范围、循环和初始自动播放，再录制游戏快捷键。“更多设置”可调整作者默认倍率和采样率。预览停止后会恢复原 Action、帧和权重。
+4. 使用“全部资源”或“仅 Mesh”导出；仅材质/贴图更新会保留已有动画。游戏中快捷键播放/停止；**Ins → 形态动画**支持播放、暂停、停止和实时调速，倍率可直接输入并会保存，调速保持当前进度。
+
+停止恢复手动权重；手动形态滑块或原形态快捷键会先停止关联播放组。第一版每个频道只能属于一个启用的播放组，NLA 和驱动器需先烘焙。F10 后初始自动播放的组从头播放，其余回到停止。该功能已有 Blender、原生控制和隔离编译回归，游戏内动画显示与实际性能仍待验收。详细边界见 [形态动画说明](docs/shape-animation.md)。
 
 导出需要游戏安装路径，请设置 `EFF_RELOAD_GAME` 环境变量指向当前游戏目录；如果输出目录本身位于 `plugin/mods/<Mod>` 下，插件会从目录结构推断游戏目录。插件不保存开发者本机的游戏路径，也不会把固定的 Mod 名称写入代码。
 

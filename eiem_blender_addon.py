@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 41, 0),
+    "version": (0, 42, 0),
     "blender": (5, 0, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
@@ -194,6 +194,7 @@ if __package__:
     from . import eiem_physics_authoring as physics_authoring
     from . import eiem_material_editor as material_editor
     from . import eiem_blender_controls as controls
+    from . import eiem_shape_animation as shape_animation
     from . import eiem_animation as animation_io
 else:
     _release_spec = importlib.util.spec_from_file_location(
@@ -227,6 +228,10 @@ else:
 
 
 if not __package__:
+    _shape_animation_spec = importlib.util.spec_from_file_location("eiem_shape_animation", Path(__file__).with_name("eiem_shape_animation.py"))
+    shape_animation = importlib.util.module_from_spec(_shape_animation_spec)
+    sys.modules[_shape_animation_spec.name] = shape_animation
+    _shape_animation_spec.loader.exec_module(shape_animation)
     _animation_spec = importlib.util.spec_from_file_location(
         "eiem_animation", Path(__file__).with_name("eiem_animation.py"))
     animation_io = importlib.util.module_from_spec(_animation_spec)
@@ -260,6 +265,7 @@ assign_switch_meshes = controls.assign_switch_meshes
 add_switch_members = controls.add_switch_members
 remove_switch_members = controls.remove_switch_members
 create_switch_group = controls.create_switch_group
+restore_mesh_source_binding = controls.restore_mesh_source_binding
 delete_switch_group = controls.delete_switch_group
 mesh_source_identity = controls.mesh_source_identity
 plan_switch_export = controls.plan_switch_export
@@ -3071,6 +3077,28 @@ class EFF_PT_shape_controls(bpy.types.Panel):
         layout.label(text="新增形态键会自动导出为滑块；快捷键按需设置")
 
 
+class EFF_OT_mesh_restore_source(bpy.types.Operator):
+    bl_idname = "eiem.mesh_restore_source"
+    bl_label = "恢复来源绑定"
+    bl_description = "按物体保留的原 Renderer 来源恢复丢失的 Mesh 绑定，不改几何和控制"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = getattr(context, "object", None)
+        return (context.mode == "OBJECT" and obj is not None and obj.type == "MESH"
+                and not obj.data.get("eiem_section"))
+
+    def execute(self, context):
+        try:
+            section = restore_mesh_source_binding(context.object, context.scene)
+            self.report({'INFO'}, "已恢复来源绑定：" + section)
+            return {'FINISHED'}
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+
+
 class EFF_PT_mesh_properties(bpy.types.Panel):
     bl_label = 'EFF 网格'
     bl_idname = "DATA_PT_eiem_properties"
@@ -3082,7 +3110,7 @@ class EFF_PT_mesh_properties(bpy.types.Panel):
     def poll(cls, context):
         obj = getattr(context, "object", None)
         return (obj is not None and obj.type == "MESH" and
-                bool(obj.data.get("eiem_section")))
+                bool(obj.data.get("eiem_section") or obj.get("eiem_render_section")))
 
     def draw(self, context):
         layout = self.layout
@@ -3090,6 +3118,9 @@ class EFF_PT_mesh_properties(bpy.types.Panel):
         layout.use_property_decorate = False
         obj = context.object
         mesh = obj.data
+        if not mesh.get("eiem_section"):
+            layout.label(text="Mesh 数据块缺少来源绑定", icon="ERROR")
+            layout.operator("eiem.mesh_restore_source", icon="FILE_REFRESH")
 
         # Logical paths and selectors are placed first because they are the
         # only identity fields an author is expected to inspect or change.
@@ -3510,6 +3541,10 @@ class EFF_PT_switches(bpy.types.Panel):
         layout.use_property_split = False
         layout.use_property_decorate = False
         layout.operator("eiem.switch_create", icon="ADD")
+        obj = getattr(context, "object", None)
+        if obj is not None and obj.type == "MESH" and not obj.data.get("eiem_section"):
+            layout.label(text=obj.name + " 缺少来源绑定", icon="ERROR")
+            layout.operator("eiem.mesh_restore_source", icon="FILE_REFRESH")
         draw_eiem_rna_property(layout, context.scene, "eiem_switch_active", "当前组", factor=0.3)
         groups = switch_groups(context.scene)
         if groups:
@@ -3694,7 +3729,7 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
     resource_scope: EnumProperty(
         name='导出资源', default='ALL',
         items=(('ALL', '全部资源', '导出所选网格及其材质、贴图、控制配置'),
-               ('MESH', '仅 Mesh', '更新已有 Mod 中所选网格的几何、骨骼与形态数据'),
+               ('MESH', '仅 Mesh', '更新已有 Mod 中所选网格的几何、骨骼、形态和形态动画'),
                ('MATERIALS', '仅材质与贴图', '更新所选网格引用的材质、贴图及 INI 声明'),
                ('TEXTURES', '仅贴图', '读取最新图片，更新贴图及绑定声明')))
     include_switches: BoolProperty(
@@ -3932,6 +3967,7 @@ classes = (
     EFF_OT_export_mesh_only,
     EFF_PT_material_properties,
     EFF_PT_mesh_properties,
+    EFF_OT_mesh_restore_source,
     EFF_PT_image_properties,
 )
 
@@ -3945,6 +3981,7 @@ def register():
         bpy.app.handlers.load_post.append(_eiem_export_load_post)
     for cls in classes: bpy.utils.register_class(cls)
     material_editor.register()
+    shape_animation.register(sys.modules[__name__])
     physics_authoring.register(globals())
     bpy.types.Mesh.eiem_shape_controls = CollectionProperty(type=EFF_PG_shape_control)
     bpy.types.Collection.eiem_switch_state_index = IntProperty(
@@ -3970,6 +4007,7 @@ def unregister():
         bpy.app.handlers.load_post.remove(_eiem_export_load_post)
     _eiem_export_load_post(None)
     physics_authoring.unregister()
+    shape_animation.unregister()
     material_editor.unregister()
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_export)

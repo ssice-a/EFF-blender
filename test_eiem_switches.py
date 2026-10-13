@@ -77,6 +77,59 @@ for part in (top, accessory):
     assert part["eiem_bone_palette_json"] == "[1,2,3]"
     assert [g.name for g in part.vertex_groups] == ["Root", "Tip", "Unused"]
 
+# Object provenance can survive a replaced Mesh data-block. Report the exact
+# unbound object and recover only its verified source metadata, with no name
+# matching and no copying another object's geometry/control identities.
+for original in (obj, top, accessory):
+    original["eiem_prefab_path"] = "assets/test/model.prefab"
+broken = top.copy()
+broken.data = top.data.copy()
+assert broken.data["eiem_section"] == top.data["eiem_section"]
+assert broken.data["eiem_source"] == top.data["eiem_source"]
+broken.name = "Renamed_without_source_name"
+bpy.context.scene.collection.objects.link(broken)
+for property_name in list(broken.data.keys()):
+    del broken.data[property_name]
+geometry = [tuple(vertex.co) for vertex in broken.data.vertices]
+collections_before = set(bpy.data.collections)
+try:
+    addon.create_switch_group("Must_not_create", "F24", [top, broken])
+    raise AssertionError("unbound selected Mesh was accepted")
+except ValueError as error:
+    assert broken.name in str(error) and "来源绑定" in str(error)
+assert set(bpy.data.collections) == collections_before
+assert addon.restore_mesh_source_binding(broken) == "MeshSource"
+assert [tuple(vertex.co) for vertex in broken.data.vertices] == geometry
+assert broken.data.get("eiem_control_id") is None
+assert broken.data["eiem_source"] == top.data["eiem_source"]
+assert broken.data["eiem_coordinate_space"] == top.data["eiem_coordinate_space"]
+restored_group = addon.create_switch_group("Restored source", "F24", [broken])
+addon.delete_switch_group(restored_group)
+for property_name in list(broken.data.keys()):
+    del broken.data[property_name]
+broken["eiem_render_section"] = "UnrelatedRenderer"
+try:
+    addon.restore_mesh_source_binding(broken)
+    raise AssertionError("missing exact source was guessed from Mesh name")
+except ValueError:
+    pass
+assert not broken.data.keys()
+broken["eiem_render_section"] = top["eiem_render_section"]
+conflict = top.copy()
+conflict.data = top.data.copy()
+bpy.context.scene.collection.objects.link(conflict)
+conflict.data["eiem_source"] = "assets/test/another.asset"
+try:
+    addon.restore_mesh_source_binding(broken)
+    raise AssertionError("conflicting source candidates were accepted")
+except ValueError:
+    pass
+assert not broken.data.keys()
+for temporary in (broken, conflict):
+    temporary_mesh = temporary.data
+    bpy.data.objects.remove(temporary, do_unlink=True)
+    bpy.data.meshes.remove(temporary_mesh)
+
 accessory.shape_key_add(name="Basis")
 shape = accessory.shape_key_add(name="StockingBlend")
 shape.data[0].co.z += .1

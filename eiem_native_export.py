@@ -410,6 +410,23 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
                 nativeTypeHash=native['native']['typeHash'], textureEdits=edits,
                 fieldData={} if texture_only else material_fields(source.tree(native), overrides, encode))
 
+def _replace_published_file(source, destination):
+    # ReplaceFile preserves the runtime reader's delete-shared old snapshot.
+    # MoveFileEx (used by os.replace) can reject that pinned block-store file.
+    if os.name == 'nt' and Path(destination).is_file():
+        import ctypes
+        from ctypes import wintypes
+        api = ctypes.WinDLL('kernel32', use_last_error=True)
+        api.ReplaceFileW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                    wintypes.LPCWSTR, wintypes.DWORD,
+                                    ctypes.c_void_p, ctypes.c_void_p]
+        api.ReplaceFileW.restype = wintypes.BOOL
+        if not api.ReplaceFileW(str(destination), str(source), None, 0, None, None):
+            raise OSError(ctypes.get_last_error(), 'Mod 文件原子发布失败：' + str(destination))
+    else:
+        os.replace(source, destination)
+
+
 def publish(staging, destination, reader):
     staging = Path(staging).resolve()
     destination = Path(destination).resolve()
@@ -475,7 +492,7 @@ def publish(staging, destination, reader):
         for name in sorted(changed, key=lambda value: (value == 'mod.ini', value)):
             output = destination/name
             output.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(pending/'new'/name, output)
+            _replace_published_file(pending/'new'/name, output)
             applied.append(name)
         return reader(destination)
     except Exception as error:
@@ -483,7 +500,7 @@ def publish(staging, destination, reader):
             for name in reversed(applied):
                 saved = backup/name
                 if saved.is_file():
-                    os.replace(saved, destination/name)
+                    _replace_published_file(saved, destination/name)
                 else:
                     (destination/name).unlink()
         except Exception as rollback:
@@ -535,7 +552,7 @@ def _detach_staging_files(paths):
         try:
             shutil.copy2(path, temporary)
             os.chmod(temporary, os.stat(temporary).st_mode | stat.S_IWRITE)
-            os.replace(temporary, path)
+            _replace_published_file(temporary, path)
         finally:
             try:
                 os.unlink(temporary)
@@ -616,9 +633,9 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
     if resource_scope != 'ALL' and existing_ini is None:
         raise ValueError('部分导出需要已有的完整 Mod；首次请选择全部资源')
     if __package__:
-        from .eiem_offline_reload import reload_context, compile_reload, prepare_static_sources
+        from .eiem_offline_reload import reload_context, compile_reload, prepare_static_sources, publish_reload
     else:
-        from eiem_offline_reload import reload_context, compile_reload, prepare_static_sources
+        from eiem_offline_reload import reload_context, compile_reload, prepare_static_sources, publish_reload
     offline_context = reload_context(destination)
     if offline_context is None:
         raise ValueError('完整原生导出需要离线编译目标：请设置 EFF_RELOAD_GAME，或直接导出到游戏 plugin/mods/<Mod>，并提供经过结构校验的静态来源输入')
@@ -669,12 +686,14 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                      stateValues=addon.switch_state_values(group), default=default)
                 for group, states, default, key, var in plan['groups']]
     controls_by_object = {}
-    if not mesh_only and resource_scope == 'ALL':
+    clips_by_object = {}
+    if resource_scope in {'ALL', 'MESH'}:
         originals = {addon.mesh_export_template(view) for view in plan['objects']
                      if view not in plan['hidden']}
         # This is the same author-side validator the controls panels use. It
         # validates shared channels and ranges before any
         # resource files are written.
+        clips_by_object = {original.as_pointer(): addon.shape_animation.export_clips(original, addon, include_switches) for original in originals}
         _, _, hotkeys = addon.plan_shape_controls(list(originals),
                                                  include_hotkeys=include_switches)
         controls_by_object = {original.as_pointer(): shape_controls(addon, original, include_switches)
@@ -742,6 +761,7 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                                           indices=len(author['indices']),bonePaths=author['bone_paths'],
                                           shapeNames=[c[0] for c in author['blend_channels']],shapeControls=controls,
                                           shapeOwner=str(original.data.get('eiem_control_id', '')),
+                                          shapeAnimations=clips_by_object.get(identity, []),
                                           visibilityBindings=plan['bindings'].get(view,[]),
                                           nativeTypeHash=target['native']['typeHash'],
                                           fieldData=fields))
@@ -829,13 +849,15 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                         textures=list(textures.values()),texture_only=resource_scope == 'TEXTURES',
                         resource_cache=resource_cache)
         author_done = time.perf_counter()
+        _detach_staging_files([staging / 'compiled.bin', staging / 'source-inputs.bin'])
         source_index = prepare_static_sources(staging, source.package, offline_context, previous=destination)
         prior_compiled = destination / 'compiled.bin'
         if prior_compiled.is_file() and not (staging / 'compiled.bin').is_file():
             shutil.copyfile(prior_compiled, staging / 'compiled.bin')
         offline = compile_reload(staging, offline_context, previous=destination, source_index=source_index)
         compile_done = time.perf_counter()
-        package=publish(staging,destination,read_package)
+        package, offline = publish_reload(staging, destination,
+            lambda: publish(staging,destination,read_package), offline_context, source_index, offline)
         texture_paths = modules['ini_package'].ini_document(destination)
         written_texture_files = {texture_paths[section]['path'] for section in texture_paths
                                  if section in textures and textures[section].get('_written', True)}

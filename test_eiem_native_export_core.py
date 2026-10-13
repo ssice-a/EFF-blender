@@ -57,6 +57,29 @@ def addon_function(name, namespace):
 
 
 class NativeExportCoreTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', 'Windows pinned runtime snapshot')
+    def test_atomic_publication_keeps_pinned_old_runtime_file_readable(self):
+        import ctypes
+        from ctypes import wintypes
+        api=ctypes.WinDLL('kernel32',use_last_error=True)
+        api.CreateFileW.argtypes=[wintypes.LPCWSTR,wintypes.DWORD,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD,wintypes.DWORD,wintypes.HANDLE]
+        api.CreateFileW.restype=wintypes.HANDLE
+        api.ReadFile.argtypes=[wintypes.HANDLE,ctypes.c_void_p,wintypes.DWORD,ctypes.POINTER(wintypes.DWORD),ctypes.c_void_p]
+        api.CloseHandle.argtypes=[wintypes.HANDLE]
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);old=root/'compiled.bin';new=root/'new.bin'
+            old.write_bytes(b'old pinned PFB');new.write_bytes(b'new author and PFB')
+            handle=api.CreateFileW(str(old),0x80000000,7,None,3,0x80,None)
+            self.assertNotEqual(handle,ctypes.c_void_p(-1).value)
+            try:
+                exporter._replace_published_file(new,old)
+                self.assertEqual(old.read_bytes(),b'new author and PFB')
+                data=ctypes.create_string_buffer(64);count=wintypes.DWORD()
+                self.assertTrue(api.ReadFile(handle,data,64,ctypes.byref(count),None))
+                self.assertEqual(data.raw[:count.value],b'old pinned PFB')
+            finally:
+                api.CloseHandle(handle)
+
     def test_mesh_part_ids_keep_unicode_names_distinct_and_stable(self):
         names = ['MeshS_actor_liino_cloth_02_lod0_3.丝袜上',
                  'MeshS_actor_liino_cloth_02_lod0_3.丝袜下']

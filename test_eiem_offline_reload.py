@@ -6,6 +6,10 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 import unittest
+import hashlib
+import struct
+import os
+import subprocess
 
 spec=importlib.util.spec_from_file_location('eiem_offline_reload',Path(__file__).with_name('eiem_offline_reload.py'))
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
@@ -15,7 +19,8 @@ class OfflineExportTests(unittest.TestCase):
         return dict(format=module.EXPECTED_PROTOCOL, compiledMod=module.COMPILED_MOD,
                     staticSourceInputs=module.STATIC_SOURCE_INPUTS,
                     sourcePreparation='in-process/index-vfs+author-declarations',
-                    structures=dict(module.STRUCTURES),compiler='arbitrary-label',abi=999)
+                    structures=dict(module.STRUCTURES),compiler='arbitrary-label',abi=999,
+                    compiledExportCarryover=module.EXPORT_CARRYOVER)
 
     def test_compile_only_requested_staged_mod(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -43,13 +48,80 @@ class OfflineExportTests(unittest.TestCase):
                     if command[-1]=='--protocol':
                         return SimpleNamespace(returncode=0,stdout=json.dumps(declaration),stderr='')
                     expected=[str(game/'compiler'),'--export-mod',str(stage.resolve()),str(game)]
-                    if support=='validated-previous-mod':expected+=['--previous-mod',str(previous.resolve())]
+                    expected+=['--previous-mod',str(previous.resolve())]
                     self.assertEqual(command,expected)
                     (stage/'compiled.bin').write_bytes(b'new result')
                     return SimpleNamespace(returncode=0,stdout='COMPILED-MOD-PUBLISHED',stderr='')
                 with patch.object(module.subprocess,'run',side_effect=invoke):
                     module.compile_reload(stage,(game/'compiler',None,None,game),previous=previous)
                 self.assertEqual(prior.read_bytes(),b'previous result')
+
+    def test_old_cache_capability_does_not_excuse_lost_discoveries(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);stage=root/'stage';stage.mkdir();prior=root/'prior';prior.mkdir()
+            (prior/'compiled.bin').write_bytes(b'published additions')
+            declaration=self.protocol();declaration.pop('compiledExportCarryover')
+            declaration['compiledCacheInputs']='validated-previous-mod'
+            with patch.object(module.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=json.dumps(declaration),stderr='')) as run:
+                with self.assertRaisesRegex(ValueError,'继承'):
+                    module.compile_reload(stage,(root/'compiler',None,None,root),previous=prior)
+                self.assertEqual(run.call_count,1)
+            self.assertEqual((prior/'compiled.bin').read_bytes(),b'published additions')
+
+    def test_concurrent_addition_is_recompiled_before_publish(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);published=root/'published';published.mkdir();stage=root/'stage';stage.mkdir()
+            path=published/'compiled.bin';path.write_bytes(b'PFB-A')
+            first={'offlinePreviousRevision':module.published_revision(published)}
+            path.write_bytes(b'PFB-A+PFB-B')
+            events=[]
+            def compile_current(*args,**kwargs):
+                events.append('compile')
+                (stage/'compiled.bin').write_bytes(path.read_bytes()+b'+new Mesh')
+                return {'offlinePreviousRevision':module.published_revision(published)}
+            def publish():
+                events.append('publish')
+                self.assertEqual((stage/'compiled.bin').read_bytes(),b'PFB-A+PFB-B+new Mesh')
+                return 'committed'
+            with patch.object(module,'compile_reload',side_effect=compile_current):
+                result,receipt=module.publish_reload(stage,published,publish,None,None,first)
+            self.assertEqual(result,'committed');self.assertEqual(events,['compile','publish'])
+
+    def test_continuous_concurrent_changes_keep_old_publication(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);path=root/'compiled.bin';path.write_bytes(b'latest')
+            with patch.object(module,'compile_reload',return_value={'offlinePreviousRevision':('stale',)}) as compile_current:
+                with self.assertRaisesRegex(ValueError,'未发布'):
+                    module.publish_reload(root,root,lambda:self.fail('stale state was published'),None,None,{'offlinePreviousRevision':None})
+                self.assertEqual(compile_current.call_count,2)
+            self.assertEqual(path.read_bytes(),b'latest')
+
+    def test_block_revision_reads_committed_index_and_ignores_tail(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);path=root/'compiled.bin';index=b'validated index'
+            slot=struct.pack('<QQQ',7,192,len(index))+hashlib.sha256(index).digest()
+            slot+=hashlib.sha256(slot).digest()
+            path.write_bytes(b'EFF_MOD_BLOCKS/1'+bytes(88)+slot+index)
+            before=module.published_revision(root)
+            self.assertEqual(before[2:4],('blocks',7))
+            with path.open('ab') as stream:stream.write(b'uncommitted data')
+            self.assertEqual(module.published_revision(root),before)
+            corrupted=bytearray(path.read_bytes());corrupted[104+56]^=1;path.write_bytes(corrupted)
+            with self.assertRaisesRegex(ValueError,'代际'):module.published_revision(root)
+
+    @unittest.skipUnless(os.name=='nt' and os.environ.get('EIEM_CARRYOVER_SMOKE'), 'optional real C++ writer fixture')
+    def test_cpp_writer_shares_python_publication_mutex(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);tool=os.environ['EIEM_CARRYOVER_SMOKE'];path=root/'compiled.bin'
+            subprocess.run([tool,'--commit-fixture',str(path)],check=True,capture_output=True)
+            before=module.published_revision(root)
+            with module.publication_lock(root):
+                process=subprocess.Popen([tool,'--commit-fixture',str(path)],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                with self.assertRaises(subprocess.TimeoutExpired):process.communicate(timeout=0.15)
+                self.assertEqual(module.published_revision(root),before)
+            output,error=process.communicate(timeout=5)
+            self.assertEqual(process.returncode,0,error);self.assertIn(b'COMMITTED 2',output)
+            self.assertEqual(module.published_revision(root)[3],2)
 
     def test_game_and_workspace_exports_use_addon_compiler_only(self):
         with tempfile.TemporaryDirectory() as folder:
