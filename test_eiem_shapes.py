@@ -113,11 +113,8 @@ copy.data["eiem_target_asset"] = "OtherAsset"
 controls, bindings, hotkeys = addon.plan_shape_controls([obj, copy])
 assert len(controls) == 2 and bindings[obj] != bindings[copy]
 copy.data.eiem_shape_controls[0].shape = "Missing"
-try:
-    addon.plan_shape_controls([copy])
-    raise AssertionError("Missing channel accepted")
-except ValueError:
-    pass
+addon.plan_shape_controls([copy])
+assert all(c.shape != "Missing" for c in copy.data.eiem_shape_controls)
 obj.data.shape_keys.use_relative = False
 try:
     addon.export_package(output / "bad", [obj], [])

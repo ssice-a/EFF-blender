@@ -15,6 +15,22 @@ spec=importlib.util.spec_from_file_location('eiem_offline_reload',Path(__file__)
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 
 class OfflineExportTests(unittest.TestCase):
+    def test_shape_animation_requires_shared_channel_playback_capability(self):
+        capability='shared-channel-groups/replace-conflicting-playback'
+        for consumer_capability in (None,capability):
+            with self.subTest(consumer=consumer_capability),tempfile.TemporaryDirectory() as folder:
+                root=Path(folder);stage=root/'stage';stage.mkdir();(stage/'mod.ini').write_text('[ShapeAnimationgroup]\npath=resources/a.bin\n')
+                declaration=self.protocol();declaration['structures'].update(shapeAnimation='sampled-shape-weight-clips/le32/1',shapeAnimationPlayback=capability)
+                consumer=json.loads(json.dumps(declaration));consumer['structures']['shapeAnimationPlayback']=consumer_capability
+                def invoke(command,**kwargs):
+                    if command[-1]=='--protocol':return SimpleNamespace(returncode=0,stdout=json.dumps(declaration),stderr='')
+                    (stage/'compiled.bin').write_bytes(b'new output');return SimpleNamespace(returncode=0,stdout='COMPILED-MOD-PUBLISHED',stderr='')
+                with patch.object(module.subprocess,'run',side_effect=invoke),patch.object(module,'_game_protocol',return_value=consumer):
+                    if consumer_capability:
+                        self.assertTrue(module.compile_reload(stage,(root/'compiler',None,None,root))['offlineReloadPrepared'])
+                    else:
+                        with self.assertRaisesRegex(ValueError,'共享形态频道'):module.compile_reload(stage,(root/'compiler',None,None,root))
+                        self.assertFalse((stage/'compiled.bin').exists())
     def protocol(self):
         return dict(format=module.EXPECTED_PROTOCOL, compiledMod=module.COMPILED_MOD,
                     staticSourceInputs=module.STATIC_SOURCE_INPUTS,

@@ -693,6 +693,7 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
         # This is the same author-side validator the controls panels use. It
         # validates shared channels and ranges before any
         # resource files are written.
+        addon.shape_animation.validate_export_members(originals)
         clips_by_object = {original.as_pointer(): addon.shape_animation.export_clips(original, addon, include_switches) for original in originals}
         _, _, hotkeys = addon.plan_shape_controls(list(originals),
                                                  include_hotkeys=include_switches)

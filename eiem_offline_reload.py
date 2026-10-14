@@ -285,6 +285,9 @@ def compile_reload(destination, context=None, previous=None, source_index=None):
         expected='sampled-shape-weight-clips/le32/1'
         if protocol.get('structures',{}).get('shapeAnimation')!=expected or consumer is not None and consumer.get('structures',{}).get('shapeAnimation')!=expected:
             raise ValueError('当前编译器或游戏 DLL 未声明形态动画支持，请安装配套版本；上一 Mod 保留')
+        playback='shared-channel-groups/replace-conflicting-playback'
+        if protocol.get('structures',{}).get('shapeAnimationPlayback')!=playback or consumer is not None and consumer.get('structures',{}).get('shapeAnimationPlayback')!=playback:
+            raise ValueError('当前编译器或游戏 DLL 未声明多组共享形态频道支持，请更新配套文件；上一 Mod 保留')
     if source_index is not None:
         if protocol.get('sourcePreparation') != SOURCE_PREPARATION:
             raise ValueError('插件缺少支持进程内来源查询的编译器，请安装完整插件包')

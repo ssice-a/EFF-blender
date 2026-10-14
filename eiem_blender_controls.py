@@ -64,7 +64,14 @@ def add_shape_control(obj, name, automatic=False):
 
 
 def sync_new_shape_controls(obj):
+    """Controls follow existing keys, including deletion of the Key datablock."""
     keys = obj.data.shape_keys
+    # Blender keeps Mesh custom properties when keys are removed or a Mesh is
+    # copied. Neither automatic nor explicit controls can outlive their key.
+    names = set(keys.key_blocks.keys()) if keys else set()
+    for index in reversed(range(len(obj.data.eiem_shape_controls))):
+        if obj.data.eiem_shape_controls[index].shape not in names:
+            obj.data.eiem_shape_controls.remove(index)
     if not keys:
         return
     native = {
@@ -74,11 +81,6 @@ def sync_new_shape_controls(obj):
         for frame in channel.get("frames", [])
     }
     declared = {control.shape for control in obj.data.eiem_shape_controls}
-    # Removed automatic channels disappear; explicit broken bindings remain an error.
-    for index in reversed(range(len(obj.data.eiem_shape_controls))):
-        control = obj.data.eiem_shape_controls[index]
-        if control.automatic and control.shape not in keys.key_blocks:
-            obj.data.eiem_shape_controls.remove(index)
     for key in keys.key_blocks:
         if (key != keys.reference_key and key.name not in native
                 and key.name not in declared):
