@@ -1,21 +1,18 @@
-# EFF Blender v0.43.0
+# EFF Blender v0.44.0
 
-配套：[EFF v1.6.0](https://github.com/ssice-a/EFF/releases/tag/v1.6.0)、[AnimeStudio v1.5.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.5.0)。
+配套：[EFF v1.7.0](https://github.com/ssice-a/EFF/releases/tag/v1.7.0)、[AnimeStudio v1.6.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.6.0)。
 
-- 新增统一的 N → EFF → 形态动画组管理面板，无需选中网格即可查看全部组、成员及快捷键。
-- 一个播放组支持多个网格，每个成员独立选择 Action、KEY slot 和频道；组内共用范围、循环、倍率、快捷键与播放时间。预览停止后恢复各成员原动画状态。
-- 同一网格、同一频道可以加入多个播放组。游戏内启动新组会停止共享频道的冲突组；不同频道的组可同时播放。
-- 删除形态键后自动清理失效控制记录，包括复制网格遗留的记录，保留有效控制设置。删除已发布的形态绑定后仍需选择“全部资源”导出。
-- 配套编译器支持原 PFB 与 Mesh 骨骼列表数量不对应时的精确骨架路径绑定，修复这类资源导致的整包导出失败。
+- 接受 AnimeStudio 在原解包目录更新的来源清单、原生模板与当前索引。旧 Blender 工程无需重新导入人物；作者修改的几何、UV、权重、材质参数、形态键和动画继续用于导出。
+- 导出期间与解包器共用来源锁，发布前核对来源是否变化；避免混用新清单和旧快照，来源更新中会明确提示重试。
+- 优先使用重新解包记录的当前索引，避免回到旧父目录索引；原生模板缓存按来源内容失效。
+- 配套编译器支持本次更新的 BLC v5 目录，并依据当前完整索引更新变化/退休来源、覆盖当前命中的 PFB。编译器静态链接 C/C++ 运行实现。
 
-Windows x64 / Blender 5.0，内置依赖使用 Python 3.11，已在 Blender 5.0.1 验证。保存工程并关闭 Blender 后安装 `EFF_Blender_v0.43.0.zip`；形态动画导出需同时更新 EFF v1.6.0。多网格组导出需选齐成员，NLA/驱动器仍需先烘焙。
+使用：保存工程并关闭 Blender 后安装 `EFF_Blender_v0.44.0.zip`。游戏更新后，用 AnimeStudio 重新打开当前游戏与原工作区、更新原解包资源，再打开原工程正常导出；首次更新建议选择“全部资源”。此作者流程不需要 EFF 修复工具。
 
-真实 Blender 的组管理、成员/slot/频道、预览恢复和删除形态键回归通过，含原失败脸部的完整包编译与候选 53 个骨骼引用回读通过。本次不包含骨骼动画播放或完整的游戏更新自动 PFB 适配。游戏内新动画画面和连续 F10 最终验收仍待完成。
+Windows x64 / Blender 5.0 / Python 3.11，已在 Blender 5.0.1 验证。真实庄方宜旧工程 body 网格使用新来源隔离导出成功，原工程文件摘要未变；来源变化、缓存、离线调用与发布回归通过。不将此样本解释为所有骨架、Shader 或游戏画面已验收。
 
 ## English
 
-The unified Shape Animation Group Manager supports multi-mesh groups, per-member Actions/KEY slots/channels, shared playback settings and synchronized previews with state restoration. A mesh or channel may belong to several groups; the paired runtime replaces conflicting playback while allowing disjoint groups to run together.
+Existing Blender projects can export against sources refreshed in place by AnimeStudio. Export locks and manifest validation keep source snapshots consistent, and the refreshed source package selects its current asset index. Author geometry, UVs, weights, materials, Shape Keys and animation remain in the original project.
 
-Deleted Shape Keys no longer leave stale export controls. The bundled compiler resolves mismatched native bone palettes through exact hierarchy bindings. Removing published shape bindings still requires a full export.
-
-Windows x64 / Blender 5.0 with Python 3.11, tested on 5.0.1. Save your work and close Blender before installation; pair with EFF v1.6.0. Export all group members together and bake NLA/drivers first. Automated Blender and isolated real-resource validation passed; final in-game visual checks remain pending.
+The paired compiler supports BLC v5 and current-index source relocation, retirement and Prefab consumer discovery. Save and close Blender before installing. Refresh sources in AnimeStudio, then export from the existing project; the separate Mod repair tool is optional. Windows x64 / Blender 5.0 / Python 3.11, tested on 5.0.1.

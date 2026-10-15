@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import types
+import contextlib
 
 
 # Native partial exports used to rebuild the Blender snapshot on every click,
@@ -592,7 +593,22 @@ def _partial_output_paths(staging, resource_scope, existing_ini, materials,
 def export_native_package(*args, **kwargs):
     cache = {'__frozen_files__': {}}
     try:
-        return _export_native_package(*args, resource_cache=cache, **kwargs)
+        objects = list(kwargs.get('mesh_objects', args[2] if len(args) > 2 else []))
+        if len(args) > 2:
+            args = (*args[:2], objects, *args[3:])
+        else:
+            kwargs['mesh_objects'] = objects
+        configured = kwargs.get('source_baseline', args[8] if len(args) > 8 else '')
+        primary = baseline_for(objects, configured)
+        packages = {primary}
+        packages.update(Path(slot.material.get('eiem_author_package')).resolve()
+                        for obj in objects for slot in obj.material_slots
+                        if slot.material and slot.material.get('eiem_author_package'))
+        modules, _ = pack_modules()
+        with contextlib.ExitStack() as locks:
+            for package in sorted(packages, key=lambda p: str(p).casefold()):
+                locks.enter_context(modules['author_source'].source_read_lock(package))
+            return _export_native_package(*args, resource_cache=cache, **kwargs)
     finally:
         for stream, _signature, _result in cache['__frozen_files__'].values():
             stream.close()
@@ -857,6 +873,9 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
             shutil.copyfile(prior_compiled, staging / 'compiled.bin')
         offline = compile_reload(staging, offline_context, previous=destination, source_index=source_index)
         compile_done = time.perf_counter()
+        source.assert_current()
+        for material_baseline in material_sources.values():
+            material_baseline.assert_current()
         package, offline = publish_reload(staging, destination,
             lambda: publish(staging,destination,read_package), offline_context, source_index, offline)
         texture_paths = modules['ini_package'].ini_document(destination)

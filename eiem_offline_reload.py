@@ -259,6 +259,14 @@ def prepare_static_sources(destination, source_package, context, previous=None):
     index = Path(configured).resolve() if configured else None
     source_package = Path(source_package).resolve()
     if index is None:
+        manifest_path = source_package / 'source/manifest.json'
+        if manifest_path.is_file():
+            current = json.loads(manifest_path.read_text('utf-8-sig')).get('sourceIndex')
+            if current:
+                index = Path(current).resolve()
+                if not index.is_file():
+                    raise ValueError('重新解包记录的来源索引已不存在，请在 AnimeStudio 重新打开对应工作区：' + str(index))
+    if index is None:
         for parent in (source_package, *source_package.parents):
             candidate = parent / 'index/endfield_assets.eidx'
             if candidate.is_file():

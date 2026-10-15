@@ -15,6 +15,18 @@ spec=importlib.util.spec_from_file_location('eiem_offline_reload',Path(__file__)
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 
 class OfflineExportTests(unittest.TestCase):
+    def test_reextracted_source_uses_its_current_index_before_old_parent_workspace(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);source=root/'assets/character.eff';(source/'source').mkdir(parents=True)
+            old=root/'index/endfield_assets.eidx';old.parent.mkdir();old.write_bytes(b'old index')
+            current=root/'current/index.eidx';current.parent.mkdir();current.write_bytes(b'current index')
+            (source/'source/manifest.json').write_text(json.dumps(dict(sourceIndex=str(current))))
+            with patch.dict(os.environ,{},clear=True):
+                self.assertEqual(module.prepare_static_sources(root/'stage',source,None),current.resolve())
+                current.unlink()
+                with self.assertRaisesRegex(ValueError,'来源索引已不存在'):
+                    module.prepare_static_sources(root/'stage',source,None)
+
     def test_shape_animation_requires_shared_channel_playback_capability(self):
         capability='shared-channel-groups/replace-conflicting-playback'
         for consumer_capability in (None,capability):

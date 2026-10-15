@@ -335,6 +335,25 @@ class NativeExportCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'source snapshot hash'):
             exporter.native_mesh_fields(modules, source, target, edited, edited, 0, 'Mesh', encode)
 
+    def test_reextracted_source_rebinds_objects_and_rejects_mid_export_change(self):
+        module = exporter.pack_modules()[0]['author_source']
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder);(root/'source').mkdir()
+            path = root/'source/manifest.json'
+            row = dict(type='Mesh', logicalPath='assets/body.mesh', name='Body',
+                       identity='old:1', native=dict(cab='old', pathId=1))
+            manifest = dict(format='EFFSOURCE', serializedFiles=[], resources=[row])
+            path.write_text(json.dumps(manifest))
+            original = module.AuthorSource(root, None)
+            self.assertEqual(original.resolve('Mesh', 'assets/body.mesh', 'Body')['native']['pathId'], 1)
+            row.update(identity='new:2', native=dict(cab='new', pathId=2))
+            path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, '导出期间发生更新'):
+                original.assert_current()
+            refreshed = module.AuthorSource(root, None)
+            self.assertEqual(refreshed.resolve('Mesh', 'assets/body.mesh', 'Body')['native'], dict(cab='new', pathId=2))
+            refreshed.assert_current()
+
     def test_material_uses_its_own_source_and_reuses_loaded_package(self):
         class Source:
             def __init__(self, package, core):
