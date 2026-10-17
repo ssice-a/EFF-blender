@@ -1,0 +1,98 @@
+name: Complete Blender package
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        type: string
+        required: true
+      tag:
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Read exact source and pinned native framework
+        id: source
+        shell: pwsh
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          $revision = git rev-parse HEAD
+          "revision=$revision" >> $env:GITHUB_OUTPUT
+          $framework = (Get-Content native-base.json -Raw | ConvertFrom-Json).framework
+          "framework=$framework" >> $env:GITHUB_OUTPUT
+          $archive = if ($env:REQUESTED_TAG) { "EFF_Blender_$env:REQUESTED_TAG.zip" } else { "EFF_Blender_main-$revision.zip" }
+          "archive=$archive" >> $env:GITHUB_OUTPUT
+          python -c "import ast,os; d=ast.parse(open('__init__.py',encoding='utf-8').read()); info=next(ast.literal_eval(n.value) for n in d.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='bl_info' for t in n.targets)); expected='v'+'.'.join(map(str,info['version'])); assert not os.environ['REQUESTED_TAG'] or os.environ['REQUESTED_TAG']==expected, (os.environ['REQUESTED_TAG'],expected)"
+          if ($LASTEXITCODE -ne 0) { throw 'Source tag/version differs' }
+      - uses: actions/checkout@v4
+        with:
+          repository: ssice-a/EFF
+          ref: ${{ steps.source.outputs.framework }}
+          path: framework
+      - name: Install test dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --only-binary=:all: numpy Pillow==12.3.0
+          if ($LASTEXITCODE -ne 0) { throw 'Test dependencies failed' }
+      - name: Assemble complete package with verified existing native tools
+        shell: pwsh
+        run: |
+          python ci/package_update.py --output dist/update --revision '${{ steps.source.outputs.revision }}' --name '${{ steps.source.outputs.archive }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Complete package validation failed' }
+      - name: Verify pushed source against paired author contracts
+        shell: pwsh
+        run: |
+          python -m compileall -q .
+          if ($LASTEXITCODE -ne 0) { throw 'Python syntax failed' }
+          New-Item -ItemType Directory -Force framework/tools/Blender | Out-Null
+          Copy-Item *.py -Destination framework/tools/Blender
+          Copy-Item dist/update/package/EFF_Blender/nativepack -Destination framework/tools/Blender/nativepack -Recurse
+          $testTemp = Join-Path $pwd '.author-test-temp'
+          New-Item -ItemType Directory -Force $testTemp | Out-Null
+          $env:TEMP = $testTemp
+          $env:TMP = $testTemp
+          $env:PYTHONPATH = "$pwd/framework/tools/Blender;$pwd/framework/tools"
+          Push-Location framework
+          python -m unittest test_eiem_native_export_core test_eiem_native_publish test_eiem_offline_reload test_eiem_release test_eiem_shape_animation_package test_eiem_material_features test_eiem_update
+          $result = $LASTEXITCODE
+          Pop-Location
+          if ($result -ne 0) { throw 'Author/update contracts failed' }
+      - name: Publish tested repository update
+        if: inputs.mode == 'continuous'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view continuous --repo '${{ github.repository }}' *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create continuous --repo '${{ github.repository }}' --target '${{ steps.source.outputs.revision }}' --prerelease --latest=false --title 'Blender repository updates' --notes 'Automatically tested complete add-ons from main. Each archive and its build receipt identify the exact source commit; the continuous tag is a channel marker. Formal stable releases remain separate.'
+            if ($LASTEXITCODE -ne 0) { throw 'Update channel creation failed' }
+          }
+          gh release upload continuous 'dist/update/${{ steps.source.outputs.archive }}' --repo '${{ github.repository }}' --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Update package upload failed' }
+          gh release upload continuous dist/update/eff-blender-update.json --repo '${{ github.repository }}' --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Update catalog publication failed' }
+      - name: Prepare stable Release draft
+        if: inputs.mode == 'stable'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          draft: true
+          files: dist/update/${{ steps.source.outputs.archive }}
+          body_path: RELEASE_NOTES.md

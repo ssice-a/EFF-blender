@@ -1,15 +1,16 @@
-# EFF Blender v0.45.0
+# EFF Blender v0.46.0
 
-配套：[EFF v1.8.0](https://github.com/ssice-a/EFF/releases/tag/v1.8.0)、[AnimeStudio v1.7.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.7.0)。
+配套：[EFF v1.8.1](https://github.com/ssice-a/EFF/releases/tag/v1.8.1)、[AnimeStudio v1.7.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.7.0)。
 
-- 游戏小更新导致索引过期时，自动调用插件自带的离线索引工具：复用未变 Bundle，只解析变化/新增内容，再继续本次导出。相同基线后续不重复刷新，无需运行 AnimeStudio 或重新导入工程。
-- 工具自带运行环境，完整索引仍在作者工作区，不随插件或 Mod 分发；游戏/工作区位置来自用户设置与解包清单，没有固定盘符。搬动工作区后，清单中旧绝对索引路径仍可能需要重新定位。
-- 优化 Mesh 快照失效粒度、历史缓存占用、形态/面槽位读取、材质字段和磁盘图片解码；实际几何、权重、静态骨架、形态、材质槽和图片内容改变仍会更新。
-- 修复游戏自带形态帧与频道身份不一致导致导出拒绝；导出窗口可选择并记住游戏目录，允许导出到任意制作目录。
-- 明确区分来源被其他导出或解包更新占用。与解包器保持完整性锁，失败保留上一 Mod。
+- 材质按表面透明、PBR／法线、Ramp、清漆、边缘光、自发光、角色 VFX、视差和描边分组；功能开关联动 Shader 关键字，不再手填字符串。
+- 所有已绑定贴图集中顶部；开启功能时自动显示其已声明空槽，关闭功能保留设置并隐藏参数。保留完整原始参数入口与未知 Shader 原始编辑。
+- 透明模式下拉框同步裁剪／预乘混合、实际队列和标签，保留作者当前深度写入、双面及贴图选择；呼吸联动自发光与角色 VFX。
+- 新增仓库更新：main 推送通过自动测试后生成完整更新包，插件按提交 SHA 检查，无需作者每次手动发布 Release 或升版本号。仍可切换为仅检查正式 Release。
+- 用户点击“下载并准备更新”后先校验大小、SHA256、包内文件及来源身份；保存工程并关闭全部 Blender 后自动安装，保留完整旧插件备份。不会自动关闭／保存工程、改游戏 DLL 或 Mod；开发用源码链接不自动覆盖。
+- Python／UI 更新复用已验证的 v0.45.0 原生基础包，完整包含编译器、索引刷新器、作者核心和依赖。未改变离线包协议或 DLL；原生组件变化时需维护者另行构建配套基础包。
 
-关闭 Blender 后安装完整 ZIP，再打开原工程。Windows x64 / Blender 5.0，已在 5.0.1 验证。固定十网格全部导出，单顶点编辑约 11.32 → 10.23 秒、不变重导约 5.76 → 5.08 秒，作者及编译产物逐文件一致；机器负载不同会影响耗时。几何变化仍完整离线编译。新增索引工具约 43 MiB，不包含 831 MB 工作区索引。
+旧版用户需先安装本次完整 ZIP，才能使用新更新器。Windows x64 / Blender 5.0 / Python 3.11，已在 Blender 5.0.1 验证。角色效果组合仍受游戏 Shader 变体限制，编辑器设置与实际游戏视觉验收不同。
 
 ## English
 
-Automatically refreshes a stale workspace index with the bundled offline updater and retries the same staged export once. Unchanged Bundle records are reused; new/changed content is parsed and retired content removed. Includes more precise Mesh snapshot invalidation, bounded history, material/bitmap reuse, native shape-frame identity fixes, and a persistent game-folder picker. Save and close Blender before installing the complete archive. No external AnimeStudio installation or .NET runtime is required for the updater.
+Adds grouped material controls with paired Shader keywords, centralized texture paths and automatic declared empty slots. Adds opt-in installation from automatically tested main-branch packages, identified by source commit rather than version bumps. Downloads and validates a complete package, waits until all Blender processes close, then replaces the add-on with a full rollback backup. Stable Release checks remain available. Existing users must install this archive once to obtain the updater. Native tools are reused from an explicitly pinned, verified full base package; no game DLL or Mod changes are included.

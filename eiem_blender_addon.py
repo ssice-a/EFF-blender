@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 45, 0),
+    "version": (0, 46, 0),
     "blender": (5, 0, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
@@ -20,6 +20,7 @@ import math
 import uuid
 import importlib.util
 import threading
+import subprocess
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
@@ -3648,24 +3649,33 @@ class EFF_PT_switches(bpy.types.Panel):
 
 
 def draw_update_status(layout):
+    prefs = _addon_preferences(bpy.context)
+    if prefs is not None:
+        layout.prop(prefs, 'update_channel', text='更新来源')
     row = layout.row(align=True)
-    row.enabled = _update_state["status"] != "checking"
+    row.enabled = _update_state["status"] not in ('checking', 'downloading', 'prepared')
     row.operator("eiem.check_update", text="检查更新", icon="FILE_REFRESH")
     status = _update_state["status"]
     if status == "checking":
-        layout.label(text="正在检查 GitHub Release...")
+        layout.label(text="正在检查更新…")
     elif status == "latest":
         layout.label(text="已是最新版本")
     elif status == "available":
-        layout.label(text="发现新版本 " + _update_state["tag"])
+        layout.label(text=_update_state.get('label') or "发现新版本 " + _update_state["tag"])
         row = layout.row(align=True)
-        row.operator("eiem.open_update_release", text='查看 Release', icon="URL")
-        row.operator("eiem.open_update_release", text="查看 Release", icon="URL")
+        if _update_state.get('channel') == 'MAIN':
+            row.operator('eiem.install_update', text='下载并准备更新', icon='IMPORT')
+        row.operator("eiem.open_update_release", text='查看更改', icon="URL")
     elif status == "ignored":
         layout.label(text="已忽略 " + _update_state["tag"])
         layout.operator("eiem.check_update", text="仍要查看此版本").force = True
     elif status == "error":
-        layout.label(text="妫€鏌ュけ璐ワ細" + _update_state["message"], icon="ERROR")
+        layout.label(text="更新失败：" + _update_state["message"], icon="ERROR")
+    elif status == 'downloading':
+        layout.label(text=_update_state.get('message') or '正在下载并校验更新包…')
+    elif status == 'prepared':
+        layout.label(text='更新已校验，保存工程后关闭全部 Blender')
+        layout.label(text='关闭后自动安装并备份，下次启动生效')
 
 
 class EFF_PT_updates(bpy.types.Panel):
@@ -3987,6 +3997,9 @@ class EFF_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = (__package__ or __name__).split(".")[0]
 
     ignored_release_tag: StringProperty(name="Ignored release", default="")
+    update_channel: EnumProperty(name='更新来源', items=(
+        ('MAIN', '仓库更新（自动测试）', '跟踪 main 的已通过测试完整更新包，无需作者逐次发布版本'),
+        ('RELEASE', '正式 Release', '只提示正式发布版本，手动下载安装')), default='MAIN')
     game_directory: StringProperty(
         name='游戏目录', subtype='DIR_PATH', default='', update=game_directory_changed,
         description='终末地安装目录（包含 Endfield.exe）；独立于 Mod 导出位置，留空自动识别')
@@ -4008,11 +4021,16 @@ class EFF_OT_check_update(bpy.types.Operator):
         prefs = _addon_preferences(context)
         ignored = prefs.ignored_release_tag if prefs else ""
         force = bool(self.force)
-        _update_state.update(status="checking", tag="", url="", message="")
+        channel = prefs.update_channel if prefs else 'MAIN'
+        directory = Path(__file__).resolve().parent
+        _update_state.update(status="checking", tag="", url="", message="", label='', feed=None, channel=channel)
 
         def work():
             try:
-                result = release_check.check_release(bl_info["version"], ignored, force)
+                result = (release_check.check_repository(directory, bl_info['version'], ignored, force)
+                          if channel == 'MAIN' else release_check.check_release(bl_info['version'], ignored, force))
+                if channel == 'RELEASE':
+                    result['channel'] = 'RELEASE'
                 _update_state.update(result, message="")
             except Exception as error:
                 _update_state.update(status="error", message=str(error)[:120])
@@ -4029,6 +4047,49 @@ class EFF_OT_check_update(bpy.types.Operator):
             return None
 
         bpy.app.timers.register(redraw_when_done, first_interval=0.1)
+        return {'FINISHED'}
+
+
+class EFF_OT_install_update(bpy.types.Operator):
+    bl_idname = 'eiem.install_update'
+    bl_label = '下载并准备 EFF 更新'
+    bl_description = '下载校验完整插件，保存工程并退出全部 Blender 后自动安装，保留旧插件备份'
+
+    def execute(self, context):
+        global _update_worker
+        if _update_state['status'] != 'available' or _update_state.get('channel') != 'MAIN':
+            return {'CANCELLED'}
+        directory = Path(__file__).absolute().parent
+        try:
+            release_check.check_install_target(directory)
+            python = Path(sys.prefix) / 'bin/python.exe'
+            if os.name != 'nt' or not python.is_file():
+                raise ValueError('自动安装需要 Windows Blender 自带的 Python；可从正式 Release 手动安装')
+        except (OSError, ValueError) as error:
+            self.report({'ERROR'}, str(error)); return {'CANCELLED'}
+        feed = dict(_update_state['feed'])
+        _update_state.update(status='downloading', message='正在下载并校验更新包…')
+
+        def work():
+            try:
+                def progress(done, total):
+                    _update_state['message'] = '下载更新 %.1f / %.1f MB' % (done / 1048576, total / 1048576)
+                job = release_check.prepare_update(directory, feed, progress=progress)
+                with (job.parent / 'install.log').open('wb') as log:
+                    subprocess.Popen([str(python), str(job.parent / 'eiem_update_worker.py'), str(job)],
+                                     cwd=job.parent, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                     creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), close_fds=True)
+                _update_state.update(status='prepared', message='', job=str(job))
+            except Exception as error:
+                _update_state.update(status='error', message=str(error)[:180])
+        _update_worker = threading.Thread(target=work, name='EFF update download', daemon=True)
+        _update_worker.start()
+        def redraw():
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    area.tag_redraw()
+            return 0.25 if _update_state['status'] == 'downloading' else None
+        bpy.app.timers.register(redraw, first_interval=0.1)
         return {'FINISHED'}
 
 
@@ -4071,6 +4132,7 @@ classes = (
     EFF_AddonPreferences,
     EFF_OT_detect_game_directory,
     EFF_OT_check_update,
+    EFF_OT_install_update,
     EFF_OT_open_update_release,
     EFF_OT_ignore_update_release,
     EFF_OT_import_material,

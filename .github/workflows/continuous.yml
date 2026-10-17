@@ -1,0 +1,19 @@
+name: Repository update
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: blender-main-update
+  cancel-in-progress: false
+
+jobs:
+  package:
+    uses: ./.github/workflows/package.yml
+    with:
+      mode: continuous

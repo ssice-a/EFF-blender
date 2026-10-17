@@ -49,6 +49,8 @@ for cycle in range(3):
     assert [item.identifier for item in resource_scope.enum_items] == ['ALL', 'MESH', 'MATERIALS', 'TEXTURES']
     assert bpy.ops.eiem.export_mesh_only.get_rna_type() is not None
     assert bpy.ops.eiem.detect_game_directory.get_rna_type() is not None
+    assert bpy.ops.eiem.install_update.get_rna_type() is not None
+    assert 'update_channel' in module.eiem_blender_addon.EFF_AddonPreferences.bl_rna.properties
     assert 'game_directory' in module.eiem_blender_addon.EFF_AddonPreferences.bl_rna.properties
     assert bpy.ops.eiem.import_material.get_rna_type() is not None
     assert bpy.ops.eiem.import_animation.get_rna_type() is not None

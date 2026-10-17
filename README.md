@@ -2,7 +2,7 @@
 
 EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以在 Blender 中编辑网格、材质、贴图、款式切换和形态键，然后导出可放入 EFF `plugin/mods` 的 Mod 文件夹。
 
-本次发布 **v0.44.0**，配套 [EFF v1.7.0](https://github.com/ssice-a/EFF/releases/tag/v1.7.0) 与 [AnimeStudio v1.6.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.6.0)。Windows x64 插件包含原生导出核心、统一资源编译器及 Pillow；已在 Blender 5.0.1 / Python 3.11 验证。当前包支持 Windows x64 / Blender 5.0，内置依赖使用 Python 3.11 ABI；不同 Python ABI 需要另行构建依赖。
+本次发布 **v0.46.0**，配套 [EFF v1.8.1](https://github.com/ssice-a/EFF/releases/tag/v1.8.1) 与 [AnimeStudio v1.7.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.7.0)。Windows x64 插件包含原生导出核心、统一资源编译器、索引刷新工具及 Pillow；已在 Blender 5.0.1 / Python 3.11 验证。当前包支持 Windows x64 / Blender 5.0，内置依赖使用 Python 3.11 ABI；不同 Python ABI 需要另行构建依赖。
 
 带截图的[简易 Mod 制作教程](https://github.com/ssice-a/EFF/blob/main/Mod%20Tutorial.md)包含安装、解包、材质编辑和所选网格导出步骤；也提供[英文版](https://github.com/ssice-a/EFF/blob/main/Mod%20Tutorial_EN.md)。
 
@@ -19,11 +19,17 @@ EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以
 - 分资源导出复用当前会话 Mesh 快照；同一次导出复用共享骨架的路径、供体及绑定信息；仅贴图导出保留已有完整 Mod 的其他资源。
 - 自动生成每个 Mod 的 `source-inputs.bin`，只编译当前导出的独立 Mod，生成 `compiled.bin`。
 - 同一游戏材质可作为多个独立作者材质的模板，各自保留参数和贴图绑定。
-- 在 EFF 面板中检查 GitHub Release 更新并忽略指定版本。
+- 在 EFF 面板中检查 main 的已测试完整更新包，按提交号识别 Python 更新，下载校验后退出 Blender 自动安装并保留备份；也可只检查正式 Release。
 
 ## 安装
 
-从 [Releases](https://github.com/ssice-a/EFF-blender/releases) 下载 `EFF_Blender_v0.44.0.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。更新前保存工程、关闭 Blender，再替换旧插件并重新启动，以释放原生 DLL 和旧 Python 模块。
+从 [Releases](https://github.com/ssice-a/EFF-blender/releases) 下载 `EFF_Blender_v0.46.0.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。旧版需要手动升级这一次以取得更新器。更新前保存工程、关闭 Blender，再替换旧插件并重新启动，以释放原生 DLL 和旧 Python 模块。
+
+之后可在 **N → EFF → EFF 更新**选择“仓库更新（自动测试）”，点击“检查更新”和“下载并准备更新”。下载期间可继续编辑；出现准备完成提示后，自行保存工程并关闭全部 Blender，更新器再替换插件，下次启动生效。不会自动保存、关闭工程或修改 Mod。旧插件位于插件父目录 `.eff-update-backups` 下，可在 Blender 关闭时恢复。
+
+仓库更新只发布通过自动测试的完整包，包含固定摘要核验的原生工具和 Python 依赖，不使用缺少 nativepack/vendor 的 GitHub 源码 ZIP。main 推送后自动生成更新包并维护一个持续更新下载页，无需每次手工发版或改版本号；以安装包记录的提交 SHA 比较更新。正式 Release 仍可独立发布和选择。源码链接／Git 开发安装继续使用 Git，不自动替换代码目录。
+
+原生基础包由 `native-base.json` 固定下载地址、大小、SHA256 和配套框架版本。仅改 Python／UI 时复用这些工具；修改原生编译器、作者核心、解析器或依赖时，维护者必须先构建并验证新的完整基础包，再更新该记录。打包会再次核对当前 Python 所要求的编译器协议。
 
 ## 制作 Mod
 

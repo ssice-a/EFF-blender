@@ -15,5 +15,5 @@ jobs:
       - name: Compile Python sources
         run: python -m compileall -q .
       - name: Verify material feature controls
-        run: python -m unittest test_eiem_material_features
+        run: python -m unittest test_eiem_material_features test_eiem_release test_eiem_update
 
