@@ -220,19 +220,109 @@ def _game_protocol(game):
     return value
 
 
-def reload_context(destination):
+def valid_game_directory(path):
+    path = Path(path)
+    return ((path / 'Endfield.exe').is_file() and (path / 'GameAssembly.dll').is_file()
+            and (path / 'Endfield_Data/StreamingAssets/VFS').is_dir())
+
+
+def _games_at(path):
+    """Inspect the selected root and launcher games folder, never a drive tree."""
+    root = Path(os.path.expandvars(str(path))).expanduser().resolve()
+    if root.name.lower() == 'endfield.exe' or root.name.lower() == 'endfield_data':
+        root = root.parent
+    if valid_game_directory(root):
+        return [root]
+    folders = [root / 'games']
+    if root.name.lower() == 'games':
+        folders.append(root)
+    candidates = [root / 'Endfield Game']
+    for folder in folders:
+        try:
+            candidates.extend(child for child in folder.iterdir() if child.is_dir())
+        except OSError:
+            continue
+    return sorted({candidate.resolve() for candidate in candidates if valid_game_directory(candidate)},
+                  key=lambda p: str(p).casefold())
+
+
+def _registry_game_hints():
+    if os.name != 'nt':
+        return []
+    import winreg
+    results = []
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+            try:
+                with winreg.OpenKey(hive, r'Software\Microsoft\Windows\CurrentVersion\Uninstall',
+                                    0, winreg.KEY_READ | view) as uninstall:
+                    for index in range(winreg.QueryInfoKey(uninstall)[0]):
+                        try:
+                            with winreg.OpenKey(uninstall, winreg.EnumKey(uninstall, index)) as entry:
+                                name = str(winreg.QueryValueEx(entry, 'DisplayName')[0]).casefold()
+                                if any(label in name for label in ('endfield', '终末地', 'hypergryph', '鹰角')):
+                                    results.append(winreg.QueryValueEx(entry, 'InstallLocation')[0])
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+    return results
+
+
+def _launcher_game_hints():
+    if os.name != 'nt':
+        return []
+    return [Path(drive + ':/' + prefix + 'Hypergryph Launcher/games')
+            for drive in 'CDEFGHIJKLMNOPQRSTUVWXYZ'
+            for prefix in ('', 'Program Files/', 'Program Files (x86)/')]
+
+
+def discover_game_directories():
+    hints = []
+    local = os.environ.get('LOCALAPPDATA')
+    if local:
+        try:
+            saved = json.loads((Path(local) / 'EFF/Repair/settings.json').read_text('utf-8-sig'))
+            if isinstance(saved, dict) and isinstance(saved.get('game'), str):
+                hints.append(saved['game'])
+        except (OSError, ValueError):
+            pass
+    hints.extend(_registry_game_hints())
+    hints.extend(_launcher_game_hints())
+    games = {}
+    for hint in hints:
+        if not hint:
+            continue
+        try:
+            for game in _games_at(hint):
+                games[os.path.normcase(str(game))] = game
+        except (OSError, ValueError):
+            continue
+    return sorted(games.values(), key=lambda p: str(p).casefold())
+
+
+def resolve_game_directory(destination=None, configured=''):
+    selected = str(configured or os.environ.get('EFF_RELOAD_GAME', '')).strip()
+    if selected:
+        games = _games_at(selected)
+        if not games:
+            raise ValueError('游戏目录无效，请在导出窗口重新选择包含 Endfield.exe 的安装目录：' + selected)
+    else:
+        if destination is not None:
+            for parent in Path(destination).resolve().parents:
+                if parent.name.lower() == 'plugin' and valid_game_directory(parent.parent):
+                    return parent.parent
+        games = discover_game_directories()
+    if len(games) == 1:
+        return games[0]
+    if games:
+        raise ValueError('发现多份终末地游戏目录，请在导出窗口选择本次使用的安装：' + '；'.join(map(str, games)))
+    raise ValueError('未找到终末地游戏，请在导出窗口选择“游戏目录”；选择一次后会记住，Mod 可导出到任意文件夹')
+
+
+def reload_context(destination, game_directory=''):
     destination = Path(destination).resolve()
-    configured = os.environ.get('EFF_RELOAD_GAME')
-    game = Path(configured).resolve() if configured else None
-    # A normal export to <game>/plugin/mods/<Mod> needs no machine-specific
-    # config. Any other destination still requires EFF_RELOAD_GAME.
-    if game is None:
-        for parent in destination.parents:
-            if parent.name.lower() == 'plugin' and (parent.parent / 'Endfield_Data').is_dir():
-                game = parent.parent
-                break
-    if game is None:
-        raise ValueError('离线编译需要游戏安装路径；导出到游戏 plugin/mods，或设置 EFF_RELOAD_GAME')
+    game = resolve_game_directory(destination, game_directory)
     baseline = destination / 'compiled.bin'
     cache = destination
     protocol = _game_protocol(game)
@@ -312,6 +402,15 @@ def compile_reload(destination, context=None, previous=None, source_index=None):
         command.extend(['--previous-mod', str(Path(previous).resolve())])
     result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace',
                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), check=False)
+    refreshed = None
+    # A changed installation is a request to bring the author index forward,
+    # not a reason to discard a valid author stage. Only the compiler's typed
+    # stale-index result permits this one bounded retry; other failures remain.
+    if (source_index is not None and result.returncode == 3 and
+            'OFFLINE-SOURCE-INDEX-STALE' in result.stderr.splitlines()):
+        refreshed = refresh_source_index(compiler, game, source_index)
+        result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), check=False)
     if result.returncode:
         raise ValueError('离线资源构建失败，游戏继续保留上一完整候选：' + (result.stderr or result.stdout)[-1600:])
     if any(row.startswith('OFFLINE-SOURCE-LOOKUP-PENDING ') for row in result.stdout.splitlines()):
@@ -334,4 +433,39 @@ def compile_reload(destination, context=None, previous=None, source_index=None):
                 offlineReloadManifestHash=digest, offlineReloadCache=str(destination),
                 offlineCompiler=protocol.get('compiler', str(compiler)),
                 offlinePreviousRevision=revision,
+                offlineSourceIndexRefresh=refreshed,
                 offlineCompilerCostsMs=costs)
+
+
+def refresh_source_index(compiler, game, index):
+    """Update only changed Bundles using this add-on's offline parser helper."""
+    helper = Path(compiler).with_name('eff_source_index.exe')
+    if not helper.is_file():
+        raise ValueError('游戏资源已有更新，插件缺少自动刷新索引的配套工具，请安装完整 Blender 插件；上一 Mod 保留')
+    options = dict(capture_output=True, text=True, encoding='utf-8', errors='replace',
+                   creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), check=False)
+    try:
+        reply = subprocess.run([str(helper), '--protocol'], timeout=5, **options)
+        declaration = json.loads(reply.stdout) if reply.returncode == 0 else {}
+    except (OSError, subprocess.TimeoutExpired, ValueError) as error:
+        raise ValueError('无法查询自动来源索引工具：' + str(error)) from error
+    if (not isinstance(declaration, dict) or declaration.get('format') != 'EFF_SOURCE_INDEX_UPDATER' or declaration.get('version') != 1 or
+            declaration.get('update') != 'bundle-content/incremental' or declaration.get('authorPackages') != 'unchanged'):
+        raise ValueError('自动来源索引工具协议不兼容，请安装完整 Blender 插件；上一 Mod 保留')
+    print('[EFF] 检测到游戏资源更新，正在增量刷新来源索引，完成后继续本次导出', flush=True)
+    result = subprocess.run([str(helper), '--update', str(game), str(Path(index).resolve())], **options)
+    if result.returncode:
+        raise ValueError('游戏来源索引自动刷新失败，上一 Mod 保留：' + (result.stderr or result.stdout)[-1600:])
+    try:
+        rows = [line.removeprefix('SOURCE-INDEX-PREPARED ') for line in result.stdout.splitlines()
+                if line.startswith('SOURCE-INDEX-PREPARED ')]
+        receipt = json.loads(rows[-1])
+        if Path(receipt['index']).resolve() != Path(index).resolve():
+            raise ValueError('索引输出路径不一致')
+        for key in ('parsed', 'reused', 'removed'):
+            if type(receipt[key]) is not int or receipt[key] < 0:
+                raise ValueError('索引统计无效')
+    except (ValueError, KeyError, IndexError, TypeError) as error:
+        raise ValueError('自动来源索引工具没有返回当前索引的完整凭据；上一 Mod 保留') from error
+    print('[EFF] 来源索引刷新完成：解析 %(parsed)d，复用 %(reused)d，移除 %(removed)d；继续导出' % receipt, flush=True)
+    return receipt

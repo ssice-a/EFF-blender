@@ -1,18 +1,15 @@
-# EFF Blender v0.44.0
+# EFF Blender v0.45.0
 
-配套：[EFF v1.7.0](https://github.com/ssice-a/EFF/releases/tag/v1.7.0)、[AnimeStudio v1.6.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.6.0)。
+配套：[EFF v1.8.0](https://github.com/ssice-a/EFF/releases/tag/v1.8.0)、[AnimeStudio v1.7.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.7.0)。
 
-- 接受 AnimeStudio 在原解包目录更新的来源清单、原生模板与当前索引。旧 Blender 工程无需重新导入人物；作者修改的几何、UV、权重、材质参数、形态键和动画继续用于导出。
-- 导出期间与解包器共用来源锁，发布前核对来源是否变化；避免混用新清单和旧快照，来源更新中会明确提示重试。
-- 优先使用重新解包记录的当前索引，避免回到旧父目录索引；原生模板缓存按来源内容失效。
-- 配套编译器支持本次更新的 BLC v5 目录，并依据当前完整索引更新变化/退休来源、覆盖当前命中的 PFB。编译器静态链接 C/C++ 运行实现。
+- 游戏小更新导致索引过期时，自动调用插件自带的离线索引工具：复用未变 Bundle，只解析变化/新增内容，再继续本次导出。相同基线后续不重复刷新，无需运行 AnimeStudio 或重新导入工程。
+- 工具自带运行环境，完整索引仍在作者工作区，不随插件或 Mod 分发；游戏/工作区位置来自用户设置与解包清单，没有固定盘符。搬动工作区后，清单中旧绝对索引路径仍可能需要重新定位。
+- 优化 Mesh 快照失效粒度、历史缓存占用、形态/面槽位读取、材质字段和磁盘图片解码；实际几何、权重、静态骨架、形态、材质槽和图片内容改变仍会更新。
+- 修复游戏自带形态帧与频道身份不一致导致导出拒绝；导出窗口可选择并记住游戏目录，允许导出到任意制作目录。
+- 明确区分来源被其他导出或解包更新占用。与解包器保持完整性锁，失败保留上一 Mod。
 
-使用：保存工程并关闭 Blender 后安装 `EFF_Blender_v0.44.0.zip`。游戏更新后，用 AnimeStudio 重新打开当前游戏与原工作区、更新原解包资源，再打开原工程正常导出；首次更新建议选择“全部资源”。此作者流程不需要 EFF 修复工具。
-
-Windows x64 / Blender 5.0 / Python 3.11，已在 Blender 5.0.1 验证。真实庄方宜旧工程 body 网格使用新来源隔离导出成功，原工程文件摘要未变；来源变化、缓存、离线调用与发布回归通过。不将此样本解释为所有骨架、Shader 或游戏画面已验收。
+关闭 Blender 后安装完整 ZIP，再打开原工程。Windows x64 / Blender 5.0，已在 5.0.1 验证。固定十网格全部导出，单顶点编辑约 11.32 → 10.23 秒、不变重导约 5.76 → 5.08 秒，作者及编译产物逐文件一致；机器负载不同会影响耗时。几何变化仍完整离线编译。新增索引工具约 43 MiB，不包含 831 MB 工作区索引。
 
 ## English
 
-Existing Blender projects can export against sources refreshed in place by AnimeStudio. Export locks and manifest validation keep source snapshots consistent, and the refreshed source package selects its current asset index. Author geometry, UVs, weights, materials, Shape Keys and animation remain in the original project.
-
-The paired compiler supports BLC v5 and current-index source relocation, retirement and Prefab consumer discovery. Save and close Blender before installing. Refresh sources in AnimeStudio, then export from the existing project; the separate Mod repair tool is optional. Windows x64 / Blender 5.0 / Python 3.11, tested on 5.0.1.
+Automatically refreshes a stale workspace index with the bundled offline updater and retries the same staged export once. Unchanged Bundle records are reused; new/changed content is parsed and retired content removed. Includes more precise Mesh snapshot invalidation, bounded history, material/bitmap reuse, native shape-frame identity fixes, and a persistent game-folder picker. Save and close Blender before installing the complete archive. No external AnimeStudio installation or .NET runtime is required for the updater.

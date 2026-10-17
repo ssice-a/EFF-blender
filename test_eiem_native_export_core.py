@@ -10,6 +10,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+import zlib
 import numpy as np
 from unittest.mock import patch
 
@@ -57,6 +58,54 @@ def addon_function(name, namespace):
 
 
 class NativeExportCoreTests(unittest.TestCase):
+    def shape_frame_snapshot(self, metadata, names):
+        class Keys(list):
+            def get(self, name):
+                return next((key for key in self if key.name == name), None)
+
+        basis = SimpleNamespace(name='Basis')
+        keys = Keys([basis] + [SimpleNamespace(name=name, relative_key=basis, vertex_group='') for name in names])
+        mesh = Material('Shape source', {'eiem_blend_shapes_json': metadata})
+        mesh.vertices = []
+        mesh.shape_keys = SimpleNamespace(reference_key=basis, key_blocks=keys, use_relative=True)
+        function = addon_function('export_blend_shapes', dict(
+            parse_json_property=lambda owner, key, default: owner.get(key, default), zlib=zlib))
+        vertices, frames, channels, weights, additional = function(SimpleNamespace(data=mesh), tuple, [])
+        author = dict(vertex_count=0, blend_vertices=vertices, blend_frames=frames,
+                      blend_channels=channels, blend_weights=weights)
+        modules, _ = exporter.pack_modules()
+        class Array:
+            def set_items(self, values): self.values = values
+        shapes = Material('Shapes', {key: Array() for key in ('vertices', 'shapes', 'channels', 'fullWeights')})
+        shapes.data = shapes
+        modules['mesh'].write_shapes({'m_Shapes': shapes}, author)
+        return author, shapes
+
+    def test_imported_shape_frames_without_native_names_use_their_channel(self):
+        metadata = [dict(name='Native brow', hash=1234,
+                         frames=[dict(key='Native brow', source_name='', weight=100.)])]
+        author, shapes = self.shape_frame_snapshot(metadata, ['Native brow'])
+        self.assertEqual(author['blend_frames'][0][0], 'Native brow')
+        self.assertEqual(shapes['channels'].values, [dict(name='Native brow', nameHash=1234, frameIndex=0, frameCount=1)])
+        self.assertEqual(shapes['fullWeights'].values, [100.])
+
+    def test_imported_multi_frame_labels_keep_channel_hash_range_and_weights(self):
+        metadata = [dict(name='Native smile', hash=5678, frames=[
+            dict(key='Smile@50', source_name='different legacy frame label', weight=50.),
+            dict(key='Smile@100', weight=100.)])]
+        author, _ = self.shape_frame_snapshot(metadata, ['Smile@50', 'Smile@100', 'Author key'])
+        self.assertEqual([frame[0] for frame in author['blend_frames']], ['Native smile', 'Native smile', 'Author key'])
+        self.assertEqual(author['blend_channels'][0], ('Native smile', 5678, 0, 2))
+        self.assertEqual(author['blend_channels'][1], ('Author key', zlib.crc32(b'Author key') & 0xffffffff, 2, 1))
+        self.assertEqual(author['blend_weights'], [50., 100., 100.])
+
+    def test_deleted_imported_shape_frames_do_not_shift_following_channel_identity(self):
+        metadata = [dict(name='Deleted', frames=[dict(key='Removed', source_name='')]),
+                    dict(name='Survivor', hash=42, frames=[dict(key='Keep', source_name='')])]
+        author, _ = self.shape_frame_snapshot(metadata, ['Keep'])
+        self.assertEqual(author['blend_channels'], [('Survivor', 42, 0, 1)])
+        self.assertEqual(author['blend_frames'][0][0], 'Survivor')
+
     @unittest.skipUnless(os.name == 'nt', 'Windows pinned runtime snapshot')
     def test_atomic_publication_keeps_pinned_old_runtime_file_readable(self):
         import ctypes
@@ -335,6 +384,51 @@ class NativeExportCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'source snapshot hash'):
             exporter.native_mesh_fields(modules, source, target, edited, edited, 0, 'Mesh', encode)
 
+    def test_material_fields_reuse_unchanged_parameters_and_validate_current_source(self):
+        exporter._NATIVE_MATERIAL_FIELDS_CACHE.clear()
+        checked = []
+        source = SimpleNamespace(rows={'CAB': {'snapshot': {'sha256': 'proof'}}},
+                                 file=lambda target: checked.append(target),
+                                 tree=lambda target: object())
+        native = {'identity': 'material', 'native': {'cab': 'CAB', 'typeHash': 'schema'}}
+        encode = lambda value: value
+        with patch.object(exporter, 'material_fields', side_effect=lambda tree, values, fn:
+                          {'field': values['float._AlphaClip'].encode()}) as build:
+            first = exporter.native_material_fields(source, native, {'float._AlphaClip': '0'}, encode)
+            self.assertEqual(exporter.native_material_fields(source, native,
+                {'float._AlphaClip': '0', 'texture._MainTex': 'new-pixels'}, encode), first)
+            self.assertEqual(build.call_count, 1)
+            self.assertNotEqual(exporter.native_material_fields(source, native,
+                {'float._AlphaClip': '1'}, encode), first)
+            self.assertEqual(build.call_count, 2)
+            source.rows['CAB']['snapshot']['sha256'] = 'updated-game-source'
+            exporter.native_material_fields(source, native, {'float._AlphaClip': '0'}, encode)
+            self.assertEqual(build.call_count, 3)
+            self.assertEqual(len(checked), 4)
+            def invalid(target):
+                raise ValueError('source snapshot hash')
+            source.file = invalid
+            with self.assertRaisesRegex(ValueError, 'source snapshot hash'):
+                exporter.native_material_fields(source, native, {'float._AlphaClip': '0'}, encode)
+
+    def test_disk_texture_cache_checks_bytes_even_when_size_and_timestamp_match(self):
+        from PIL import Image
+        exporter._NATIVE_IMAGE_CACHE.clear()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'pixels.bmp'
+            Image.new('RGBA', (2, 2), (255, 0, 0, 255)).save(path)
+            stamp, size = path.stat().st_mtime_ns, path.stat().st_size
+            with exporter.texture_bitmap(path, True) as first:
+                self.assertEqual(first.getpixel((0, 0)), (255, 0, 0, 255))
+            Image.new('RGBA', (2, 2), (0, 255, 0, 255)).save(path)
+            os.utime(path, ns=(stamp, stamp))
+            self.assertEqual(path.stat().st_size, size)
+            with exporter.texture_bitmap(path, True) as changed:
+                self.assertEqual(changed.getpixel((0, 0)), (0, 255, 0, 255))
+            # A dirty/packed image's temporary export is always read again.
+            with exporter.texture_bitmap(path, False) as uncached:
+                self.assertEqual(uncached.tobytes(), changed.tobytes())
+
     def test_reextracted_source_rebinds_objects_and_rejects_mid_export_change(self):
         module = exporter.pack_modules()[0]['author_source']
         with tempfile.TemporaryDirectory() as folder:
@@ -519,12 +613,14 @@ class NativeExportCoreTests(unittest.TestCase):
         context = SimpleNamespace(mode='OBJECT', scene=SimpleNamespace(eiem_source_baseline='source'),
                                   view_layer=SimpleNamespace(update=lambda: calls.append('update')))
         namespace = dict(bpy=SimpleNamespace(context=context), sys=sys,
-                         __name__=__name__, _EXPORT_IN_PROGRESS=False)
+                         __name__=__name__, _EXPORT_IN_PROGRESS=False,
+                         export_game_directory=lambda root, configured: 'selected game')
 
         def fail(*args, **kwargs):
             self.assertTrue(namespace['_EXPORT_IN_PROGRESS'])
             self.assertEqual(kwargs['source_baseline'], 'source')
             self.assertEqual(kwargs['resource_scope'], 'TEXTURES')
+            self.assertEqual(kwargs['game_directory'], 'selected game')
             raise ValueError('bad author')
 
         namespace['native_export'] = SimpleNamespace(export_native_package=fail)

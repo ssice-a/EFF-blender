@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 44, 0),
+    "version": (0, 45, 0),
     "blender": (5, 0, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
@@ -62,6 +62,8 @@ def _eiem_export_load_post(_filepath):
     # state belongs to one author scene, including its datablock pointers.
     _EXPORT_DIRTY_SERIAL.clear()
     native_export._NATIVE_SNAPSHOT_CACHE.clear()
+    native_export._NATIVE_MATERIAL_FIELDS_CACHE.clear()
+    native_export._NATIVE_IMAGE_CACHE.clear()
 
 
 def _owner_property_digest(owner):
@@ -73,7 +75,14 @@ def _owner_property_digest(owner):
         digest.update(key.encode("utf-8", "replace"))
         digest.update(b"=")
         try:
-            value = repr(owner[key])
+            value = owner[key]
+            # RNA wrappers' repr describes their type/extent, not contents.
+            # Rest bindings can be edited in place without a depsgraph event.
+            if hasattr(value, 'to_list'):
+                value = value.to_list()
+            elif hasattr(value, 'to_dict'):
+                value = value.to_dict()
+            value = repr(value)
         except (KeyError, RuntimeError, TypeError):
             value = "<unreadable>"
         digest.update(value.encode("utf-8", "replace"))
@@ -136,11 +145,11 @@ def _shape_key_digest(mesh):
             encoded = value.encode("utf-8", "replace")
             digest.update(struct.pack("<I", len(encoded)))
             digest.update(encoded)
-        points = list(block.data)
+        points = block.data
         digest.update(struct.pack("<I", len(points)))
-        for point in points:
-            digest.update(struct.pack(
-                "<3f", float(point.co.x), float(point.co.y), float(point.co.z)))
+        coordinates = np.empty(len(points) * 3, dtype='<f4')
+        points.foreach_get('co', coordinates)
+        digest.update(coordinates.tobytes())
     return digest.hexdigest()
 
 
@@ -159,11 +168,29 @@ def _mesh_slot_digest(obj):
             "utf-8", "replace")
         digest.update(struct.pack("<I", len(encoded)))
         digest.update(encoded)
-    polygons = list(mesh.polygons)
+    polygons = mesh.polygons
     digest.update(struct.pack("<I", len(polygons)))
-    for polygon in polygons:
-        digest.update(struct.pack("<I", int(polygon.material_index)))
+    slots = np.empty(len(polygons), dtype='<i4')
+    polygons.foreach_get('material_index', slots)
+    digest.update(slots.tobytes())
     return digest.hexdigest()
+
+
+def _skeleton_export_token(armature):
+    """Fingerprint rest binding inputs, independently of pose evaluation."""
+    if armature is None:
+        return None
+    digest = hashlib.sha1()
+    for bone in armature.data.bones:
+        for value in (bone.name, bone.parent.name if bone.parent else '',
+                      _owner_property_digest(bone)):
+            encoded = value.encode('utf-8', 'replace')
+            digest.update(struct.pack('<I', len(encoded)))
+            digest.update(encoded)
+        digest.update(struct.pack('<16d', *(v for row in bone.matrix_local for v in row)))
+    return (int(armature.as_pointer()), int(armature.data.as_pointer()),
+            _owner_property_digest(armature), _owner_property_digest(armature.data),
+            digest.hexdigest())
 
 
 def _mesh_resource_token(obj):
@@ -174,12 +201,11 @@ def _mesh_resource_token(obj):
                      if modifier.type == "ARMATURE" and modifier.object), None)
     shape_keys = getattr(mesh, "shape_keys", None)
     return (
-        "mesh-v3",
-        _owner_revision(obj),
+        "mesh-v4",
+        (int(obj.as_pointer()), _owner_property_digest(obj)),
         _owner_revision(mesh),
         _owner_revision(shape_keys),
-        _owner_revision(armature),
-        _owner_revision(getattr(armature, "data", None)),
+        _skeleton_export_token(armature),
         _vertex_group_digest(obj),
         _shape_key_digest(mesh),
         _mesh_slot_digest(obj),
@@ -191,6 +217,7 @@ if __package__:
     from . import eiem_format as format_io
     from . import eiem_lod as lod
     from . import eiem_native_export as native_export
+    from . import eiem_offline_reload as offline_reload
     from . import eiem_physics_authoring as physics_authoring
     from . import eiem_material_editor as material_editor
     from . import eiem_blender_controls as controls
@@ -213,6 +240,10 @@ else:
         "eiem_native_export", Path(__file__).with_name("eiem_native_export.py"))
     native_export = importlib.util.module_from_spec(_native_spec)
     _native_spec.loader.exec_module(native_export)
+    _offline_spec = importlib.util.spec_from_file_location(
+        "eiem_offline_reload", Path(__file__).with_name("eiem_offline_reload.py"))
+    offline_reload = importlib.util.module_from_spec(_offline_spec)
+    _offline_spec.loader.exec_module(offline_reload)
     _physics_spec = importlib.util.spec_from_file_location(
         "eiem_physics_authoring", Path(__file__).with_name("eiem_physics_authoring.py"))
     physics_authoring = importlib.util.module_from_spec(_physics_spec)
@@ -1698,7 +1729,7 @@ def export_blend_shapes(obj, to_source, source_vertices):
     channels = []
     weights = []
 
-    def append_frame(key, frame_metadata):
+    def append_frame(key, frame_metadata, channel_name):
         first = len(vertices)
         normal_attribute = str(frame_metadata.get("normal_attribute", ""))
         tangent_attribute = str(frame_metadata.get("tangent_attribute", ""))
@@ -1716,13 +1747,17 @@ def export_blend_shapes(obj, to_source, source_vertices):
             vertices.append((index, to_source(delta_position), to_source(delta_normal),
                              to_source(delta_tangent)))
         frames.append((
-            str(frame_metadata.get("source_name", key.name)), first, len(vertices) - first,
+            # Modern Unity frames have no name field. The preserved legacy
+            # source_name may be empty or label a frame rather than its channel.
+            # EFF's frame identity is the owning channel, including multi-frame keys.
+            channel_name, first, len(vertices) - first,
             normal_values is not None, tangent_values is not None,
             bool(frame_metadata.get("has_additional_normals", False)),
         ))
         weights.append(float(frame_metadata.get("weight", 100.0)))
 
     for channel_metadata in metadata:
+        name = str(channel_metadata.get("name", "Shape"))
         first_frame = len(frames)
         for frame_metadata in channel_metadata.get("frames", []):
             key_name = str(frame_metadata.get("key", ""))
@@ -1730,10 +1765,9 @@ def export_blend_shapes(obj, to_source, source_vertices):
             if key is None or key == basis:
                 continue
             used.add(key.name)
-            append_frame(key, frame_metadata)
+            append_frame(key, frame_metadata, name)
         frame_count = len(frames) - first_frame
         if frame_count:
-            name = str(channel_metadata.get("name", "Shape"))
             channels.append((name, int(channel_metadata.get(
                 "hash", zlib.crc32(name.encode("utf-8")) & 0xffffffff)),
                 first_frame, frame_count))
@@ -1744,7 +1778,7 @@ def export_blend_shapes(obj, to_source, source_vertices):
         if key == basis or key.name in used:
             continue
         first_frame = len(frames)
-        append_frame(key, {"source_name": key.name, "weight": 100.0})
+        append_frame(key, {"weight": 100.0}, key.name)
         channels.append((key.name, zlib.crc32(key.name.encode("utf-8")) & 0xffffffff,
                          first_frame, 1))
 
@@ -2761,7 +2795,7 @@ def unique_export_section(requested, used, prefix):
 
 def export_package(root, mesh_objects=None, armatures=None, physics_objects=None,
                    mesh_only=False, lod_levels=None, include_switches=True,
-                   source_baseline='', resource_scope='ALL'):
+                   source_baseline='', resource_scope='ALL', game_directory=''):
     """Export through the single format-2 author pipeline used by the UI.
 
     Selection and Blender dependency updates stay in this facade. Native
@@ -2781,6 +2815,7 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
         source_baseline = getattr(bpy.context.scene, 'eiem_source_baseline', '')
     if bpy.context.mode != 'OBJECT':
         raise ValueError('请回到物体模式后导出')
+    game_directory = export_game_directory(root, game_directory)
     # Consume user edits before looking up the snapshot cache. Updates produced
     # by triangulation/tangent evaluation are consumed while suppressed so they
     # do not turn an unchanged second export into a false miss.
@@ -2794,7 +2829,7 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
             armatures=list(armatures or []), physics_objects=list(physics_objects or []),
             mesh_only=mesh_only, lod_levels=lod_levels,
             include_switches=include_switches, source_baseline=source_baseline,
-            resource_scope=resource_scope)
+            resource_scope=resource_scope, game_directory=game_directory)
     finally:
         try:
             bpy.context.view_layer.update()
@@ -3761,10 +3796,12 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
         except ValueError as error:
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
+        prefill_export_game_directory(context, self.directory or self.filepath)
         return ExportHelper.invoke(self, context, event)
 
     def draw(self, context):
         self.layout.label(text=self.scope_message)
+        draw_export_game_directory(self.layout, context)
         self.layout.prop(context.scene, "eiem_export_mod_name", text='Mod 文件夹名')
         self.layout.prop(context.scene, "eiem_source_baseline", text='原生来源目录')
         self.layout.prop(self, "resource_scope")
@@ -3821,6 +3858,7 @@ class EFF_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
         except ValueError as error:
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
+        prefill_export_game_directory(context, self.directory or self.filepath)
         return ExportHelper.invoke(self, context, event)
 
     def execute(self, context):
@@ -3845,6 +3883,7 @@ class EFF_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
     def draw(self, context):
         if self.scope_message:
             self.layout.label(text=self.scope_message)
+        draw_export_game_directory(self.layout, context)
         self.layout.prop(context.scene, "eiem_export_mod_name", text='Mod 文件夹名')
         self.layout.prop(context.scene, "eiem_source_baseline", text='原生来源目录')
         draw_lod_options(self.layout, self)
@@ -3860,12 +3899,100 @@ def _addon_preferences(context):
     return addon.preferences if addon else None
 
 
+def game_directory_changed(self, context):
+    if not bpy.app.background:
+        # This is an installation preference, not part of the author's .blend.
+        # Keep it even when Blender's automatic preference saving is disabled.
+        try:
+            bpy.ops.wm.save_userpref()
+        except RuntimeError:
+            pass
+
+
+def export_game_directory(destination, configured=''):
+    prefs = _addon_preferences(bpy.context)
+    selected = configured or (prefs.game_directory if prefs else '')
+    game = offline_reload.resolve_game_directory(
+        destination, bpy.path.abspath(selected) if selected else '')
+    if prefs and prefs.game_directory != str(game):
+        prefs.game_directory = str(game)
+    return str(game)
+
+
+def prefill_export_game_directory(context, destination):
+    prefs = _addon_preferences(context)
+    if prefs and not prefs.game_directory:
+        try:
+            export_game_directory(destination or Path.cwd())
+        except (OSError, ValueError):
+            # Keep the picker available for missing or ambiguous installations.
+            pass
+
+
+def draw_export_game_directory(layout, context):
+    prefs = _addon_preferences(context)
+    if prefs is None:
+        return
+    box = layout.box()
+    row = box.row(align=True)
+    row.prop(prefs, 'game_directory', text='游戏目录')
+    row.operator('eiem.detect_game_directory', text='', icon='VIEWZOOM')
+    box.label(text='选择一次即可记住；Mod 可导出到任意文件夹')
+
+
+def game_installation_items(self, context):
+    return getattr(self, '_game_items', [])
+
+
+class EFF_OT_detect_game_directory(bpy.types.Operator):
+    bl_idname = 'eiem.detect_game_directory'
+    bl_label = '自动识别游戏目录'
+    bl_description = '从本机安装记录、修复工具设置和常见启动器目录查找终末地'
+    installation: EnumProperty(name='游戏安装', items=game_installation_items)
+
+    def invoke(self, context, event):
+        games = offline_reload.discover_game_directories()
+        if len(games) > 1:
+            self._game_items = [(str(index), str(game), '') for index, game in enumerate(games)]
+            self.installation = '0'
+            return context.window_manager.invoke_props_dialog(self, width=650)
+        return self.execute(context)
+
+    def draw(self, context):
+        self.layout.label(text='发现多份游戏安装，请选择用于本次导出的资源：')
+        self.layout.prop(self, 'installation', text='游戏目录')
+
+    def execute(self, context):
+        try:
+            items = getattr(self, '_game_items', [])
+            selected = items[int(self.installation)][1] if items else ''
+            game = offline_reload.resolve_game_directory(configured=selected) if selected else None
+            if game is None:
+                games = offline_reload.discover_game_directories()
+                if len(games) != 1:
+                    raise ValueError('未能唯一识别游戏目录，请点击路径旁的文件夹按钮选择安装目录')
+                game = games[0]
+            prefs = _addon_preferences(context)
+            if prefs is None:
+                raise ValueError('请先在偏好设置中启用 EFF 插件')
+            prefs.game_directory = str(game)
+            self.report({'INFO'}, '游戏目录：' + str(game))
+            return {'FINISHED'}
+        except (OSError, ValueError, IndexError) as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+
+
 class EFF_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = (__package__ or __name__).split(".")[0]
 
     ignored_release_tag: StringProperty(name="Ignored release", default="")
+    game_directory: StringProperty(
+        name='游戏目录', subtype='DIR_PATH', default='', update=game_directory_changed,
+        description='终末地安装目录（包含 Endfield.exe）；独立于 Mod 导出位置，留空自动识别')
 
     def draw(self, context):
+        draw_export_game_directory(self.layout, context)
         draw_update_status(self.layout)
 
 
@@ -3942,6 +4069,7 @@ def menu_export(self, context):
 
 classes = (
     EFF_AddonPreferences,
+    EFF_OT_detect_game_directory,
     EFF_OT_check_update,
     EFF_OT_open_update_release,
     EFF_OT_ignore_update_release,

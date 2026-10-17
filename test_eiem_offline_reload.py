@@ -15,6 +15,67 @@ spec=importlib.util.spec_from_file_location('eiem_offline_reload',Path(__file__)
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 
 class OfflineExportTests(unittest.TestCase):
+    def make_game(self, root):
+        (root/'Endfield_Data/StreamingAssets/VFS').mkdir(parents=True)
+        (root/'Endfield.exe').touch();(root/'GameAssembly.dll').touch()
+        return root.resolve()
+
+    def test_arbitrary_export_uses_explicit_game_and_rejects_stale_selection(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {}, clear=True):
+            root=Path(folder);selected=self.make_game(root/'selected');other=self.make_game(root/'other')
+            with patch.object(module,'discover_game_directories',return_value=[other]):
+                self.assertEqual(module.resolve_game_directory(root/'release/Mod',str(selected)),selected)
+                with self.assertRaisesRegex(ValueError,'游戏目录无效'):
+                    module.resolve_game_directory(root/'release/Mod',str(root/'missing'))
+            with patch.dict(os.environ,{'EFF_RELOAD_GAME':str(other)}):
+                self.assertEqual(module.resolve_game_directory(root/'release/Mod',str(selected)),selected)
+
+    def test_game_picker_accepts_executable_data_and_launcher_games_folder(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ,{},clear=True):
+            root=Path(folder);game=self.make_game(root/'launcher/games/Endfield Game')
+            for selected in (game,game/'Endfield.exe',game/'Endfield_Data',root/'launcher',root/'launcher/games'):
+                self.assertEqual(module.resolve_game_directory(root/'distribution',str(selected)),game)
+            second=self.make_game(root/'launcher/games/other-install')
+            with self.assertRaisesRegex(ValueError,'多份'):
+                module.resolve_game_directory(root/'distribution',str(root/'launcher/games'))
+
+    def test_destination_inference_precedes_auto_discovery_and_legacy_env_still_works(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ,{},clear=True):
+            root=Path(folder);game=self.make_game(root/'game');other=self.make_game(root/'other')
+            with patch.object(module,'discover_game_directories',return_value=[other]) as find:
+                self.assertEqual(module.resolve_game_directory(game/'plugin/mods/Mod'),game)
+                find.assert_not_called()
+                with patch.dict(os.environ,{'EFF_RELOAD_GAME':str(other)}):
+                    self.assertEqual(module.resolve_game_directory(root/'release'),other)
+
+    def test_auto_detection_requires_one_valid_installation(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ,{},clear=True):
+            root=Path(folder);a=self.make_game(root/'game-a');b=self.make_game(root/'game-b')
+            for candidates in ([],[a,b]):
+                with patch.object(module,'discover_game_directories',return_value=candidates):
+                    with self.assertRaisesRegex(ValueError,'游戏目录'):
+                        module.resolve_game_directory(root/'release')
+            with patch.object(module,'discover_game_directories',return_value=[a]):
+                self.assertEqual(module.resolve_game_directory(root/'release'),a)
+
+    def test_discovery_uses_local_hints_and_deduplicates_valid_games(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);game=self.make_game(root/'game');settings=root/'local/EFF/Repair/settings.json'
+            settings.parent.mkdir(parents=True);settings.write_text(json.dumps({'game':str(game)}))
+            with patch.dict(os.environ,{'LOCALAPPDATA':str(root/'local')},clear=True),patch.object(module,'_registry_game_hints',return_value=[game,root/'missing']),patch.object(module,'_launcher_game_hints',return_value=[]):
+                self.assertEqual(module.discover_game_directories(),[game])
+                settings.write_text('{broken json')
+                self.assertEqual(module.discover_game_directories(),[game])
+
+    def test_reload_context_accepts_separate_game_without_changing_export_destination(self):
+        with tempfile.TemporaryDirectory() as folder,patch.dict(os.environ,{},clear=True):
+            root=Path(folder);game=self.make_game(root/'game');destination=root/'release/MyMod'
+            compiler=root/'compiler.exe'
+            with patch.object(module,'_select_compiler',return_value=(compiler,self.protocol())):
+                self.assertEqual(module.reload_context(destination,game_directory=str(game)),
+                                 (compiler,destination.resolve()/'compiled.bin',destination.resolve(),game))
+            self.assertFalse(destination.exists())
+
     def test_reextracted_source_uses_its_current_index_before_old_parent_workspace(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder);source=root/'assets/character.eff';(source/'source').mkdir(parents=True)
@@ -65,6 +126,88 @@ class OfflineExportTests(unittest.TestCase):
                 self.assertTrue(module.compile_reload(stage,(game/'local-compiler.exe',stage/'compiled.bin',stage,game))['offlineReloadPrepared'])
             self.assertEqual(sentinel.read_bytes(),b'other Mod');self.assertEqual(len(calls),2)
             self.assertFalse((game/'plugin/resource-reload-cache').exists())
+
+    def test_updated_game_refreshes_index_once_then_retries_same_author_stage(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);stage=root/'stage';stage.mkdir();prior=root/'published';prior.mkdir()
+            (prior/'compiled.bin').write_bytes(b'previous Mod')
+            compiler=root/'addon/nativepack/eff_resource_pack.exe'
+            helper=compiler.with_name('eff_source_index.exe');helper.parent.mkdir(parents=True);helper.touch()
+            index=root/'workspace/index/endfield_assets.eidx';index.parent.mkdir(parents=True);index.write_bytes(b'old index')
+            exports=[];updates=[]
+            def invoke(command, **kwargs):
+                if command == [str(compiler),'--protocol']:
+                    return SimpleNamespace(returncode=0,stdout=json.dumps(self.protocol()),stderr='')
+                if command == [str(helper),'--protocol']:
+                    return SimpleNamespace(returncode=0,stdout=json.dumps(dict(format='EFF_SOURCE_INDEX_UPDATER',version=1,update='bundle-content/incremental',authorPackages='unchanged')),stderr='')
+                if command[0] == str(helper):
+                    self.assertEqual(command,[str(helper),'--update',str(root),str(index.resolve())])
+                    updates.append(command);index.write_bytes(b'current index')
+                    return SimpleNamespace(returncode=0,stdout='SOURCE-INDEX-PREPARED '+json.dumps(dict(index=str(index),parsed=2,reused=273606,removed=0)),stderr='')
+                exports.append(command)
+                if len(exports)==1:
+                    return SimpleNamespace(returncode=3,stdout='',stderr='OFFLINE-SOURCE-INDEX-STALE\nold catalog')
+                self.assertEqual(command,exports[0])
+                self.assertEqual(index.read_bytes(),b'current index')
+                (stage/'compiled.bin').write_bytes(b'new Mod')
+                return SimpleNamespace(returncode=0,stdout='COMPILED-MOD-PUBLISHED',stderr='')
+            with patch.object(module.subprocess,'run',side_effect=invoke):
+                result=module.compile_reload(stage,(compiler,None,None,root),previous=prior,source_index=index)
+            self.assertEqual(len(exports),2);self.assertEqual(len(updates),1)
+            self.assertEqual(result['offlineSourceIndexRefresh']['parsed'],2)
+            self.assertEqual((prior/'compiled.bin').read_bytes(),b'previous Mod')
+
+    def test_other_errors_do_not_refresh_index_and_failed_retry_is_bounded(self):
+        for code, message, expected in ((1,'OFFLINE-SOURCE-INDEX-STALE',0),
+                (3,'some other error',0),(3,'OFFLINE-SOURCE-INDEX-STALE',1)):
+            with self.subTest(code=code,message=message), tempfile.TemporaryDirectory() as folder:
+                root=Path(folder);stage=root/'stage';stage.mkdir();prior=root/'prior';prior.mkdir()
+                (prior/'compiled.bin').write_bytes(b'previous Mod')
+                calls=[]
+                def invoke(command,**kwargs):
+                    if command[-1]=='--protocol':
+                        return SimpleNamespace(returncode=0,stdout=json.dumps(self.protocol()),stderr='')
+                    calls.append(command)
+                    return SimpleNamespace(returncode=code,stdout='',stderr=message)
+                with patch.object(module.subprocess,'run',side_effect=invoke),patch.object(module,'refresh_source_index',return_value={}) as refresh:
+                    with self.assertRaisesRegex(ValueError,'构建失败'):
+                        module.compile_reload(stage,(root/'compiler',None,None,root),previous=prior,source_index=root/'index')
+                self.assertEqual(refresh.call_count,expected)
+                self.assertEqual(len(calls),expected+1)
+                self.assertEqual((prior/'compiled.bin').read_bytes(),b'previous Mod')
+
+    def test_failed_index_update_stops_before_retry_and_preserves_published_mod(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);stage=root/'stage';stage.mkdir();prior=root/'prior';prior.mkdir()
+            (prior/'compiled.bin').write_bytes(b'previous Mod')
+            replies=[SimpleNamespace(returncode=0,stdout=json.dumps(self.protocol()),stderr=''),
+                     SimpleNamespace(returncode=3,stdout='',stderr='OFFLINE-SOURCE-INDEX-STALE')]
+            with patch.object(module.subprocess,'run',side_effect=replies) as run,patch.object(module,'refresh_source_index',side_effect=ValueError('索引刷新失败')):
+                with self.assertRaisesRegex(ValueError,'索引刷新失败'):
+                    module.compile_reload(stage,(root/'compiler',None,None,root),previous=prior,source_index=root/'index')
+            self.assertEqual(run.call_count,2)
+            self.assertEqual((prior/'compiled.bin').read_bytes(),b'previous Mod')
+
+    def test_index_helper_requires_compatible_protocol_and_current_index_receipt(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);compiler=root/'eff_resource_pack.exe';helper=root/'eff_source_index.exe'
+            index=root/'workspace/index/endfield_assets.eidx'
+            with self.assertRaisesRegex(ValueError,'缺少'):
+                module.refresh_source_index(compiler,root,index)
+            helper.touch()
+            declaration=dict(format='EFF_SOURCE_INDEX_UPDATER',version=1,update='bundle-content/incremental',authorPackages='unchanged')
+            for value in ([],dict(declaration,authorPackages='refresh')):
+                with patch.object(module.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=json.dumps(value),stderr='')) as run:
+                    with self.assertRaisesRegex(ValueError,'协议'):
+                        module.refresh_source_index(compiler,root,index)
+                    self.assertEqual(run.call_count,1)
+            for receipt in ({'index':str(root/'other'), 'parsed':2,'reused':4,'removed':0},
+                            {'index':str(index), 'parsed':-1,'reused':4,'removed':0}):
+                replies=[SimpleNamespace(returncode=0,stdout=json.dumps(declaration),stderr=''),
+                         SimpleNamespace(returncode=0,stdout='SOURCE-INDEX-PREPARED '+json.dumps(receipt),stderr='')]
+                with patch.object(module.subprocess,'run',side_effect=replies):
+                    with self.assertRaisesRegex(ValueError,'完整凭据'):
+                        module.refresh_source_index(compiler,root,index)
 
     def test_previous_snapshot_is_read_only_and_requires_declared_support(self):
         for support in (None, 'unknown-layout', 'validated-previous-mod'):
@@ -154,7 +297,7 @@ class OfflineExportTests(unittest.TestCase):
     def test_game_and_workspace_exports_use_addon_compiler_only(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder);addon=root/'addon';tool=addon/'nativepack/eff_resource_pack.exe';tool.parent.mkdir(parents=True);tool.touch()
-            game=root/'game';(game/'Endfield_Data').mkdir(parents=True);author=game/'plugin/mods/A';author.mkdir(parents=True)
+            game=self.make_game(root/'game');author=game/'plugin/mods/A';author.mkdir(parents=True)
             foreign=game/'plugin/tools/eff_resource_pack.exe';foreign.parent.mkdir();foreign.touch()
             reply=SimpleNamespace(returncode=0,stdout=json.dumps(self.protocol()),stderr='')
             with patch.object(module,'__file__',str(addon/'eiem_offline_reload.py')),patch.object(module.subprocess,'run',return_value=reply) as run,patch.dict(module.os.environ,{},clear=True):

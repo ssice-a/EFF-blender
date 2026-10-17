@@ -5,6 +5,7 @@ it does not call Unity or install a DLL. Geometry and material decoding remain
 in the canonical nativepack modules and the native compiler.
 """
 import hashlib
+import io
 import importlib.util
 import math
 import os
@@ -25,6 +26,9 @@ import contextlib
 # revisions, so an edit naturally misses without trusting mtimes.
 _NATIVE_SNAPSHOT_CACHE = {}
 _NATIVE_SNAPSHOT_CACHE_LIMIT = 128
+_NATIVE_MATERIAL_FIELDS_CACHE = {}
+_NATIVE_IMAGE_CACHE = {}
+_NATIVE_IMAGE_CACHE_BYTES = 128 * 1024 * 1024
 
 
 class _MeshSnapshot(dict):
@@ -51,6 +55,11 @@ def _cached_mesh_snapshot(addon, obj, skin_cache=None):
     if cached is not None:
         return cached, True
     snapshot = _MeshSnapshot(addon.write_mesh(None, obj, **options))
+    # Keep the current version of each object, rather than letting old edits
+    # evict still-useful snapshots of all its unchanged siblings.
+    for previous in list(_NATIVE_SNAPSHOT_CACHE):
+        if previous[0] == key[0]:
+            del _NATIVE_SNAPSHOT_CACHE[previous]
     _NATIVE_SNAPSHOT_CACHE[key] = snapshot
     while len(_NATIVE_SNAPSHOT_CACHE) > _NATIVE_SNAPSHOT_CACHE_LIMIT:
         _NATIVE_SNAPSHOT_CACHE.pop(next(iter(_NATIVE_SNAPSHOT_CACHE)))
@@ -242,6 +251,24 @@ def material_fields(tree, overrides, encode):
             changed[key] = encoded
     return changed
 
+
+def native_material_fields(source, native, overrides, encode):
+    # Shader fields depend on exact source bytes and scalar/keyword settings.
+    # Texture bindings are resolved separately, on every export.
+    source.file(native)
+    source_hash = source.rows[native['native']['cab']]['snapshot']['sha256']
+    settings = tuple(sorted((key, value) for key, value in overrides.items()
+                            if not key.startswith('texture.')))
+    key = (native['identity'], source_hash, native['native']['typeHash'], settings, encode)
+    cached = _NATIVE_MATERIAL_FIELDS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    fields = material_fields(source.tree(native), overrides, encode)
+    _NATIVE_MATERIAL_FIELDS_CACHE[key] = fields
+    while len(_NATIVE_MATERIAL_FIELDS_CACHE) > 128:
+        _NATIVE_MATERIAL_FIELDS_CACHE.pop(next(iter(_NATIVE_MATERIAL_FIELDS_CACHE)))
+    return fields
+
 def material_id(material):
     stored = str(material.get('eiem_native_id', ''))
     return stored or 'Material'+token(material.get('eiem_section', material.name)).removeprefix('Material')
@@ -321,6 +348,27 @@ def _texture_image_signature(addon, image):
             str(image.get('eiem_aniso', '1')),
             str(image.get('eiem_mip_bias', '0')))
 
+
+def texture_bitmap(path, cache_disk=False):
+    """Decode exact captured file bytes; dirty/packed Blender images bypass reuse."""
+    from PIL import Image
+    if not cache_disk:
+        with Image.open(path) as image:
+            return image.convert('RGBA')
+    encoded = Path(path).read_bytes()
+    key = hashlib.sha256(encoded).digest()
+    cached = _NATIVE_IMAGE_CACHE.pop(key, None)
+    if cached is None:
+        with Image.open(io.BytesIO(encoded)) as image:
+            rgba = image.convert('RGBA')
+            cached = (rgba.size, rgba.tobytes())
+    if len(cached[1]) <= _NATIVE_IMAGE_CACHE_BYTES:
+        _NATIVE_IMAGE_CACHE[key] = cached
+        while (len(_NATIVE_IMAGE_CACHE) > 128 or
+               sum(len(value[1]) for value in _NATIVE_IMAGE_CACHE.values()) > _NATIVE_IMAGE_CACHE_BYTES):
+            _NATIVE_IMAGE_CACHE.pop(next(iter(_NATIVE_IMAGE_CACHE)))
+    return Image.frombytes('RGBA', cached[0], cached[1])
+
 def collect_material(addon, source, mat, images, textures, temporary, encode,
                      existing=None, texture_only=False, mid=None,
                      texture_cache=None, existing_package=None):
@@ -372,8 +420,8 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
             png = disk if direct else Path(temporary)/(hashlib.sha256(section.encode()).hexdigest()+'.png')
             if not direct:
                 addon.write_texture(png, image)
-            with Image.open(png) as img:
-                mip = img.convert('RGBA'); width, height = mip.size; raw = bytearray(); count = 0
+            with texture_bitmap(png, direct) as mip:
+                width, height = mip.size; raw = bytearray(); count = 0
                 settings = dict(colorSpace=0 if str(image.get('eiem_linear', 'false')) == 'true' else 1,
                                 filter=int(image.get('eiem_filter',1)), wrap=int(image.get('eiem_wrap',0)),
                                 aniso=int(image.get('eiem_aniso',1)), mipBias=float(image.get('eiem_mip_bias',0)))
@@ -409,7 +457,7 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
         edits.append(dict(property=prop, texture=tid))
     return dict(id=mid, sourcePath=matpath, sourceAsset=matasset,
                 nativeTypeHash=native['native']['typeHash'], textureEdits=edits,
-                fieldData={} if texture_only else material_fields(source.tree(native), overrides, encode))
+                fieldData={} if texture_only else native_material_fields(source, native, overrides, encode))
 
 def _replace_published_file(source, destination):
     # ReplaceFile preserves the runtime reader's delete-shared old snapshot.
@@ -616,7 +664,8 @@ def export_native_package(*args, **kwargs):
 
 def _export_native_package(addon, destination, mesh_objects, armatures=None,
                           physics_objects=None, mesh_only=False, lod_levels=None,
-                          include_switches=True, source_baseline='', resource_scope='ALL', resource_cache=None):
+                          include_switches=True, source_baseline='', resource_scope='ALL', resource_cache=None,
+                          game_directory=''):
     import bpy
     started = time.perf_counter()
     vendor=Path(__file__).parent/'vendor'
@@ -652,9 +701,7 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
         from .eiem_offline_reload import reload_context, compile_reload, prepare_static_sources, publish_reload
     else:
         from eiem_offline_reload import reload_context, compile_reload, prepare_static_sources, publish_reload
-    offline_context = reload_context(destination)
-    if offline_context is None:
-        raise ValueError('完整原生导出需要离线编译目标：请设置 EFF_RELOAD_GAME，或直接导出到游戏 plugin/mods/<Mod>，并提供经过结构校验的静态来源输入')
+    offline_context = reload_context(destination, game_directory=game_directory)
     if destination == source.package or source.package in destination.parents:
         raise ValueError('不能覆盖原生来源目录')
     bpy.context.view_layer.update()
