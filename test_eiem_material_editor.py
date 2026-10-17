@@ -98,6 +98,85 @@ try:
     values,images=package.eiem_blender_addon.material_override_payload(mat,{},force=True)
     assert not any('editor_' in line for line in values), 'UI state leaked into native material fields'
     assert not any(line.startswith('texture.') for line in values), 'empty slot was exported'
+
+    # Existing CharacterNPR projects get paired feature controls without
+    # mutating source fields on opening, drawing, or schema preparation.
+    mat['eiem_shader']='HGRP/CharacterNPR'
+    for name in ('_ClearCoat','_EnableCharacterVFX','_EmissionAlphaBrightBreath','_UseSpecRampMap',
+                 '_EnableStylizedFresnel','_EnableAlphaTest'):
+        mat['eiem_float.'+name]='0'
+    for slot in ('_ClearCoatMask','_VFXSpecialMainTex','_VFXSpecialBlendTex','_SpecRampMap'):
+        mat['eiem_texture_scale.'+slot]='1,1'
+        mat['eiem_texture_offset.'+slot]='0,0'
+    mat['eiem_float._ClearCoatSmoothness']='0.94'
+    mat['eiem_float._EmissionAlphaBrightBreathSpeed']='1.6'
+    mat['eiem_value4._BaseMapUVSpeed']='0,0,7,8'
+    mat.eiem_editor_search='';mat.eiem_editor_advanced=False
+    def native():return {key:str(value) for key,value in mat.items() if not key.startswith('eiem_editor_')}
+    before=native();editor._prepare_material(mat)
+    fields=[];editor.draw(Layout(fields),mat)
+    assert before==native(), 'profile setup/draw rewrote an old source material'
+    assert ('eiem_float._ClearCoatSmoothness','scalar') not in fields
+    assert ('eiem_texture._ClearCoatMask','text') not in fields
+    mat.eiem_editor_features['clearcoat'].enabled=True
+    assert mat['eiem_keyword._CLEARCOAT']=='1'
+    fields=[];editor.draw(Layout(fields),mat)
+    assert ('eiem_texture._ClearCoatMask','text') in fields, 'enabled empty declared slot needs no add-slot action'
+    assert ('eiem_float._ClearCoatSmoothness','scalar') in fields
+    assert 'eiem_texture._ClearCoatMask' not in mat, 'virtual slot wrote an empty native override'
+    mat.eiem_editor_features['clearcoat'].enabled=False
+    assert mat['eiem_float._ClearCoatSmoothness']=='0.94'
+    mat['eiem_texture._ClearCoatMask']='preserved-mask.png'
+    fields=[];editor.draw(Layout(fields),mat)
+    assert ('eiem_texture._ClearCoatMask','text') in fields, 'bound paths should stay at the top even when a feature is off'
+    assert ('eiem_float._ClearCoatSmoothness','scalar') not in fields
+    mat['eiem_texture._ClearCoatMask']=''
+    mat.eiem_editor_features['vfx'].enabled=True
+    mat.eiem_editor_groups['vfx'].expanded=False
+    fields=[];editor.draw(Layout(fields),mat)
+    for slot in ('_VFXSpecialMainTex','_VFXSpecialBlendTex'):
+        assert ('eiem_texture.'+slot,'text') in fields
+        assert fields.index(('eiem_texture.'+slot,'text')) < fields.index(('vfx','enabled')), 'texture path was buried inside feature controls'
+    editor._row(mat,'eiem_value4._BaseMapUVSpeed').uv_speed=(0,0.2)
+    assert mat['eiem_value4._BaseMapUVSpeed'].split(',')[2:]==['7','8']
+    mat.eiem_editor_features['breath'].enabled=True
+    assert mat['eiem_keyword._EMISSION']=='1' and mat['eiem_keyword._CHARACTER_VFX_SPECIAL']=='1'
+    mat.eiem_editor_surface='CUTOUT'
+    assert mat['eiem_keyword._ALPHATEST_ON']=='1' and mat['eiem_render_queue']=='2450'
+    mat['eiem_float._ZWrite']='1'
+    mat.eiem_editor_surface='TRANSPARENT'
+    assert mat['eiem_keyword._ALPHATEST_ON']=='0' and mat['eiem_keyword._ALPHABLEND_ON']=='1'
+    assert mat['eiem_float._AlphaPremultiply']=='1' and mat['eiem_float._ZWrite']=='1'
+    values,_=package.eiem_blender_addon.material_override_payload(mat,{},force=True)
+    for value in ('keyword._EMISSION=1','keyword._CHARACTER_VFX_SPECIAL=1',
+                  'keyword._ALPHABLEND_ON=1','float._SurfaceType=1','float._AlphaPremultiply=1'):
+        assert value in values, 'paired UI state did not reach author payload: '+value
+    assert not any('editor_' in value for value in values)
+    assert not any(value.startswith('texture._VFXSpecial') for value in values)
+    before=native();controls=len(mat.eiem_editor_values)
+    for _ in range(3):editor.draw(Layout([]),mat)
+    assert native()==before and controls==len(mat.eiem_editor_values), 'profile draw mutated state'
+    mat.eiem_editor_advanced=True
+    for group in mat.eiem_editor_groups:group.expanded=True
+    fields=[];editor.draw(Layout(fields),mat)
+    assert ('eiem_float._ClearCoatSmoothness','scalar') in fields, 'raw escape hatch lost a disabled field'
+    effect=bpy.data.materials.new('Dedicated VFX Editor Test')
+    try:
+        effect['eiem_shader']='HGRP/CharacterNPR_VFX'
+        effect['eiem_float._UseBlend']='0';effect['eiem_float._UseMask']='0'
+        for slot in ('_MainTex','_BlendTex','_MaskTex'):
+            effect['eiem_texture_scale.'+slot]='1,1'
+        editor._prepare_material(effect)
+        effect.eiem_editor_features['blend'].enabled=True
+        effect.eiem_editor_features['mask'].enabled=True
+        effect.eiem_editor_groups['blend'].expanded=False
+        fields=[];editor.draw(Layout(fields),effect)
+        for slot in ('_MainTex','_BlendTex','_MaskTex'):
+            assert ('eiem_texture.'+slot,'text') in fields
+        assert effect['eiem_keyword._USE_BLEND']=='1' and effect['eiem_keyword._USE_MASK']=='1'
+        assert 'eiem_keyword._CHARACTER_VFX_SPECIAL' not in effect
+    finally:
+        bpy.data.materials.remove(effect)
 finally:
     bpy.data.materials.remove(mat)
     package.unregister()

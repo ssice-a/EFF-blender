@@ -104,7 +104,7 @@ jobs:
           $env:TEMP = $testTemp
           $env:TMP = $testTemp
           $env:PYTHONPATH = "$pwd/tools/Blender;$pwd/tools"
-          python -m unittest test_eiem_native_export_core test_eiem_native_publish test_eiem_offline_reload test_eiem_release test_eiem_shape_animation_package
+          python -m unittest test_eiem_native_export_core test_eiem_native_publish test_eiem_offline_reload test_eiem_release test_eiem_shape_animation_package test_eiem_material_features
           if ($LASTEXITCODE -ne 0) { throw 'Author export tests failed' }
       - uses: softprops/action-gh-release@v2
         with:
