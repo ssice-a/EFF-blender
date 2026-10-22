@@ -320,7 +320,7 @@ def resolve_game_directory(destination=None, configured=''):
     raise ValueError('未找到终末地游戏，请在导出窗口选择“游戏目录”；选择一次后会记住，Mod 可导出到任意文件夹')
 
 
-def reload_context(destination, game_directory=''):
+def reload_context(destination, game_directory='', effect_update=False):
     destination = Path(destination).resolve()
     game = resolve_game_directory(destination, game_directory)
     baseline = destination / 'compiled.bin'
@@ -330,6 +330,8 @@ def reload_context(destination, game_directory=''):
         raise ValueError('当前 DLL 不支持独立 Mod 编译结构，请安装配套 DLL')
     candidates = [Path(__file__).parent / 'nativepack/eff_resource_pack.exe']
     compiler, declaration = _select_compiler(candidates, protocol)
+    if effect_update and declaration.get('effectAuthorUpdate')!='effects-only/validated-character-inputs/1':
+        raise ValueError('配套资源编译器不支持向角色包追加特效，请更新完整 Blender 插件')
     if declaration.get('compiledMod') != COMPILED_MOD:
         raise ValueError('插件缺少支持独立 Mod 编译结果的配套工具，请安装完整插件包')
     return compiler, baseline, cache, game
@@ -379,6 +381,13 @@ def compile_reload(destination, context=None, previous=None, source_index=None):
         raise ValueError('插件或 DLL 不支持独立 Mod 编译结构，请更新配套文件')
     destination = Path(destination).resolve()
     command = [str(compiler), '--export-mod', str(destination), str(game)]
+    declarations=(destination/'mod.ini').read_text(encoding='utf-8-sig') if (destination/'mod.ini').is_file() else ''
+    for prefix,field,expected in (
+            ('MaterialAnimation','materialAnimation','sampled-material-property-clips/renderer-slot-block/le32/1'),
+            ('EffectAttachment','effectAttachment','isolated-native-effect/mesh-owner+bone/le32/1'),
+            ('EffectAttachment','effectTarget','source-prefab+renderer+mesh+bone-palette/strings/1')):
+        if '['+prefix in declarations and (protocol.get('structures',{}).get(field)!=expected or consumer is not None and consumer.get('structures',{}).get(field)!=expected):
+            raise ValueError('当前编译器或游戏 DLL 未声明 '+prefix+' 支持，请安装配套测试版本；上一 Mod 保留')
     if (destination/'mod.ini').is_file() and '[ShapeAnimation' in (destination/'mod.ini').read_text(encoding='utf-8-sig'):
         expected='sampled-shape-weight-clips/le32/1'
         if protocol.get('structures',{}).get('shapeAnimation')!=expected or consumer is not None and consumer.get('structures',{}).get('shapeAnimation')!=expected:

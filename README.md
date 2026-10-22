@@ -1,8 +1,8 @@
 # EFF Blender 插件
 
-EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以在 Blender 中编辑网格、材质、贴图、款式切换和形态键，然后导出可放入 EFF `plugin/mods` 的 Mod 文件夹。
+EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以在 Blender 中编辑网格、材质、贴图、款式切换、形态键和粒子特效，然后导出可放入 EFF `plugin/mods` 的 Mod 文件夹。
 
-本次发布 **v0.46.0**，配套 [EFF v1.8.1](https://github.com/ssice-a/EFF/releases/tag/v1.8.1) 与 [AnimeStudio v1.7.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.7.0)。Windows x64 插件包含原生导出核心、统一资源编译器、索引刷新工具及 Pillow；已在 Blender 5.0.1 / Python 3.11 验证。当前包支持 Windows x64 / Blender 5.0，内置依赖使用 Python 3.11 ABI；不同 Python ABI 需要另行构建依赖。
+本次发布 **v0.47.0**，配套 [EFF v1.9.0](https://github.com/ssice-a/EFF/releases/tag/v1.9.0) 与 [AnimeStudio v1.8.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.8.0)。Windows x64 插件包含原生导出核心、统一资源编译器、索引刷新工具及 Pillow；已在 Blender 5.0.1 / Python 3.11 验证。当前包支持 Windows x64 / Blender 5.0，内置依赖使用 Python 3.11 ABI；不同 Python ABI 需要另行构建依赖。
 
 带截图的[简易 Mod 制作教程](https://github.com/ssice-a/EFF/blob/main/Mod%20Tutorial.md)包含安装、解包、材质编辑和所选网格导出步骤；也提供[英文版](https://github.com/ssice-a/EFF/blob/main/Mod%20Tutorial_EN.md)。
 
@@ -15,6 +15,9 @@ EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以
 - 为形态键提供 Blender 滑块，并可按需录制游戏快捷键。
 - 在 N → EFF → 形态动画组管理中统一管理多网格播放组；每成员独立 Action/KEY slot，同一网格可加入多个组。游戏快捷键控制播放，Ins 提供暂停与实时倍率。
 - 创建款式切换组，设置默认款式和游戏快捷键。
+- 创建款式切换组时即可录制游戏快捷键；后续仍可在组设置中改键。
+- 将 `.efffx` 导入为空物体特效层级，按模块编辑发射器、生命周期、曲线、渐变、Billboard 序列帧、Mesh、材质和贴图；支持增删发射器及多个特效统一导出。
+- 在 Blender 场景中预览常用粒子、形状、Mesh 和序列帧；可将特效挂到角色骨骼，或导出独立特效 Mod，并覆盖全部 LOD。
 - 导出 format 2 完整 Mod，或更新已有 Mod 的 Mesh、材质和贴图；导出按键切换选项默认开启。
 - 分资源导出复用当前会话 Mesh 快照；同一次导出复用共享骨架的路径、供体及绑定信息；仅贴图导出保留已有完整 Mod 的其他资源。
 - 自动生成每个 Mod 的 `source-inputs.bin`，只编译当前导出的独立 Mod，生成 `compiled.bin`。
@@ -23,7 +26,7 @@ EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以
 
 ## 安装
 
-从 [Releases](https://github.com/ssice-a/EFF-blender/releases) 下载 `EFF_Blender_v0.46.0.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。旧版需要手动升级这一次以取得更新器。更新前保存工程、关闭 Blender，再替换旧插件并重新启动，以释放原生 DLL 和旧 Python 模块。
+从 [Releases](https://github.com/ssice-a/EFF-blender/releases) 下载 `EFF_Blender_v0.47.0.zip`，在 Blender 的插件设置中选择“从磁盘安装”，然后启用插件。旧版需要手动升级这一次以取得更新器。更新前保存工程、关闭 Blender，再替换旧插件并重新启动，以释放原生 DLL 和旧 Python 模块。
 
 之后可在 **N → EFF → EFF 更新**选择“仓库更新（自动测试）”，点击“检查更新”和“下载并准备更新”。下载期间可继续编辑；出现准备完成提示后，自行保存工程并关闭全部 Blender，更新器再替换插件，下次启动生效。不会自动保存、关闭工程或修改 Mod。旧插件位于插件父目录 `.eff-update-backups` 下，可在 Blender 关闭时恢复。
 
@@ -49,9 +52,11 @@ Blender 中选中已经导入的 EFF 骨架或绑定该骨架的网格，选择 
 
    **材质属性 → EFF 材质**按功能分组，提供开关、数字和 RGBA 控件；可搜索参数，通过“添加空贴图槽”绑定来源材质已有的空槽。关闭发光、描边会收起详细参数，已有贴图保留显示。设置示例见[材质说明](docs/material-effects.md)。
 4. 需要形态键时，在网格数据属性的 **EFF 形态键控制**中点击“接管当前形态键”。这会把已有的 Blender 形态键登记为导出滑块；它不会修改顶点，也不会自动创建游戏快捷键。快捷键需要在同一面板中单独录制。
-5. 选择要导出的 EFF 网格，在 EFF 面板或 **文件 → 导出** 中选择“导出所选 Mod”。首次选择“全部资源”；后续可以选择“仅 Mesh”“仅材质与贴图”或“仅贴图”更新已有完整 Mod。完整导出窗口中的“导出按键切换”默认勾选；取消后只导出默认款式，不导出款式和形态键快捷键，但仍保留形态键及其滑块。
+5. 选择要导出的 EFF 网格和/或特效，在 **文件 → 导出 → EFF Mod 包**统一导出。仅选特效根或子发射器时只导出所属完整特效，可一次多选多个特效；人物与特效一起选中则一起导出，挂载于所选人物 Mesh 的启用特效也会带上。首次选择“全部资源”；后续可用“仅 Mesh”“仅材质与贴图”或“仅贴图”更新已有完整人物 Mod。完整导出窗口中的“导出按键切换”默认勾选；取消后只导出默认款式，不导出款式和形态键快捷键，但仍保留形态键及其滑块。
 6. 在 EFF 导出区域填写 Mod 文件夹名，然后在文件浏览器中选择父目录；插件创建或刷新同名文件夹，把 `mod.ini`、`meshes/`、`materials/` 和 `textures/` 写入其中，再在暂存目录中完成独立编译和校验后发布。需要直接在游戏中使用时，父目录选择游戏的 `plugin/mods/`。文件浏览器里的文件名不决定 Mod 名称。
 7. 等待导出和离线准备完成，进入游戏后按 **F10** 热重载。按 **Ins** 独立勾选哪些 Mod 接收按键，默认全部启用，允许多个 Mod 同时响应。也可在各 `mod.ini` 的 `[Mod]` 中设置 `key_switch_enabled=0` 或 `1`。实际全局快捷键以游戏 `plugin/eff.ini` 为准。
+
+重复编辑后，用 **文件 → 导出 → EFF 快速更新所选 Mod** 更新上次目录，选择范围仍由本次所选资源决定。纯特效包使用专用目录，游戏按 F9 更新特效；人物包与纯特效包互相覆盖会被拒绝。
 
 导出窗口提供独立的“游戏目录”，可点文件夹按钮选择，也可自动识别；设置记在插件偏好中，供其他工程使用。支持选择游戏根目录、`Endfield.exe` 或启动器的 `games` 目录。多份安装需要明确选择一份。Mod 可以导出到桌面、制作目录或游戏 `plugin/mods`，不要求配置环境变量；游戏目录用于读取当前资源，仍需本机安装游戏。旧的 `EFF_RELOAD_GAME` 配置继续兼容。
 
@@ -83,6 +88,8 @@ Shader 功能开关也属于材质数据。可添加自定义属性 `eiem_keywor
 导出完成提示的贴图数按实际写入的不同 `.tex` 文件计数。多个材质绑定可共用一个贴图文件；未修改的游戏贴图保持游戏资源引用。
 
 透明裁剪、混合透明、自发光及呼吸/流光的字段和操作步骤见[材质效果设置](docs/material-effects.md)。呼吸和流光的参数存在性已核对，动态效果仍需在游戏验证。
+
+特效导入为根空物体，在 **数据属性 → EFF 特效 · 发射器**编辑模块/曲线/引用；支持基础 Mesh/billboard 离线预览、骨骼挂载。导出统一使用 **EFF Mod 包**，支持多个特效单独打包或随人物导出。普通 eff.dll 使用可配置 F9 重载，无需 PID 或额外 DLL，见[特效编辑说明](docs/effects-editor.md)。
 
 保留源包的 `source/manifest.json` 和 `source/serialized/` 供精确来源和字段模板读取；普通 Blender 导出不读取 `source/streams/` 的原始载荷快照。新解包贴图使用短名称，旧包的哈希名称按自己的 INI/manifest 继续使用，不能只改文件名而不更新引用。游戏 Mod 无需携带原包快照或全局索引。
 

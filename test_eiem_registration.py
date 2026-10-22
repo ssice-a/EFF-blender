@@ -44,6 +44,9 @@ for cycle in range(3):
     assert metadata.bl_info == module.bl_info == module.eiem_blender_addon.bl_info
     assert bpy.ops.eiem.import_package.get_rna_type() is not None
     assert bpy.ops.eiem.export_package.get_rna_type() is not None
+    assert bpy.ops.eiem.export_package.get_rna_type().properties['package_directory'].is_skip_save
+    assert bpy.ops.eiem.export_update.get_rna_type() is not None
+    assert hasattr(bpy.types.Scene,'eiem_export_last_directory')
     resource_scope = bpy.ops.eiem.export_package.get_rna_type().properties['resource_scope']
     assert resource_scope.default == 'ALL'
     assert [item.identifier for item in resource_scope.enum_items] == ['ALL', 'MESH', 'MATERIALS', 'TEXTURES']
@@ -58,7 +61,9 @@ for cycle in range(3):
     assert bpy.ops.eiem.export_physics.get_rna_type() is not None
     assert bpy.ops.eiem.physics_parameters.get_rna_type() is not None
     assert bpy.ops.eiem.physics_curve_key.get_rna_type() is not None
+    assert bpy.ops.eiem.switch_create.get_rna_type() is not None
     assert bpy.ops.eiem.switch_key_record.get_rna_type() is not None
+    assert bpy.ops.eiem.switch_create_confirm.get_rna_type() is not None
     assert bpy.ops.eiem.mesh_restore_source.get_rna_type() is not None
     assert bpy.ops.eiem.switch_state_drag.get_rna_type() is not None
     assert bpy.ops.eiem.switch_member_add.get_rna_type() is not None
@@ -68,6 +73,17 @@ for cycle in range(3):
     assert hasattr(bpy.types, "EFF_UL_switch_states")
     assert hasattr(bpy.types, "VIEW3D_PT_eiem_updates")
     assert hasattr(bpy.types, "EFF_PT_physics_editor")
+    assert hasattr(bpy.types, "EFF_PT_effect_object")
+    assert hasattr(bpy.types, "MATERIAL_PT_eiem_properties")
+    assert not hasattr(bpy.types, "EFF_PT_effect_material")
+    assert bpy.ops.eiem.effect_import.get_rna_type() is not None
+    assert bpy.ops.eiem.effect_export.get_rna_type() is not None
+    assert bpy.ops.eiem.effect_build.get_rna_type() is not None
+    assert bpy.ops.eiem.effect_curve_edit.get_rna_type() is not None
+    assert bpy.ops.eiem.effect_key.get_rna_type() is not None
+    assert 'toggle_keys' in module.eiem_blender_addon.effect_editor.EFF_PG_effect_object.bl_rna.properties
+    assert hasattr(bpy.types.Object, "eff_effect")
+    assert not hasattr(bpy.types.Scene, "eiem_effect_game_pid")
     assert not hasattr(bpy.types, "EFF_PT_physics_object")
     assert hasattr(bpy.types, "EFF_MT_physics_create")
     assert not hasattr(bpy.types, "EFF_MT_physics_copy")
@@ -102,7 +118,7 @@ for cycle in range(3):
     assert hasattr(bpy.types.Scene, "eiem_switch_active")
     assert hasattr(bpy.types.Scene, "eiem_source_baseline")
     assert hasattr(bpy.types.Collection, "eiem_switch_state_index")
-    assert len(callbacks(bpy.types.TOPBAR_MT_file_import)) == 1
+    assert len(callbacks(bpy.types.TOPBAR_MT_file_import)) == 2
     assert len(callbacks(bpy.types.TOPBAR_MT_file_export)) == 1
     assert tuple(bpy.data.objects) == scene_objects
 
@@ -112,6 +128,9 @@ for cycle in range(3):
     assert not callbacks(bpy.types.TOPBAR_MT_file_import)
     assert not callbacks(bpy.types.TOPBAR_MT_file_export)
     assert not hasattr(bpy.types.Scene, "eiem_switch_active")
+    assert not hasattr(bpy.types.Object, "eff_effect")
+    assert not hasattr(bpy.types, "EFF_PG_effect_key")
+    assert not hasattr(bpy.types, "EFF_PT_effect_object")
     assert not hasattr(bpy.types.Scene, "eiem_source_baseline")
     assert not hasattr(bpy.types.Collection, "eiem_switch_state_index")
     assert not hasattr(bpy.types.Object, "eiem_physics")

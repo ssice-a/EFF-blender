@@ -123,6 +123,23 @@ class MaterialFeatures(unittest.TestCase):
         with self.assertRaises(ValueError):
             ui.set_surface(material, 1)
 
+    def test_petal_shader_groups_and_switches_use_its_own_fields(self):
+        material = {'eiem_shader': 'HGRP/Effect/VFXDitherAlpha',
+                    'eiem_float._UseMain2': '0', 'eiem_float._UseDissolve': '0',
+                    'eiem_float._EnableNormalMap': '1', 'eiem_float._UseDisturb': '0',
+                    'eiem_texture_scale._MainTex2': '1,1'}
+        self.assertEqual(ui.owner(material, 'eiem_value4._MainTex2Color'), 'main2')
+        self.assertEqual(ui.owner(material, 'eiem_value4._MainTexUVSpeed'), 'main')
+        self.assertEqual(ui.owner(material, 'eiem_float._NormalScale'), 'normal')
+        for feature, keyword in (('main2', '_USE_MAIN2'), ('dissolve', '_USE_DISSOLVE'),
+                                 ('normal', '_NORMAL_MAP'), ('disturb', '_USE_DISTURB')):
+            ui.set_feature(material, feature, True)
+            self.assertEqual(ui.field(material, keyword, 'keyword'), '1')
+            ui.set_feature(material, feature, False)
+            self.assertEqual(ui.field(material, keyword, 'keyword'), '0')
+        self.assertNotIn('blend', [item['key'] for item in ui.features(material)])
+        self.assertNotIn('eiem_keyword._CHARACTER_VFX_SPECIAL', material)
+
 
 if __name__ == '__main__':
     unittest.main()

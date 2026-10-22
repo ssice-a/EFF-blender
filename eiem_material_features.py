@@ -26,7 +26,8 @@ def texture_slots(material):
 def profile(material):
     shader = str(material.get('eiem_shader', '')).strip()
     if shader:
-        return {'HGRP/CharacterNPR': 'character', 'HGRP/CharacterNPR_VFX': 'vfx'}.get(shader)
+        return {'HGRP/CharacterNPR': 'character', 'HGRP/CharacterNPR_VFX': 'vfx',
+                'HGRP/Effect/VFXDitherAlpha': 'vfx_dither'}.get(shader)
     def declared(slot):
         return any(prefix + slot in material for prefix in
                    ('eiem_texture.', 'eiem_texture_scale.', 'eiem_texture_offset.'))
@@ -83,18 +84,25 @@ VFX = (
             ('_MaskTex', '_MaskUV'), ('_UseMaskTexAsAlpha',)),
     feature('disturb', 'UV 扰动', '_UseDisturb', '_USE_DISTURB', ('_DisturbTex1',),
             ('_Disturb',), ('_Bi_Disturb',)),
-    feature('normal', '法线', '_EnableNormalMap', '_NORMAL_MAP', ('_NormalMap',), ('_NormalMap',)),
+    feature('normal', '法线', '_EnableNormalMap', '_NORMAL_MAP', ('_NormalMap',), ('_NormalMap',), ('_NormalScale',)),
     feature('fresnel', '菲涅耳边缘光', '_UseFresnel', '_USE_FRESNEL', prefixes=('_Fresnel',)),
     feature('emission', '特效发光', '_UseEmission', '_EMISSION', prefixes=('_Emission',)),
 )
-PROFILES = {'character': CHARACTER, 'vfx': VFX}
+# The pink-petal source Shader's native keyword table was checked directly.
+# Use its own main2/dissolve switches instead of CharacterNPR_VFX's blend layer.
+VFX_DITHER = tuple(item for item in VFX if item['key'] not in ('blend', 'emission')) + (
+    feature('main2', '第二主图', '_UseMain2', '_USE_MAIN2', ('_MainTex2',),
+            ('_MainTex2',), ('_UseMainTex2AsAlpha',)),
+    feature('dissolve', '溶解', '_UseDissolve', '_USE_DISSOLVE', ('_DissolveTex',), ('_Dissolve',)),
+)
+PROFILES = {'character': CHARACTER, 'vfx': VFX, 'vfx_dither': VFX_DITHER}
 
 # Frequently edited controls first. Less common source fields remain in the
 # feature's secondary foldout and in the complete raw view, without crowding
 # the primary workflow or pretending every saved legacy field is necessary.
 PRIMARY = {
     'pbr': ('_Metallic', '_Specular', '_Smoothness'),
-    'normal': ('_BumpScale', '_NormalMapUVSpeed'),
+    'normal': ('_BumpScale', '_NormalScale', '_NormalMapUVSpeed'),
     'diffuse': ('_DiffRampAddictive', '_RampCurveOffset'),
     'specular': ('_SpecRampIridescentMode',),
     'anisotropy': ('_AnisotropyValue', '_AnisotropyDirection', '_AnisotropyIntensityMultiplier'),
@@ -111,7 +119,9 @@ PRIMARY = {
     'main': ('_TintColor', '_TintColorIntensity', '_TintColorAlpha', '_UseMainTexAsAlpha', '_MainTexUVSpeed', '_MainUVSet'),
     'blend': ('_BlendTint', '_BlendTexUVSpeed', '_BlendUVSet'),
     'mask': ('_UseMaskTexAsAlpha', '_MaskTexUVSpeed', '_MaskUVSet'),
-    'disturb': ('_DisturbIntensity', '_DisturbUVSpeed1', '_Bi_Disturb'),
+    'disturb': ('_DisturbIntensity', '_DisturbUIntensity1', '_DisturbVIntensity1', '_DisturbUVSpeed1', '_Bi_Disturb'),
+    'main2': ('_MainTex2Color', '_UseMainTex2AsAlpha', '_MainTex2UVSpeed', '_MainTex2BlendMode'),
+    'dissolve': ('_DissolveScheduleOffset', '_DissolveEdgeSharp', '_DissolveEmissiveEdge'),
 }
 
 
@@ -218,9 +228,11 @@ def owner(material, key, items=None):
     for item in items:
         if name == item['switch'] or name == item['keyword'] or name in item['names'] or name in item['slots']:
             return item['key']
-    for item in items:
-        if any(name.startswith(prefix) for prefix in item['prefixes']):
-            return item['key']
+    # _MainTex2 fields belong to the second layer rather than _MainTex.
+    matching = [(len(prefix), item['key']) for item in items for prefix in item['prefixes']
+                if name.startswith(prefix)]
+    if matching:
+        return max(matching, key=lambda match: match[0])[1]
     if name in ('_BaseColor', '_BaseMap', '_Color'):
         return 'surface'
     return None

@@ -1,16 +1,17 @@
-# EFF Blender v0.46.0
+# EFF Blender v0.47.0
 
-配套：[EFF v1.8.1](https://github.com/ssice-a/EFF/releases/tag/v1.8.1)、[AnimeStudio v1.7.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.7.0)。
+配套：[EFF v1.9.0](https://github.com/ssice-a/EFF/releases/tag/v1.9.0)、[AnimeStudio v1.8.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.8.0)。
 
-- 材质按表面透明、PBR／法线、Ramp、清漆、边缘光、自发光、角色 VFX、视差和描边分组；功能开关联动 Shader 关键字，不再手填字符串。
-- 所有已绑定贴图集中顶部；开启功能时自动显示其已声明空槽，关闭功能保留设置并隐藏参数。保留完整原始参数入口与未知 Shader 原始编辑。
-- 透明模式下拉框同步裁剪／预乘混合、实际队列和标签，保留作者当前深度写入、双面及贴图选择；呼吸联动自发光与角色 VFX。
-- 新增仓库更新：main 推送通过自动测试后生成完整更新包，插件按提交 SHA 检查，无需作者每次手动发布 Release 或升版本号。仍可切换为仅检查正式 Release。
-- 用户点击“下载并准备更新”后先校验大小、SHA256、包内文件及来源身份；保存工程并关闭全部 Blender 后自动安装，保留完整旧插件备份。不会自动关闭／保存工程、改游戏 DLL 或 Mod；开发用源码链接不自动覆盖。
-- Python／UI 更新复用已验证的 v0.45.0 原生基础包，完整包含编译器、索引刷新器、作者核心和依赖。未改变离线包协议或 DLL；原生组件变化时需维护者另行构建配套基础包。
+- 新增对象级 `.efffx` 编辑：根 Empty 管理挂载和导出；发射器按来源层级组织，所有参数以内联类型控件编辑，并可添加、复制和删除发射器。
+- 提供 Emission、Shape、Initial、Velocity、Force、Size、Rotation、Color、Texture Sheet、Renderer 等模块块；保留未知源字段，模块可停用后再恢复。
+- 速度、大小、旋转等曲线使用 Blender 原生 Graph Editor 一起编辑；颜色渐变使用 Blender 原生 Color Ramp。
+- 支持 Billboard 序列帧、来源 Mesh 或自选 Mesh、材质和贴图引用；离线预览发射形状、粒子数量、运动、生命周期、渐隐、相机朝向和序列帧。
+- 特效可挂载角色骨骼或作为独立 Mod 导出；统一导出支持仅选特效、多个特效和角色加特效，并可让特效覆盖所有 LOD。
+- 创建款式切换组时直接录制快捷键；分资源导出仍复用当前 Mesh 快照，减少不必要的重复处理。
+- 使用由配套 EFF v1.9.0 构建并固定大小/SHA256 的原生基础包，包含 effectAttachment、standaloneEffect、作者核心和来源索引工具。
 
-旧版用户需先安装本次完整 ZIP，才能使用新更新器。Windows x64 / Blender 5.0 / Python 3.11，已在 Blender 5.0.1 验证。角色效果组合仍受游戏 Shader 变体限制，编辑器设置与实际游戏视觉验收不同。
+Windows x64 / Blender 5.0 / Python 3.11，已在 Blender 5.0.1 验证。预览是离线近似，不覆盖游戏的全部 Shader、碰撞和渲染行为；游戏画面仍需实机验收。更新前保存工程并关闭 Blender；包内工具只供作者离线导出，不安装到游戏目录。
 
 ## English
 
-Adds grouped material controls with paired Shader keywords, centralized texture paths and automatic declared empty slots. Adds opt-in installation from automatically tested main-branch packages, identified by source commit rather than version bumps. Downloads and validates a complete package, waits until all Blender processes close, then replaces the add-on with a full rollback backup. Stable Release checks remain available. Existing users must install this archive once to obtain the updater. Native tools are reused from an explicitly pinned, verified full base package; no game DLL or Mod changes are included.
+Adds object-owned `.efffx` editing with editable emitter blocks, Blender Graph Editor curves, Color Ramp gradients, Billboard flipbooks, source or custom Meshes, and material/texture references. The offline scene preview covers common particle shapes, counts, motion, lifetime, fade, camera-facing billboards and frame sequences. Effects can attach to character bones or export as standalone Mods, including all-LOD coverage. Switch shortcuts can be recorded while creating a group. The package uses a SHA256-pinned native base built for EFF v1.9.0. Blender preview remains an approximation of game rendering and collision.

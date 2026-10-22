@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 46, 0),
+    "version": (0, 47, 0),
     "blender": (5, 0, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
@@ -37,6 +37,7 @@ from mathutils import Matrix, Quaternion, Vector
 # reuse never crosses a Blender restart or enters a published Mod.
 _EXPORT_DIRTY_SERIAL = defaultdict(int)
 _EXPORT_IN_PROGRESS = False
+_EXPORT_SKELETON_TOKENS = None
 
 
 @bpy.app.handlers.persistent
@@ -181,6 +182,10 @@ def _skeleton_export_token(armature):
     """Fingerprint rest binding inputs, independently of pose evaluation."""
     if armature is None:
         return None
+    cache = globals().get('_EXPORT_SKELETON_TOKENS')
+    key = int(armature.as_pointer())
+    if cache is not None and key in cache:
+        return cache[key]
     digest = hashlib.sha1()
     for bone in armature.data.bones:
         for value in (bone.name, bone.parent.name if bone.parent else '',
@@ -189,9 +194,12 @@ def _skeleton_export_token(armature):
             digest.update(struct.pack('<I', len(encoded)))
             digest.update(encoded)
         digest.update(struct.pack('<16d', *(v for row in bone.matrix_local for v in row)))
-    return (int(armature.as_pointer()), int(armature.data.as_pointer()),
+    result = (int(armature.as_pointer()), int(armature.data.as_pointer()),
             _owner_property_digest(armature), _owner_property_digest(armature.data),
             digest.hexdigest())
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
 def _mesh_resource_token(obj):
@@ -221,8 +229,10 @@ if __package__:
     from . import eiem_offline_reload as offline_reload
     from . import eiem_physics_authoring as physics_authoring
     from . import eiem_material_editor as material_editor
+    from . import eiem_effect_editor as effect_editor
     from . import eiem_blender_controls as controls
     from . import eiem_shape_animation as shape_animation
+    from . import eiem_material_animation as material_animation
     from . import eiem_animation as animation_io
 else:
     _release_spec = importlib.util.spec_from_file_location(
@@ -253,6 +263,7 @@ else:
         "eiem_material_editor", Path(__file__).with_name("eiem_material_editor.py"))
     material_editor = importlib.util.module_from_spec(_material_spec)
     _material_spec.loader.exec_module(material_editor)
+    import eiem_effect_editor as effect_editor
     _controls_spec = importlib.util.spec_from_file_location(
         "eiem_blender_controls", Path(__file__).with_name("eiem_blender_controls.py"))
     controls = importlib.util.module_from_spec(_controls_spec)
@@ -264,6 +275,7 @@ if not __package__:
     shape_animation = importlib.util.module_from_spec(_shape_animation_spec)
     sys.modules[_shape_animation_spec.name] = shape_animation
     _shape_animation_spec.loader.exec_module(shape_animation)
+    import eiem_material_animation as material_animation
     _animation_spec = importlib.util.spec_from_file_location(
         "eiem_animation", Path(__file__).with_name("eiem_animation.py"))
     animation_io = importlib.util.module_from_spec(_animation_spec)
@@ -285,6 +297,7 @@ switch_members = controls.switch_members
 capture_switch_state = controls.capture_switch_state
 validate_switch_key = controls.validate_switch_key
 switch_key_from_event = controls.switch_key_from_event
+classify_switch_key_event = controls.classify_switch_key_event
 set_switch_group_key = controls.set_switch_group_key
 set_shape_control_hotkey = controls.set_shape_control_hotkey
 add_switch_state = controls.add_switch_state
@@ -1522,6 +1535,65 @@ def _orthogonalize_missing_tangents(mesh_name, generated, normals):
     return frames
 
 
+def _recover_zero_uv_tangents(mesh, generated, normals, missing):
+    """Recover MikkTSpace zero frames from actual float64 UV derivatives.
+
+    Very thin but nonzero triangles can produce a zero Mikk frame at one
+    corner. Only replace missing frames, using that corner's triangle and
+    exported normal; undefined UVs/geometry remain validation errors.
+    """
+    frames = np.asarray(generated, dtype=np.float64)
+    candidates = np.asarray(missing, dtype=np.int64)
+    values = frames[candidates]
+    invalid = (~np.isfinite(values).all(axis=1) |
+               ~(values[:, :3] != 0).any(axis=1) |
+               ~np.isin(values[:, 3], (-1, 1)))
+    pending = set(map(int, candidates[invalid]))
+    if not pending:
+        return generated
+    uv = mesh.uv_layers['UV0'].data
+    normals = np.asarray(normals, dtype=np.float64)
+    handedness = -1 if is_unity_left_handed(
+        mesh.get('eiem_coordinate_space', 'unity-y-up-left-handed')) else 1
+    recovered = 0
+    mesh.calc_loop_triangles()
+    for triangle in mesh.loop_triangles:
+        corners = pending.intersection(triangle.loops)
+        if not corners:
+            continue
+        positions = np.asarray([mesh.vertices[v].co for v in triangle.vertices], dtype=np.float64)
+        coords = np.asarray([uv[i].uv for i in triangle.loops], dtype=np.float64)
+        e1, e2 = positions[1:] - positions[0]
+        d1, d2 = coords[1:] - coords[0]
+        determinant = d1[0]*d2[1] - d1[1]*d2[0]
+        if (not np.isfinite(determinant) or determinant == 0 or
+                not np.isfinite(positions).all() or
+                not np.any(np.cross(e1, e2))):
+            continue
+        tangent = (e1*d2[1] - e2*d1[1]) / determinant
+        bitangent = (e2*d1[0] - e1*d2[0]) / determinant
+        for corner in sorted(corners):
+            normal = normals[corner]
+            normal_length = np.dot(normal, normal)
+            if not np.isfinite(normal_length) or normal_length == 0:
+                continue
+            value = tangent - normal * (np.dot(normal, tangent) / normal_length)
+            length = np.linalg.norm(value)
+            orientation = np.dot(np.cross(normal, value), bitangent)
+            if (not np.isfinite(length) or length == 0 or
+                    not np.isfinite(orientation) or orientation == 0):
+                continue
+            generated[corner] = (*value / length, (1 if orientation > 0 else -1) * handedness)
+            pending.remove(corner)
+            recovered += 1
+        if not pending:
+            break
+    if recovered:
+        print('[EFF] %s: recovered %d zero tangent corners from UV0 triangle derivatives' %
+              (mesh.name, recovered))
+    return generated
+
+
 def mesh_export_tangents(mesh, source_normals, normal_corners, preserve_normals):
     """Retain usable authored frames; generate only missing frames from UV0.
 
@@ -1671,6 +1743,9 @@ def mesh_export_tangents(mesh, source_normals, normal_corners, preserve_normals)
     finally:
         if has_ngons:
             bpy.data.meshes.remove(work)
+    normal_values = (np.asarray(source_normals)[loop_vertices]
+                     if preserve_normals else normal_corners)
+    generated = _recover_zero_uv_tangents(mesh, generated, normal_values, missing)
     # The no-authored-tangent path is by far the common case for newly edited
     # geometry.  Avoid allocating a mathutils.Vector and calling a helper for
     # every corner; the scalar form produces the same orthogonalized frame and
@@ -1678,8 +1753,6 @@ def mesh_export_tangents(mesh, source_normals, normal_corners, preserve_normals)
     # of loops.  The general branch below remains for partially authored
     # tangent attributes.
     if all_missing:
-        normal_values = (np.asarray(source_normals)[loop_vertices]
-                         if preserve_normals else normal_corners)
         generated = _orthogonalize_missing_tangents(mesh.name, generated, normal_values)
     else:
         for loop_index in missing:
@@ -1979,12 +2052,8 @@ def export_skin_binding(obj, armature, source_vertices, skin_cache=None):
         # metadata. Without a renderer bone palette none of it is a binding.
         if not parse_json_property(obj, "eiem_bone_paths_json", []):
             return ([], [], [], [], [], [], [])
-        return ([], parse_json_property(obj, "eiem_bindposes_json", []),
-                parse_json_property(obj, "eiem_bone_hashes_json", []),
-                parse_json_property(obj, "eiem_bone_paths_json", []),
-                parse_json_property(obj, "eiem_bone_index_paths_json", []),
-                parse_json_property(obj, "eiem_bone_sources_json", []),
-                parse_json_property(obj, "eiem_bone_source_candidates_json", []))
+        raise ValueError("%s 保留了蒙皮绑定，但缺少有效的 Armature 修改器；请将修改器关联到原骨架 %s" %
+                         (obj.name, obj.get('eiem_skeleton', '')))
     original = source_skin_binding(obj, armature)
     hashes = [int(x) for x in parse_json_property(obj, "eiem_bone_hashes_json", [])]
     if not original or len(hashes) != len(original):
@@ -2619,12 +2688,13 @@ def visible_eiem_resources(context=None):
         str(obj.data.get("eiem_section", "")), obj.name))
 
 
-def selected_eiem_resources(context=None):
+def selected_eiem_resources(context=None,allow_empty=False):
     context = context or bpy.context
     selected_objects = list(context.selected_objects)
     meshes = sorted(
         (obj for obj in selected_objects
-         if obj.type == "MESH" and obj.data.get("eiem_section")),
+         if obj.type == "MESH" and obj.data.get("eiem_section")
+         and effect_editor.root_of(obj) is None),
         key=lambda obj: str(obj.data.get("eiem_section", "")),
     )
     armatures = sorted(
@@ -2632,9 +2702,18 @@ def selected_eiem_resources(context=None):
          if obj.type == "ARMATURE" and obj.get("eiem_section")),
         key=lambda obj: str(obj.get("eiem_section", "")),
     )
-    if not meshes:
+    if not meshes and not allow_empty:
         raise ValueError("No EFF mesh objects selected")
     return meshes, armatures
+
+
+def selected_export_resources(context=None):
+    context=context or bpy.context
+    meshes,rigs=selected_eiem_resources(context,allow_empty=True)
+    effects=effect_editor.export_roots(context.selected_objects,meshes,sys.modules[__name__])
+    if not meshes and not effects:
+        raise ValueError('请选择 EFF 网格或特效根 / 发射器')
+    return meshes,rigs,effects
 
 
 def plan_mesh_only_export(mesh_objects):
@@ -2796,7 +2875,7 @@ def unique_export_section(requested, used, prefix):
 
 def export_package(root, mesh_objects=None, armatures=None, physics_objects=None,
                    mesh_only=False, lod_levels=None, include_switches=True,
-                   source_baseline='', resource_scope='ALL', game_directory=''):
+                   source_baseline='', resource_scope='ALL', game_directory='',effect_roots=None):
     """Export through the single format-2 author pipeline used by the UI.
 
     Selection and Blender dependency updates stay in this facade. Native
@@ -2805,7 +2884,8 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
     replacement writer.
     """
     if mesh_objects is None:
-        mesh_objects, selected_armatures = selected_eiem_resources()
+        mesh_objects, selected_armatures,selected_effects = selected_export_resources()
+        if effect_roots is None:effect_roots=selected_effects
         if armatures is None:
             armatures = selected_armatures
         if physics_objects is None:
@@ -2816,26 +2896,41 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
         source_baseline = getattr(bpy.context.scene, 'eiem_source_baseline', '')
     if bpy.context.mode != 'OBJECT':
         raise ValueError('请回到物体模式后导出')
+    if not mesh_objects:
+        if resource_scope!='ALL':raise ValueError('仅选择特效时请使用全部资源导出')
+        prefs=_addon_preferences(bpy.context)
+        return effect_editor.ExportBatch(effect_roots or (),root,game_directory or (prefs.game_directory if prefs else '')).run()
     game_directory = export_game_directory(root, game_directory)
     # Consume user edits before looking up the snapshot cache. Updates produced
     # by triangulation/tangent evaluation are consumed while suppressed so they
     # do not turn an unchanged second export into a false miss.
     bpy.context.view_layer.update()
-    global _EXPORT_IN_PROGRESS
+    global _EXPORT_IN_PROGRESS, _EXPORT_SKELETON_TOKENS
     previous_export = _EXPORT_IN_PROGRESS
+    previous_tokens = _EXPORT_SKELETON_TOKENS
+    # All Mesh snapshots in this synchronous export see the same rest rig.
+    # Recheck it on the next export, including direct bone-property edits.
+    _EXPORT_SKELETON_TOKENS = {}
     _EXPORT_IN_PROGRESS = True
     try:
-        return native_export.export_native_package(
+        result = native_export.export_native_package(
             sys.modules[__name__], root, list(mesh_objects or []),
             armatures=list(armatures or []), physics_objects=list(physics_objects or []),
             mesh_only=mesh_only, lod_levels=lod_levels,
             include_switches=include_switches, source_baseline=source_baseline,
-            resource_scope=resource_scope, game_directory=game_directory)
+            resource_scope=resource_scope, game_directory=game_directory,
+            effect_roots=effect_roots)
+        costs=result.get('exportCostsMs',{})
+        print('[EFF] 导出耗时：整理 %.2fs / 编译 %.2fs / 发布 %.2fs；网格缓存 %d 命中 / %d 重建'%(
+            costs.get('author',0)/1000,costs.get('compile',0)/1000,costs.get('publish',0)/1000,
+            result.get('meshSnapshotHits',0),result.get('meshSnapshotMisses',0)))
+        return result
     finally:
         try:
             bpy.context.view_layer.update()
         finally:
             _EXPORT_IN_PROGRESS = previous_export
+            _EXPORT_SKELETON_TOKENS = previous_tokens
 
 
 def export_visible_package(root, context=None):
@@ -2915,7 +3010,8 @@ class EFF_PT_material_properties(bpy.types.Panel):
         layout.use_property_split = False
         layout.use_property_decorate = False
         material = context.material
-        layout.operator("eiem.import_material", icon="IMPORT")
+        if material is None or not getattr(material, 'eff_effect_author', None):
+            layout.operator("eiem.import_material", icon="IMPORT")
         if material is None or not material.get("eiem_section"):
             layout.label(text="导入后分配到当前材质槽，不覆盖原材质数据块")
             return
@@ -3233,9 +3329,11 @@ class EFF_PT_image_properties(bpy.types.Panel):
 class EFF_OT_switch_create(bpy.types.Operator):
     bl_idname = "eiem.switch_create"
     bl_label = '从所选创建切换组'
+    bl_description = "先按下游戏快捷键，再确认组名并创建切换组；Esc 取消"
     bl_options = {"REGISTER", "UNDO"}
     group_name: StringProperty(name='组名', default='部件切换')
-    key: StringProperty(name="游戏快捷键", default="F6")
+    key: StringProperty(name="游戏快捷键", default="F6", options={"HIDDEN"})
+    object_names: StringProperty(options={"HIDDEN", "SKIP_SAVE"})
 
     @classmethod
     def poll(cls, context):
@@ -3244,16 +3342,72 @@ class EFF_OT_switch_create(bpy.types.Operator):
     def invoke(self, context, event):
         used = {g.get("eiem_key", "").upper() for g in switch_groups(context.scene)}
         self.key = next(("F%d" % i for i in range(6, 25) if i != 10 and "F%d" % i not in used), "")
+        self.object_names = json.dumps(
+            [obj.name for obj in context.selected_objects], ensure_ascii=False)
+        self._status(context, "创建切换组：请按游戏快捷键；Esc 取消")
+        context.window_manager.modal_handler_add(self)
+        self.report({'INFO'}, "请按下要用于新切换组的游戏快捷键；Esc 取消")
+        return {'RUNNING_MODAL'}
+
+    def _status(self, context, text=None):
+        workspace = getattr(context, "workspace", None)
+        if workspace and hasattr(workspace, "status_text_set"):
+            workspace.status_text_set(text=text)
+
+    def modal(self, context, event):
+        result, key = classify_switch_key_event(event)
+        if result == "WAIT":
+            return {'RUNNING_MODAL'}
+        if result == "CANCEL":
+            self._status(context)
+            return {'CANCELLED'}
+        if result == "INVALID":
+            self._status(context, "此键不能用于游戏切换；请按其他键，Esc 取消")
+            self.report({'WARNING'}, "此键不能用于游戏切换")
+            return {'RUNNING_MODAL'}
+        self.key = key
+        self._status(context)
+        bpy.ops.eiem.switch_create_confirm(
+            'INVOKE_DEFAULT', group_name=self.group_name, key=self.key,
+            object_names=self.object_names)
+        return {'CANCELLED'}
+
+    def draw(self, context):
+        self.layout.prop(self, "group_name")
+        self.layout.prop(self, "key", text="游戏快捷键")
+        self.layout.label(text="按键已录制，可在创建前修改", icon="EVENT_F")
+
+    def execute(self, context):
+        objects = [bpy.data.objects.get(name) for name in json.loads(self.object_names)]
+        objects = [obj for obj in objects if obj is not None]
+        try:
+            create_switch_group(self.group_name, self.key, objects, context.scene)
+            return {'FINISHED'}
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+
+
+class EFF_OT_switch_create_confirm(bpy.types.Operator):
+    bl_idname = "eiem.switch_create_confirm"
+    bl_label = "创建切换组"
+    bl_options = {"REGISTER", "UNDO"}
+    group_name: StringProperty(name="组名", default="部件切换")
+    key: StringProperty(name="游戏快捷键", default="F6")
+    object_names: StringProperty(options={"HIDDEN", "SKIP_SAVE"})
+
+    def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self)
 
     def draw(self, context):
         self.layout.prop(self, "group_name")
-        self.layout.label(text="将自动使用 %s；创建后可点“录制按键”修改" % (self.key or "可用快捷键"),
-                          icon="EVENT_F")
+        self.layout.prop(self, "key", text="游戏快捷键")
 
     def execute(self, context):
+        objects = [bpy.data.objects.get(name) for name in json.loads(self.object_names)]
+        objects = [obj for obj in objects if obj is not None]
         try:
-            create_switch_group(self.group_name, self.key, context.selected_objects, context.scene)
+            create_switch_group(self.group_name, self.key, objects, context.scene)
             return {'FINISHED'}
         except ValueError as error:
             self.report({'ERROR'}, str(error))
@@ -3646,6 +3800,7 @@ class EFF_PT_switches(bpy.types.Panel):
         name_row.prop(context.scene, "eiem_export_mod_name", text='Mod 文件夹名')
         layout.label(text='导出时自动创建或刷新该文件夹')
         layout.operator("eiem.export_package", text='导出所选 Mod', icon="EXPORT")
+        layout.operator("eiem.export_update", text='快速更新所选 Mod', icon="FILE_REFRESH")
 
 
 def draw_update_status(layout):
@@ -3771,9 +3926,13 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
     filename_ext = ""
     directory: StringProperty(subtype="DIR_PATH")
     scope_message: StringProperty(options={"HIDDEN"})
+    effect_only: BoolProperty(options={'HIDDEN'})
+    package_directory: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    _effect_job=None
+    _timer=None
     resource_scope: EnumProperty(
         name='导出资源', default='ALL',
-        items=(('ALL', '全部资源', '导出所选网格及其材质、贴图、控制配置'),
+        items=(('ALL', '全部资源', '导出所选网格、特效及其材质、贴图、控制配置'),
                ('MESH', '仅 Mesh', '更新已有 Mod 中所选网格的几何、骨骼、形态和形态动画'),
                ('MATERIALS', '仅材质与贴图', '更新所选网格引用的材质、贴图及 INI 声明'),
                ('TEXTURES', '仅贴图', '读取最新图片，更新贴图及绑定声明')))
@@ -3791,11 +3950,15 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
         return operator_lod_levels(self, meshes)
 
     def invoke(self, context, event):
+        # Only quick update (EXEC_DEFAULT) supplies an exact package root.
+        # A normal picker must also clear overrides remembered by older sessions.
+        self.package_directory = ''
         try:
-            meshes, _ = selected_eiem_resources(context)
-            plan = plan_mesh_only_export(meshes)
+            meshes, _,effects = selected_export_resources(context)
+            self.effect_only=not meshes
+            plan = plan_mesh_only_export(meshes) if meshes else dict(objects=[],hidden=[],sources=[])
             physics = selected_eiem_physics(context)
-            levels = self._lod_levels(meshes)
+            levels = self._lod_levels(meshes) if meshes else []
             self.scope_message = "所选 %d 个网格 / %d 个物理组 / 隐藏 %d 个 / %d 个源资源 / %d 个切换组" % (
                 len(plan["objects"]), len(physics), len(plan["hidden"]),
                 len(plan["sources"]), sum(
@@ -3803,44 +3966,103 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
                     for group in switch_groups(context.scene)))
             self.scope_message += " / LOD: " + (
                 ",".join(str(level) for level in levels) or "无")
+            self.scope_message += ' / %d 个特效'%len(effects)
+            if self.effect_only:self.resource_scope='ALL'
         except ValueError as error:
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
         prefill_export_game_directory(context, self.directory or self.filepath)
+        previous=getattr(context.scene,'eiem_export_last_directory','')
+        if previous and not self.filepath:self.filepath=previous
         return ExportHelper.invoke(self, context, event)
 
     def draw(self, context):
         self.layout.label(text=self.scope_message)
         draw_export_game_directory(self.layout, context)
         self.layout.prop(context.scene, "eiem_export_mod_name", text='Mod 文件夹名')
-        self.layout.prop(context.scene, "eiem_source_baseline", text='原生来源目录')
-        self.layout.prop(self, "resource_scope")
-        if self.resource_scope == 'ALL':
+        if self.effect_only:
+            self.layout.label(text='仅导出所选特效及其引用资源')
+            self.layout.label(text='已有角色包：追加 / 更新所选特效，保留角色与其他特效')
+        else:
+            self.layout.prop(context.scene, "eiem_source_baseline", text='原生来源目录')
+            self.layout.prop(self, "resource_scope")
+        if not self.effect_only and self.resource_scope == 'ALL':
             self.layout.prop(self, "include_switches")
             draw_lod_options(self.layout, self)
 
     def execute(self, context):
         try:
-            meshes, rigs = selected_eiem_resources(context)
+            meshes, rigs,effects = selected_export_resources(context)
+            self.effect_only=not meshes
+            destination=(Path(self.package_directory).resolve() if self.package_directory else
+                mod_export_directory(self.directory or os.path.dirname(self.filepath),
+                    self.filepath,context.scene.eiem_export_mod_name))
+            self._destination=str(destination)
+            if self.effect_only:
+                prefs=_addon_preferences(context)
+                self._effect_job=effect_editor.ExportBatch(effects,destination,prefs.game_directory if prefs else '')
+                if bpy.app.background:
+                    stats=self._effect_job.run();self._finish(context,stats);return {'FINISHED'}
+                if self._effect_job.poll():
+                    self._finish(context,self._effect_job.stats);return {'FINISHED'}
+                self._timer=context.window_manager.event_timer_add(.1,window=context.window)
+                context.window_manager.modal_handler_add(self)
+                return {'RUNNING_MODAL'}
             levels = self._lod_levels(meshes) if self.resource_scope == 'ALL' else None
             stats = export_package(
-                mod_export_directory(
-                    self.directory or os.path.dirname(self.filepath), self.filepath,
-                    context.scene.eiem_export_mod_name),
+                destination,
                 mesh_objects=meshes,
                 armatures=rigs,
                 physics_objects=selected_eiem_physics(context) if self.resource_scope == 'ALL' else [],
                 lod_levels=levels, include_switches=self.include_switches,
                 source_baseline=context.scene.eiem_source_baseline,
-                resource_scope=self.resource_scope)
-            self.report(
-                {'INFO'},
-                "已导出 %(meshes)d 个 Mesh、%(materials)d 个材质、"
-                "%(textures)d 张贴图（%(exportSeconds).1f 秒）" % stats,
-            )
+                resource_scope=self.resource_scope,effect_roots=effects)
+            self._finish(context,stats)
             return {'FINISHED'}
         except Exception as error:
+            self._cleanup(context)
             self.report({'ERROR'}, str(error)); return {'CANCELLED'}
+
+    def modal(self,context,event):
+        if event.type=='ESC':self._cleanup(context);return {'CANCELLED'}
+        if event.type!='TIMER':return {'PASS_THROUGH'}
+        try:
+            if not self._effect_job.poll():return {'PASS_THROUGH'}
+            self._finish(context,self._effect_job.stats);return {'FINISHED'}
+        except Exception as error:
+            self._cleanup(context);self.report({'ERROR'},str(error));return {'CANCELLED'}
+
+    def _finish(self,context,stats):
+        context.scene.eiem_export_last_directory=self._destination
+        self._cleanup(context)
+        if stats.get('characterEffectUpdate'):
+            self.report({'INFO'},'已更新角色包中的 %d 个特效（%.2f 秒）'%(stats['effects'],stats['exportSeconds']))
+            return
+        self.report({'INFO'},'已导出 %d 个 Mesh、%d 个材质、%d 张贴图、%d 个特效（%.2f 秒）'%(
+            stats['meshes'],stats['materials'],stats['textures'],stats.get('effects',0),stats['exportSeconds']))
+
+    def _cleanup(self,context):
+        if self._timer:context.window_manager.event_timer_remove(self._timer);self._timer=None
+        if self._effect_job:self._effect_job.close();self._effect_job=None
+
+    def cancel(self,context):self._cleanup(context)
+
+
+class EFF_OT_export_update(bpy.types.Operator):
+    bl_idname='eiem.export_update'
+    bl_label='快速更新所选 Mod'
+    bl_description='按当前选择更新上次 Mod 目录；支持一个或多个特效，以及人物与特效一起导出'
+
+    @classmethod
+    def poll(cls,context):
+        return bool(context.mode=='OBJECT' and getattr(context.scene,'eiem_export_last_directory','')
+            and not effect_editor._BUILD_RUNNING)
+
+    def execute(self,context):
+        destination=Path(bpy.path.abspath(context.scene.eiem_export_last_directory)).resolve()
+        result=bpy.ops.eiem.export_package('EXEC_DEFAULT',directory=str(destination.parent),
+            filepath=str(destination),package_directory=str(destination),resource_scope='ALL')
+        return {'FINISHED'} if result=={'RUNNING_MODAL'} else result
 
 
 class EFF_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
@@ -4125,6 +4347,7 @@ def menu_import(self, context):
 
 def menu_export(self, context):
     self.layout.operator(EFF_OT_export.bl_idname, text="EFF Mod 包")
+    self.layout.operator(EFF_OT_export_update.bl_idname, text='EFF 快速更新所选 Mod')
     self.layout.operator(EFF_OT_export_mesh_only.bl_idname, text='EFF 更新 Mesh')
 
 
@@ -4141,6 +4364,7 @@ classes = (
     EFF_OT_shape_key_record,
     EFF_PT_shape_controls,
     EFF_OT_switch_create,
+    EFF_OT_switch_create_confirm,
     EFF_OT_switch_key_record,
     EFF_UL_switch_states,
     EFF_OT_switch_state_drag,
@@ -4155,6 +4379,7 @@ classes = (
     EFF_OT_import_animation,
     EFF_OT_export,
     EFF_OT_export_mesh_only,
+    EFF_OT_export_update,
     EFF_PT_material_properties,
     EFF_PT_mesh_properties,
     EFF_OT_mesh_restore_source,
@@ -4172,7 +4397,9 @@ def register():
     for cls in classes: bpy.utils.register_class(cls)
     material_editor.register()
     shape_animation.register(sys.modules[__name__])
+    material_animation.register()
     physics_authoring.register(globals())
+    effect_editor.register()
     bpy.types.Mesh.eiem_shape_controls = CollectionProperty(type=EFF_PG_shape_control)
     bpy.types.Collection.eiem_switch_state_index = IntProperty(
         name='当前款式', default=0, min=0)
@@ -4185,6 +4412,8 @@ def register():
     bpy.types.Scene.eiem_export_mod_name = StringProperty(
         name="Mod folder name", default="",
         description="Create or refresh the selected Mod folder")
+    bpy.types.Scene.eiem_export_last_directory = StringProperty(
+        name='上次 Mod 导出目录',subtype='DIR_PATH',options={'HIDDEN'})
     bpy.types.TOPBAR_MT_file_import.append(menu_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_export)
 
@@ -4196,13 +4425,16 @@ def unregister():
     if _eiem_export_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_eiem_export_load_post)
     _eiem_export_load_post(None)
+    effect_editor.unregister()
     physics_authoring.unregister()
     shape_animation.unregister()
+    material_animation.unregister()
     material_editor.unregister()
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_export)
     del bpy.types.Scene.eiem_switch_active
     del bpy.types.Scene.eiem_export_mod_name
+    del bpy.types.Scene.eiem_export_last_directory
     del bpy.types.Scene.eiem_source_baseline
     del bpy.types.Collection.eiem_switch_state_index
     del bpy.types.Mesh.eiem_shape_controls

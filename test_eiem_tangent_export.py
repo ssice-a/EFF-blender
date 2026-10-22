@@ -1,5 +1,6 @@
 """Headless tangent export regressions; does not touch the user's Blender."""
 import importlib.util
+import math
 import struct
 import sys
 from pathlib import Path
@@ -8,6 +9,7 @@ import bpy
 from mathutils import Vector
 
 addon_path, output = map(Path, sys.argv[sys.argv.index('--') + 1:])
+sys.path.insert(0, str(addon_path.parent))
 spec = importlib.util.spec_from_file_location('eiem_tangent_export_test', addon_path)
 addon = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = addon
@@ -113,6 +115,51 @@ for corner, index in enumerate(indices):
     assert (tangent - Vector((-1 if corner < 3 else 1, 0, 0))).length < 1e-6
     assert (sign * normal.cross(tangent) - Vector((0,1,0))).length < 1e-6
 assert result['tangents'][5*4:6*4] == [0,0,0,0], 'Invented tangent on a loose vertex'
+
+# MikkTSpace can return a zero frame at a corner of a very thin triangle,
+# even though both geometry and UV0 have finite, nonzero derivatives. Keep
+# that authored triangle/UV and derive only its missing frame in float64.
+thin = bpy.data.meshes.new('ThinDerivativeTriangle')
+thin.from_pydata([
+    (.005176806356757879, .10240109264850616, .8831067085266113),
+    (.005288796499371529, .09985694289207458, .8830226063728333),
+    (.005176929756999016, .10240109264850616, .8831067085266113),
+], [], [(0,1,2)])
+thin_uv = thin.uv_layers.new(name='UV0')
+for i, uv in enumerate(((.40936279296875,.027083778753876686),
+                        (.40688133239746094,.027083754539489746),
+                        (.40936279296875,.027083730325102806))):
+    thin_uv.data[i].uv = uv
+thin.polygons[0].use_smooth = True
+thin.normals_split_custom_set([
+    (.026430722326040268,.4349936544895172,.9000455141067505),
+    (-.0037316977977752686,-.05335235595703125,.9985687732696533),
+    (-.08269882202148438,.38142648339271545,.9206925630569458),
+])
+thin.update()
+thin_obj=bpy.data.objects.new(thin.name,thin)
+bpy.context.scene.collection.objects.link(thin_obj)
+thin_result=export(thin_obj,'thin-derivative')
+assert thin_result['vertex_count']==3 and len(thin_result['indices'])==3
+for i in range(3):
+    n=Vector(thin_result['normals'][i*3:i*3+3])
+    t=Vector(thin_result['tangents'][i*4:i*4+3])
+    assert all(math.isfinite(v) for v in t)
+    assert abs(t.length-1)<1e-5 and abs(n.dot(t))<1e-5
+# A genuinely collapsed UV has no derivative; do not invent an arbitrary
+# basis just to pass validation when neither Blender nor UV0 supplies one.
+for uv in thin.uv_layers['UV0'].data:uv.uv=(0,0)
+thin.update()
+missing_frames=[(0,0,0,1)]*3
+unresolved=addon._recover_zero_uv_tangents(
+    thin,missing_frames,[tuple(c.vector) for c in thin.corner_normals],range(3))
+assert unresolved==[(0,0,0,1)]*3
+try:
+    addon._orthogonalize_missing_tangents(thin.name,unresolved,
+                                         [tuple(c.vector) for c in thin.corner_normals])
+    raise AssertionError('Collapsed UV0 acquired an invented tangent frame')
+except ValueError as error:
+    assert 'usable tangent' in str(error)
 
 # N-gons are legal Blender authoring input. Tangent generation triangulates
 # only its temporary working Mesh and leaves the source topology unchanged.

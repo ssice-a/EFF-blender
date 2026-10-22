@@ -1,7 +1,7 @@
 {
   "format": "EFF_BLENDER_NATIVE_BASE/1",
-  "framework": "v1.8.1",
-  "url": "https://github.com/ssice-a/EFF-blender/releases/download/v0.45.0/EFF_Blender_v0.45.0.zip",
-  "bytes": 47883263,
-  "sha256": "1185226459d5ff26eeb1d59c5a9d7c1fe28f824e603bf1a29208c445896ca921"
+  "framework": "v1.9.0",
+  "url": "https://github.com/ssice-a/EFF/releases/download/v1.9.0/EFF_Blender_Native_v0.47.0.zip",
+  "bytes": 47744149,
+  "sha256": "e41a870f1363479a0b7d4747e6fdd6f591ba016e171093866860b1ca49cfd2bc"
 }

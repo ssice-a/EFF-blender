@@ -565,6 +565,28 @@ class NativeExportCoreTests(unittest.TestCase):
         self.assertEqual(Path(modules['author_source'].__file__).resolve().parent,
                          (ROOT / 'tools/Blender/nativepack').resolve())
 
+    def test_parent_export_preserves_nested_mods(self):
+        import nativepack.ini_package as writer
+        import nativepack.ini_reader as reader
+        fixture_path=ROOT/'tools/nativepack/test_directory_package.py'
+        fixture=load_module('nested_export_fixture',fixture_path).fixture
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)/'lx';root.mkdir()
+            writer.export_directory(root,**fixture())
+            child=root/'effects'/'花瓣';child.mkdir(parents=True)
+            writer.export_directory(child,**dict(fixture(),mod_id='Petals'))
+            hashes={p.relative_to(child).as_posix():p.read_bytes() for p in child.rglob('*') if p.is_file()}
+            staging=Path(directory)/'staging'
+            exporter._clone_staging_tree(root,staging)
+            self.assertFalse((staging/'effects').exists())
+            ini=writer.ini_document(staging)
+            ini['Mod']['key_switch_enabled']='0'
+            exporter._detach_staging_files([staging/'mod.ini'])
+            writer.save_ini(staging,ini)
+            exporter.publish(staging,root,reader.read_package)
+            self.assertEqual({p.relative_to(child).as_posix():p.read_bytes() for p in child.rglob('*') if p.is_file()},hashes)
+            self.assertFalse(reader.read_package(root)['keySwitchEnabled'])
+
     def test_material_ids_do_not_alias_sources_and_remain_stable(self):
         first = Material('MaterialBody', dict(eiem_section='MaterialBody',
                          eiem_author_package='/source/first'))
@@ -613,7 +635,7 @@ class NativeExportCoreTests(unittest.TestCase):
         context = SimpleNamespace(mode='OBJECT', scene=SimpleNamespace(eiem_source_baseline='source'),
                                   view_layer=SimpleNamespace(update=lambda: calls.append('update')))
         namespace = dict(bpy=SimpleNamespace(context=context), sys=sys,
-                         __name__=__name__, _EXPORT_IN_PROGRESS=False,
+                         __name__=__name__, _EXPORT_IN_PROGRESS=False, _EXPORT_SKELETON_TOKENS=None,
                          export_game_directory=lambda root, configured: 'selected game')
 
         def fail(*args, **kwargs):
@@ -628,6 +650,7 @@ class NativeExportCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'bad author'):
             export_package('output', [object()], [], [], resource_scope='TEXTURES')
         self.assertFalse(namespace['_EXPORT_IN_PROGRESS'])
+        self.assertIsNone(namespace['_EXPORT_SKELETON_TOKENS'])
         self.assertEqual(calls, ['update', 'update'])
 
     def test_bundle_includes_hashing_and_accepts_known_layouts(self):

@@ -1,6 +1,6 @@
 """Real Blender switch authoring/planning test in a caller's temp folder.
 Native publication and format 2 are covered by the native export/INI tests."""
-import importlib.util
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -10,10 +10,9 @@ import bpy
 import bmesh
 
 addon_path, output = map(Path, sys.argv[sys.argv.index("--") + 1:])
-spec = importlib.util.spec_from_file_location("eiem_switch_test", addon_path)
-addon = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = addon
-spec.loader.exec_module(addon)
+addon_dir = addon_path.resolve().parent
+sys.path.insert(0, str(addon_dir.parent))
+addon = importlib.import_module(addon_dir.name + ".eiem_blender_addon")
 addon.register()
 assert hasattr(bpy.types, "VIEW3D_PT_eiem_switches")
 bpy.ops.object.select_all(action="SELECT")
@@ -179,6 +178,59 @@ assert addon.switch_key_from_event(KeyEvent("NUMPAD_MINUS")) == "NUMPADMINUS"
 assert addon.switch_key_from_event(KeyEvent("NUMPAD_ASTERIX")) == "NUMPADMULTIPLY"
 assert addon.switch_key_from_event(KeyEvent("NUMPAD_SLASH")) == "NUMPADDIVIDE"
 assert addon.switch_key_from_event(KeyEvent("NUMPAD_PERIOD")) == "NUMPADDECIMAL"
+assert addon.classify_switch_key_event(KeyEvent("A")) == ("KEY", "A")
+assert addon.classify_switch_key_event(KeyEvent("LEFT_CTRL")) == ("WAIT", None)
+assert addon.classify_switch_key_event(KeyEvent("ESC")) == ("CANCEL", None)
+assert addon.classify_switch_key_event(
+    KeyEvent("F8", ctrl=True, shift=True)) == ("KEY", "CTRL+SHIFT+F8")
+assert addon.classify_switch_key_event(KeyEvent("MOUSEMOVE"))[0] == "INVALID"
+recorded_key = addon.switch_key_from_event(KeyEvent("G", alt=True))
+recorded_group = addon.create_switch_group(
+    "CreatedWithRecordedKey", recorded_key, [obj])
+assert recorded_group["eiem_key"] == "ALT+G"
+addon.delete_switch_group(recorded_group)
+
+# The creation command must arm a modal recorder before creating anything,
+# then forward the captured chord into the confirmation that creates the group.
+class ModalWindowManager:
+    def __init__(self): self.handlers = []
+    def modal_handler_add(self, operator): self.handlers.append(operator)
+
+
+forwarded = []
+operator = SimpleNamespace(
+    group_name="ConfirmedWithRecordedKey", key="", object_names="",
+    _status=lambda context, text=None: None,
+    report=lambda level, text: None)
+manager = ModalWindowManager()
+context = SimpleNamespace(scene=bpy.context.scene, selected_objects=[obj],
+                           window_manager=manager, workspace=None)
+original_bpy = addon.bpy
+addon.bpy = SimpleNamespace(ops=SimpleNamespace(eiem=SimpleNamespace(
+    switch_create_confirm=lambda *args, **kwargs: forwarded.append((args, kwargs)))))
+try:
+    assert addon.EFF_OT_switch_create.invoke(
+        operator, context, KeyEvent("LEFTMOUSE")) == {'RUNNING_MODAL'}
+    assert manager.handlers == [operator]
+    assert operator.object_names == json.dumps([obj.name])
+    assert addon.EFF_OT_switch_create.modal(
+        operator, context, KeyEvent("G", ctrl=True)) == {'CANCELLED'}
+finally:
+    addon.bpy = original_bpy
+assert len(forwarded) == 1
+confirm_args, confirm_kwargs = forwarded[0]
+assert confirm_args == ("INVOKE_DEFAULT",)
+assert confirm_kwargs == {
+    "group_name": "ConfirmedWithRecordedKey",
+    "key": "CTRL+G",
+    "object_names": json.dumps([obj.name]),
+}
+assert bpy.ops.eiem.switch_create_confirm(
+    "EXEC_DEFAULT", **confirm_kwargs) == {'FINISHED'}
+confirmed_group = bpy.context.scene.eiem_switch_active
+assert confirmed_group.name == "ConfirmedWithRecordedKey"
+assert confirmed_group["eiem_key"] == "CTRL+G"
+addon.delete_switch_group(confirmed_group)
 assert addon.set_switch_group_key(top_group, "Ctrl+Shift+F8") == "CTRL+SHIFT+F8"
 assert addon.set_switch_group_key(acc_group, "shift+ctrl+f8") == "CTRL+SHIFT+F8"
 assert acc_group["eiem_key"] == top_group["eiem_key"]

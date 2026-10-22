@@ -305,12 +305,14 @@ def draw_value(layout, material, key, simple=False):
     _value_layout(layout, label).prop(row, field, text='')
 
 
-def context_material(context):
+def context_material(context, material_name=''):
+    if material_name:
+        return bpy.data.materials.get(material_name)
     return getattr(context, 'material', None) or getattr(getattr(context,'object',None),'active_material',None)
 
 
 def empty_slot_items(self, context):
-    material = context_material(context)
+    material = context_material(context, getattr(self, 'material_name', ''))
     if not material:
         return []
     return [_SLOT_ITEMS.setdefault(name,(name, name, '为 Shader 已声明的空贴图槽添加图片')) for name in texture_slots(material)
@@ -322,6 +324,7 @@ class EFF_OT_material_texture_add(bpy.types.Operator):
     bl_label = '添加空贴图槽'
     bl_options = {'REGISTER', 'UNDO'}
     slot: EnumProperty(name='贴图槽', items=empty_slot_items)
+    material_name: StringProperty(options={'HIDDEN'})
 
     def invoke(self, context, event):
         if not empty_slot_items(self, context):
@@ -330,10 +333,10 @@ class EFF_OT_material_texture_add(bpy.types.Operator):
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
-        material = context_material(context)
+        material = context_material(context, self.material_name)
         if material is None or self.slot not in texture_slots(material):
             return {'CANCELLED'}
-        bpy.ops.eiem.material_texture_file('INVOKE_DEFAULT', slot=self.slot)
+        bpy.ops.eiem.material_texture_file('INVOKE_DEFAULT', slot=self.slot, material_name=material.name)
         return {'FINISHED'}
 
 
@@ -342,10 +345,11 @@ class EFF_OT_material_texture_file(ImportHelper, bpy.types.Operator):
     bl_label = '选择材质贴图'
     bl_options = {'REGISTER', 'UNDO'}
     slot: StringProperty(options={'HIDDEN'})
+    material_name: StringProperty(options={'HIDDEN'})
     filter_glob: StringProperty(default='*.png;*.tga;*.jpg;*.jpeg;*.tif;*.tiff;*.bmp;*.exr', options={'HIDDEN'})
 
     def execute(self, context):
-        material = context_material(context)
+        material = context_material(context, self.material_name)
         if material is None or self.slot not in texture_slots(material):
             self.report({'ERROR'}, 'Shader 没有声明此贴图槽')
             return {'CANCELLED'}
@@ -369,8 +373,8 @@ def _draw_raw(layout, material):
             continue
         line = _value_layout(texture_box, name)
         line.prop(material.eiem_editor_values.get(key), 'text', text='')
-        line.operator('eiem.material_texture_file', text='', icon='FILE_FOLDER').slot = name
-    texture_box.operator('eiem.material_texture_add', icon='ADD')
+        op = line.operator('eiem.material_texture_file', text='', icon='FILE_FOLDER'); op.slot = name; op.material_name = material.name
+    texture_box.operator('eiem.material_texture_add', icon='ADD').material_name = material.name
     groups = {group:[] for group,_ in GROUPS}
     for key in material.keys():
         if (key.startswith(_PARAMETER_PREFIXES)
@@ -433,7 +437,7 @@ def _draw_texture(layout, material, slot):
     row = material.eiem_editor_values[key]
     line = _value_layout(layout, features.label(key))
     line.prop(row, 'text', text='')
-    line.operator('eiem.material_texture_file', text='', icon='FILE_FOLDER').slot = slot
+    op = line.operator('eiem.material_texture_file', text='', icon='FILE_FOLDER'); op.slot = slot; op.material_name = material.name
     transforms = [kind + slot for kind in ('eiem_texture_scale.', 'eiem_texture_offset.') if kind + slot in material]
     if transforms:
         line.prop(row, 'uv_expanded', text='', icon='TRIA_DOWN' if row.uv_expanded else 'TRIA_RIGHT', emboss=False)
@@ -456,7 +460,7 @@ def _draw_textures(layout, material, items):
     for slot in declared:
         if slot in visible:
             _draw_texture(box, material, slot)
-    box.operator('eiem.material_texture_add', icon='ADD')
+    box.operator('eiem.material_texture_add', icon='ADD').material_name = material.name
 
 
 def _draw_surface(layout, material, ownership):

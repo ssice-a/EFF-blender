@@ -1,5 +1,6 @@
 """Exercise the real exporter with weights beyond the source mesh palette."""
 import importlib.util
+import types
 import json
 import sys
 import zlib
@@ -9,7 +10,10 @@ import bpy
 from mathutils import Matrix
 
 addon_path, output = map(Path, sys.argv[sys.argv.index('--') + 1:])
-spec = importlib.util.spec_from_file_location('eiem_skin_test', addon_path)
+package = types.ModuleType('eiem_skin_test')
+package.__path__ = [str(addon_path.parent)]
+sys.modules[package.__name__] = package
+spec = importlib.util.spec_from_file_location('eiem_skin_test.eiem_blender_addon', addon_path)
 addon = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = addon
 spec.loader.exec_module(addon)
@@ -172,6 +176,18 @@ assert abs(sum(weights)-1)<1e-6
 assert max(abs(a-b) for a,b in zip(weights,[.5/1.4,.4/1.4,.3/1.4,.2/1.4]))<1e-6
 assert weights_before==[(g.group,g.weight) for g in obj.data.vertices[0].groups]
 first=file.read_bytes()
+
+# A removed Armature modifier must not emit a nonempty palette with no skin.
+modifier=obj.modifiers[0]
+modifier.object=None
+try:
+    addon.write_mesh(file,obj)
+    raise AssertionError('missing Armature accepted a palette without skin')
+except ValueError as ex:
+    assert obj.name in str(ex) and 'Armature' in str(ex),str(ex)
+finally:
+    modifier.object=rig
+assert file.read_bytes()==first
 
 # A positive weight with no matching bone must fail, not turn into zero skin.
 obj.vertex_groups.new(name='MissingBone').add([0],.2,'REPLACE')

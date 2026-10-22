@@ -476,16 +476,9 @@ def _replace_published_file(source, destination):
         os.replace(source, destination)
 
 
-def publish(staging, destination, reader):
-    staging = Path(staging).resolve()
-    destination = Path(destination).resolve()
-    marker = destination/'mod.ini'
-    previous = None
-    if destination.exists() and any(destination.iterdir()):
-        if not marker.is_file():
-            raise ValueError('不能覆盖缺少 mod.ini 的目录，请选择新的 Mod 输出目录')
-        previous = reader(destination)
-    candidate = reader(staging)
+def package_changes(staging, destination, previous, candidate):
+    """Compare validated packages, including content-preserving hardlinks."""
+    staging, destination = Path(staging), Path(destination)
     old_files = previous['_files'] if previous is not None else set()
     new_files = candidate['_files']
 
@@ -506,6 +499,19 @@ def publish(staging, destination, reader):
 
     changed = [name for name in sorted(new_files) if not same_bytes(staging/name, destination/name)]
     removed = sorted(old_files - new_files)
+    return changed, removed
+
+
+def publish(staging, destination, reader, previous=None, candidate=None):
+    staging = Path(staging).resolve()
+    destination = Path(destination).resolve()
+    marker = destination/'mod.ini'
+    if destination.exists() and any(destination.iterdir()):
+        if not marker.is_file():
+            raise ValueError('不能覆盖缺少 mod.ini 的目录，请选择新的 Mod 输出目录')
+        if previous is None:previous = reader(destination)
+    if candidate is None:candidate = reader(staging)
+    changed, removed = package_changes(staging, destination, previous, candidate)
     if not changed and not removed:
         return previous if previous is not None else candidate
     release = getattr(reader, 'release_files', None)
@@ -566,7 +572,9 @@ def _clone_staging_tree(source, destination):
     """Clone a partial-export input with same-volume hardlinks when possible."""
     source, destination = Path(source), Path(destination)
     destination.mkdir(parents=True, exist_ok=False)
-    for path in source.rglob('*'):
+    modules,_=pack_modules()
+    package_files=importlib.import_module(modules['ini_reader'].__package__+'.mod_directory').package_files
+    for path in package_files(source):
         relative = path.relative_to(source)
         target = destination / relative
         if path.is_dir():
@@ -665,9 +673,11 @@ def export_native_package(*args, **kwargs):
 def _export_native_package(addon, destination, mesh_objects, armatures=None,
                           physics_objects=None, mesh_only=False, lod_levels=None,
                           include_switches=True, source_baseline='', resource_scope='ALL', resource_cache=None,
-                          game_directory=''):
+                          game_directory='',effect_roots=None):
     import bpy
     started = time.perf_counter()
+    detail = dict(meshSnapshot=0., materialTexture=0., meshEncoding=0., effect=0., writeAuthor=0.)
+    snapshot_hits = snapshot_misses = 0
     vendor=Path(__file__).parent/'vendor'
     if vendor.is_dir() and str(vendor) not in sys.path: sys.path.insert(0,str(vendor))
     if resource_scope not in ('ALL', 'MESH', 'MATERIALS', 'TEXTURES'):
@@ -695,6 +705,8 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
     if (destination/'mod.ini').is_file():
         existing_package = read_package(destination)
         existing_ini = modules['ini_package'].ini_document(destination)
+        if existing_ini['Mod'].get('type','')=='effect':
+            raise ValueError('该目录是独立特效 Mod，请为人物与特效选择另一个 Mod 文件夹')
     if resource_scope != 'ALL' and existing_ini is None:
         raise ValueError('部分导出需要已有的完整 Mod；首次请选择全部资源')
     if __package__:
@@ -803,7 +815,10 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                 original = addon.mesh_export_template(view)
                 identity = original.as_pointer()
                 if identity not in snapshots:
-                    snapshots[identity], _ = _cached_mesh_snapshot(addon, original, skin_cache)
+                    phase = time.perf_counter()
+                    snapshots[identity], hit = _cached_mesh_snapshot(addon, original, skin_cache)
+                    detail['meshSnapshot'] += (time.perf_counter()-phase)*1000
+                    snapshot_hits += int(hit);snapshot_misses += int(not hit)
                     snapshot_rigs[identity] = next((modifier.object for modifier in original.modifiers
                                                    if modifier.type == 'ARMATURE' and modifier.object), None)
                 if identity not in part_cache:
@@ -814,11 +829,15 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                         if mat is None: raise ValueError(original.name+' 缺少材质槽 '+str(slot))
                         mid = material_sections[mat.as_pointer()]
                         if resource_scope == 'ALL' and mid not in materials:
+                            phase = time.perf_counter()
                             materials[mid] = collect_material(addon, material_source(source, mat, material_sources), mat, images, textures, temporary,
                                                               encode, mid=mid, texture_cache=texture_cache,
                                                               existing_package=existing_package)
+                            detail['materialTexture'] += (time.perf_counter()-phase)*1000
+                        phase = time.perf_counter()
                         fields = native_mesh_fields(modules, source, target, author,
                                                     snapshots[identity], slot, asset, encode)
+                        detail['meshEncoding'] += (time.perf_counter()-phase)*1000
                         pid = mesh_part_id(original.name, slot, len(splits))
                         controls = controls_by_object.get(identity, [])
                         parts.append(dict(partId=pid,object=pid,material=mid,vertices=author['vertex_count'],
@@ -840,16 +859,29 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                 rules.append(dict(_key=key,sourcePath=path,sourceAsset=asset,hidden=not members,parts=members,
                                   targets=[dict(level=level,sourcePath=path,sourceAsset=asset)]))
         # Hide rules across LODs group by the exact original author's family.
+        material_clips=None
+        if resource_scope in {'ALL','MATERIALS'}:
+            material_clips=[];seen_materials=set()
+            for view in objects:
+                original=addon.mesh_export_template(view)
+                for mat in original.data.materials:
+                    if mat and mat.as_pointer() not in seen_materials and mat.as_pointer() in material_sections:
+                        seen_materials.add(mat.as_pointer());material_clips.extend(addon.material_animation.export_clips(mat,material_sections[mat.as_pointer()],addon,include_switches))
+        phase = time.perf_counter()
+        effects=addon.effect_editor.export_attachments(objects,parts,addon,effect_roots or ()) if resource_scope=='ALL' else None
+        detail['effect'] = (time.perf_counter()-phase)*1000
         for rule in rules:
             base=min(rule['targets'],key=lambda t:t['level'])
             rule['sourcePath'],rule['sourceAsset']=base['sourcePath'],base['sourceAsset']
             base['level']=0
         if resource_scope == 'ALL':
+            phase = time.perf_counter()
             modules['ini_package'].export_directory(staging,mod_id=token(destination.name),parts=parts,
                         materials=list(materials.values()),textures=list(textures.values()),rules=rules,
                         switches=switches,resource_cache=resource_cache,
-                        key_switch_enabled=modules['ini_reader'].key_switch_enabled(
+                        material_clips=material_clips,effects=effects,key_switch_enabled=modules['ini_reader'].key_switch_enabled(
                             existing_ini['Mod'].get('key_switch_enabled', '1')) if existing_ini else True)
+            detail['writeAuthor'] = (time.perf_counter()-phase)*1000
             # A selected Mesh that actually weights a new chain needs that
             # chain's Skeleton/Physics resource in every matching prefab.
             # Selection of the visual Mesh already requests this dependency.
@@ -911,7 +943,7 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                 texture_paths))
             modules['ini_package'].update_directory(staging,parts=parts,materials=list(materials.values()),
                         textures=list(textures.values()),texture_only=resource_scope == 'TEXTURES',
-                        resource_cache=resource_cache)
+                        resource_cache=resource_cache,material_clips=material_clips,effects=effects)
         author_done = time.perf_counter()
         _detach_staging_files([staging / 'compiled.bin', staging / 'source-inputs.bin'])
         source_index = prepare_static_sources(staging, source.package, offline_context, previous=destination)
@@ -933,7 +965,8 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                     skeletons=len({obj.eiem_physics.rig for obj in physics_objects or []}),physics=len(physics_objects or []),format=2,
                     rules=len(rules) if resource_scope == 'ALL' else 0,
                     resourceScope=resource_scope,nativeSubmission=False,
-                    exportSeconds=time.perf_counter()-started,
+                    exportSeconds=time.perf_counter()-started,effects=len(effects or []),
+                    exportDetailMs=detail,meshSnapshotHits=snapshot_hits,meshSnapshotMisses=snapshot_misses,
                     exportCostsMs=dict(author=(author_done-started)*1000,
                                        compile=(compile_done-author_done)*1000,
                                        publish=(time.perf_counter()-compile_done)*1000), **offline)

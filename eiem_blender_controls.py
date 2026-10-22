@@ -239,6 +239,24 @@ def switch_key_from_event(event):
     return validate_switch_key("+".join(modifiers + [key]))
 
 
+def classify_switch_key_event(event):
+    """Classify a modal recording event without consuming unrelated input."""
+    if getattr(event, "value", "") != "PRESS":
+        return "WAIT", None
+    event_type = str(getattr(event, "type", "")).upper()
+    modifiers = any(bool(getattr(event, name, False))
+                    for name in ("ctrl", "shift", "alt"))
+    if event_type == "ESC" and not modifiers:
+        return "CANCEL", None
+    if event_type in {"LEFT_CTRL", "RIGHT_CTRL", "LEFT_SHIFT", "RIGHT_SHIFT",
+                      "LEFT_ALT", "RIGHT_ALT", "OSKEY"}:
+        return "WAIT", None
+    try:
+        return "KEY", switch_key_from_event(event)
+    except ValueError:
+        return "INVALID", None
+
+
 def set_switch_group_key(group, key, scene=None):
     scene = scene or bpy.context.scene
     key = validate_switch_key(key)
