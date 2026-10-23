@@ -85,8 +85,47 @@ class OfflineExportTests(unittest.TestCase):
             with patch.dict(os.environ,{},clear=True):
                 self.assertEqual(module.prepare_static_sources(root/'stage',source,None),current.resolve())
                 current.unlink()
-                with self.assertRaisesRegex(ValueError,'来源索引已不存在'):
+                self.assertEqual(module.prepare_static_sources(root/'stage',source,None),old.resolve())
+
+    def test_moved_project_uses_shared_index_for_selected_game_without_rewriting_manifest(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ,{},clear=True):
+            root=Path(folder);source=root/'project/character.eff';(source/'source').mkdir(parents=True)
+            manifest=source/'source/manifest.json';original=json.dumps(dict(sourceIndex=str(root/'missing/index.eidx')))
+            manifest.write_text(original)
+            game=self.make_game(root/'game');other=self.make_game(root/'other-game')
+            shared=root/'resources';shared.mkdir();workspace=root/'existing-workspace';index=workspace/'index/endfield_assets.eidx';index.parent.mkdir(parents=True);index.write_bytes(b'index')
+            wrong=root/'wrong-workspace';wrong_index=wrong/'index/endfield_assets.eidx';wrong_index.parent.mkdir(parents=True);wrong_index.touch()
+            registry=shared/'registry.json';registry.write_text(json.dumps(dict(format='EFF_SHARED_INDEXES/1',entries=[
+                dict(game=str(other),workspace=str(wrong)),dict(game=str(game),workspace=str(workspace))])))
+            with patch.dict(os.environ,{'EFF_RESOURCE_ROOT':str(shared)}):
+                with patch.object(module.subprocess,'run') as run:
+                    self.assertEqual(module.prepare_static_sources(root/'stage',source,(None,None,None,game)),index.resolve())
+                    run.assert_not_called()
+                self.assertEqual(module.shared_source_indexes(other),[wrong_index.resolve()])
+                self.assertEqual(manifest.read_text(),original)
+                registry.write_text('{broken')
+                with self.assertRaisesRegex(ValueError,'未找到资源索引'):
+                    module.prepare_static_sources(root/'stage',source,(None,None,None,game))
+
+    def test_explicit_index_configuration_is_respected_and_does_not_silently_fall_back(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ,{},clear=True):
+            root=Path(folder);source=root/'character.eff';source.mkdir();index=root/'index/endfield_assets.eidx';index.parent.mkdir();index.touch()
+            with patch.dict(os.environ,{'EFF_SOURCE_INDEX':str(root/'missing.eidx')}):
+                with self.assertRaisesRegex(ValueError,'EFF_SOURCE_INDEX'):
                     module.prepare_static_sources(root/'stage',source,None)
+            explicit=root/'explicit.eidx';explicit.touch()
+            with patch.dict(os.environ,{'EFF_SOURCE_INDEX':str(explicit)}):
+                self.assertEqual(module.prepare_static_sources(root/'stage',source,None),explicit.resolve())
+
+    def test_shared_index_default_location_and_malformed_entries(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ,{},clear=True):
+            root=Path(folder);game=root/'game';workspace=root/'workspace';index=workspace/'index/endfield_assets.eidx';index.parent.mkdir(parents=True);index.touch()
+            registry=root/'EFF/Resources/registry.json';registry.parent.mkdir(parents=True)
+            registry.write_text(json.dumps(dict(format='EFF_SHARED_INDEXES/1',entries=[None,{},dict(game=[],workspace='x'),
+                dict(game=str(game),workspace='invalid\0path'),
+                dict(game=str(game),workspace=str(workspace)),dict(game=str(game),workspace=str(workspace))])))
+            with patch.dict(os.environ,{'LOCALAPPDATA':str(root)}):
+                self.assertEqual(module.shared_source_indexes(game),[index.resolve()])
 
     def test_shape_animation_requires_shared_channel_playback_capability(self):
         capability='shared-channel-groups/replace-conflicting-playback'

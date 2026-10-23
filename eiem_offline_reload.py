@@ -337,6 +337,38 @@ def reload_context(destination, game_directory='', effect_update=False):
     return compiler, baseline, cache, game
 
 
+def shared_source_indexes(game):
+    """Discover only indexes registered for this installation; never scan disks."""
+    configured = os.environ.get('EFF_RESOURCE_ROOT')
+    local = os.environ.get('LOCALAPPDATA')
+    try:
+        root = Path(configured) if configured else (Path(local) if local else Path.home() / 'AppData/Local') / 'EFF/Resources'
+        registry = json.loads((root / 'registry.json').read_text('utf-8-sig'))
+        if not isinstance(registry, dict) or registry.get('format') != 'EFF_SHARED_INDEXES/1':
+            return []
+        entries = registry.get('entries')
+        if not isinstance(entries, list):
+            return []
+        def identity(path):
+            return os.path.abspath(path).replace('\\', '/').rstrip('/').lower()
+        selected = identity(game)
+        indexes = []
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get('game'), str) or not isinstance(entry.get('workspace'), str):
+                continue
+            try:
+                if not entry['game'] or not entry['workspace'] or identity(entry['game']) != selected:
+                    continue
+                candidate = Path(entry['workspace']).resolve() / 'index/endfield_assets.eidx'
+                if candidate.is_file() and candidate not in indexes:
+                    indexes.append(candidate)
+            except (OSError, ValueError, RuntimeError):
+                continue
+        return indexes
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return []
+
+
 def prepare_static_sources(destination, source_package, context, previous=None):
     """Seed the descriptor and locate the index; the compiler does discovery."""
     # Full exports start with an empty staging directory. Seed the previous
@@ -349,15 +381,23 @@ def prepare_static_sources(destination, source_package, context, previous=None):
             shutil.copyfile(prior, descriptor)
     configured = os.environ.get('EFF_SOURCE_INDEX')
     index = Path(configured).resolve() if configured else None
+    if index is not None and not index.is_file():
+        raise ValueError('EFF_SOURCE_INDEX 指定的索引不存在，请修正配置：' + str(index))
     source_package = Path(source_package).resolve()
     if index is None:
         manifest_path = source_package / 'source/manifest.json'
         if manifest_path.is_file():
             current = json.loads(manifest_path.read_text('utf-8-sig')).get('sourceIndex')
             if current:
-                index = Path(current).resolve()
-                if not index.is_file():
-                    raise ValueError('重新解包记录的来源索引已不存在，请在 AnimeStudio 重新打开对应工作区：' + str(index))
+                candidate = Path(current).resolve()
+                if candidate.is_file():
+                    index = candidate
+                else:
+                    print('[EFF] 来源记录中的旧索引路径不存在，继续查找本机共享索引：' + str(candidate), flush=True)
+    if index is None and context is not None:
+        candidates = shared_source_indexes(context[3])
+        if candidates:
+            index = candidates[0]
     if index is None:
         for parent in (source_package, *source_package.parents):
             candidate = parent / 'index/endfield_assets.eidx'
@@ -367,7 +407,9 @@ def prepare_static_sources(destination, source_package, context, previous=None):
     # The compiler validates the current layered game identity against the
     # index header before reusing a descriptor; a full index read is needed
     # only when declarations or the installed resource catalog have changed.
-    return index or source_package / 'index/endfield_assets.eidx'
+    if index is None:
+        raise ValueError('未找到资源索引。请在 AnimeStudio 选择本次游戏，打开已有工作区，或下载／导入／构建索引后重试；不需要重新解包已有角色')
+    return index
 
 
 def compile_reload(destination, context=None, previous=None, source_index=None):

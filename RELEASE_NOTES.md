@@ -1,6 +1,10 @@
-# EFF Blender v0.47.0
+# EFF Blender v0.48.0
 
-配套：[EFF v1.9.0](https://github.com/ssice-a/EFF/releases/tag/v1.9.0)、[AnimeStudio v1.8.0](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.8.0)。
+配套：[EFF v1.9.0](https://github.com/ssice-a/EFF/releases/tag/v1.9.0)、[AnimeStudio v1.8.1](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.8.1)。
+
+- 移动后的 Blender 工程会按当前游戏安装查找 AnimeStudio 登记的完整索引，不用把全量索引复制到每个项目。
+- 来源清单里的旧绝对索引路径失效时，自动尝试共享索引，并保留来源清单和摘要不变。
+- 显式设置的 `EFF_SOURCE_INDEX` 路径失效时给出明确错误，不会悄悄改用其他索引。
 
 - 新增对象级 `.efffx` 编辑：根 Empty 管理挂载和导出；发射器按来源层级组织，所有参数以内联类型控件编辑，并可添加、复制和删除发射器。
 - 提供 Emission、Shape、Initial、Velocity、Force、Size、Rotation、Color、Texture Sheet、Renderer 等模块块；保留未知源字段，模块可停用后再恢复。
