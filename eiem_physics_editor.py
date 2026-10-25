@@ -19,6 +19,7 @@ NATIVE = None
 GROUPS = {"GROUP", "NATIVE_GROUP"}
 COLLIDERS = {"COLLIDER", "NATIVE_COLLIDER"}
 _ENUM_ITEM_CACHE = {}
+_PRESET_ENUM_ITEM_CACHE = []
 PRESET_FORMAT = "EFF_PHYSICS_PRESET/1"
 PRESET_DIRECTORY = Path(__file__).with_name("physics_presets")
 
@@ -463,8 +464,39 @@ def add_scene_preset(scene, name, payload, source):
     preset.name = name
     preset.payload = json.dumps(payload, ensure_ascii=False, allow_nan=False)
     preset.source = source
-    scene.eiem_physics_editor_preset_index = next(index for index, item in enumerate(presets) if item == preset)
+    set_scene_preset_index(scene, next(index for index, item in enumerate(presets) if item == preset))
     return preset
+
+
+def preset_enum_items(scene, _context):
+    _PRESET_ENUM_ITEM_CACHE[:] = [
+        ("PRESET_%d" % index, preset.name,
+         {"BUILTIN": "随插件提供", "IMPORTED": "从文件导入", "PROJECT": "当前工程"}.get(preset.source, ""))
+        for index, preset in enumerate(scene.eiem_physics_editor_presets)]
+    if not _PRESET_ENUM_ITEM_CACHE:
+        _PRESET_ENUM_ITEM_CACHE.append(("NONE", "无可用预设", "保存当前链或导入预设文件"))
+    return _PRESET_ENUM_ITEM_CACHE
+
+
+def preset_choice_updated(scene, _context):
+    choice = scene.eiem_physics_editor_preset_choice
+    if choice == "NONE":
+        scene.eiem_physics_editor_preset_index = -1
+    elif choice.startswith("PRESET_"):
+        index = int(choice[7:])
+        if index < len(scene.eiem_physics_editor_presets):
+            scene.eiem_physics_editor_preset_index = index
+
+
+def set_scene_preset_index(scene, index):
+    presets = scene.eiem_physics_editor_presets
+    if not presets:
+        scene.eiem_physics_editor_preset_index = -1
+        scene.eiem_physics_editor_preset_choice = "NONE"
+        return
+    index = max(0, min(index, len(presets) - 1))
+    scene.eiem_physics_editor_preset_index = index
+    scene.eiem_physics_editor_preset_choice = "PRESET_%d" % index
 
 
 def refresh_bundled_presets(*_args):
@@ -487,9 +519,7 @@ def refresh_bundled_presets(*_args):
             preset.name = name
             preset.payload = json.dumps(payload, ensure_ascii=False, allow_nan=False)
             preset.source = "BUILTIN"
-        if scene.eiem_physics_editor_presets:
-            scene.eiem_physics_editor_preset_index = max(
-                0, min(scene.eiem_physics_editor_preset_index, len(scene.eiem_physics_editor_presets) - 1))
+        set_scene_preset_index(scene, scene.eiem_physics_editor_preset_index)
     return True
 
 
@@ -741,7 +771,7 @@ class EFF_OT_physics_editor_action(bpy.types.Operator):
                 else:
                     AUTHOR.document.require(presets[index].source != "BUILTIN", "随插件提供的内置预设不能删除")
                     presets.remove(index)
-                    context.scene.eiem_physics_editor_preset_index = max(0, min(index, len(presets) - 1))
+                    set_scene_preset_index(context.scene, min(index, len(presets) - 1))
             elif self.action == "RESET":
                 if NATIVE.is_native(obj):
                     raw = NATIVE.source.get_field(NATIVE.record(obj)["fields"], tuple(self.path.split(".")))
@@ -1023,9 +1053,8 @@ class EFF_PT_physics_editor(bpy.types.Panel):
                 op.action = "PASTE"
                 layout.label(text="复制参数不复制骨骼拓扑、动画或游戏运行时权重", icon="INFO")
                 layout.label(text="物理参数预设")
-                layout.template_list("UI_UL_list", "eiem_physics_presets", scene, "eiem_physics_editor_presets",
-                                     scene, "eiem_physics_editor_preset_index", rows=2)
                 preset_index = scene.eiem_physics_editor_preset_index
+                layout.prop(scene, "eiem_physics_editor_preset_choice", text="预设")
                 if 0 <= preset_index < len(scene.eiem_physics_editor_presets):
                     source = scene.eiem_physics_editor_presets[preset_index].source
                     source_label = {"BUILTIN": "随插件提供", "IMPORTED": "从文件导入", "PROJECT": "当前工程"}.get(source, "")
@@ -1090,7 +1119,8 @@ CLASSES = (EFF_PG_physics_editor_values, EFF_PG_physics_editor_preset, EFF_UL_ph
            EFF_PT_physics_editor)
 SCENE_PROPERTIES = ("eiem_physics_editor_item", "eiem_physics_editor_category", "eiem_physics_editor_index",
                     "eiem_physics_editor_tab", "eiem_physics_editor_search", "eiem_physics_editor_clipboard",
-                    "eiem_physics_editor_presets", "eiem_physics_editor_preset_index", "eiem_physics_editor_preset_name")
+                    "eiem_physics_editor_presets", "eiem_physics_editor_preset_index",
+                    "eiem_physics_editor_preset_choice", "eiem_physics_editor_preset_name")
 
 
 def register(author, native):
@@ -1112,6 +1142,8 @@ def register(author, native):
     bpy.types.Scene.eiem_physics_editor_clipboard = StringProperty(options={"HIDDEN"})
     bpy.types.Scene.eiem_physics_editor_presets = CollectionProperty(type=EFF_PG_physics_editor_preset)
     bpy.types.Scene.eiem_physics_editor_preset_index = IntProperty(default=0)
+    bpy.types.Scene.eiem_physics_editor_preset_choice = EnumProperty(
+        name="预设", items=preset_enum_items, update=preset_choice_updated)
     bpy.types.Scene.eiem_physics_editor_preset_name = StringProperty(name="预设名称")
     if _physics_preset_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_physics_preset_load_post)
@@ -1132,3 +1164,4 @@ def unregister():
     global AUTHOR, NATIVE
     AUTHOR = NATIVE = None
     _ENUM_ITEM_CACHE.clear()
+    _PRESET_ENUM_ITEM_CACHE.clear()
