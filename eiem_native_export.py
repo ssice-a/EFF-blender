@@ -1203,13 +1203,16 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
         # --previous-mod supplies the old snapshot. Do not detach/copy tens of
         # MB only to have the compiler atomically replace them with a candidate.
         (staging / 'compiled.bin').unlink(missing_ok=True)
-        offline = compile_reload(staging, offline_context, previous=destination, source_index=source_index)
+        offline = compile_reload(
+            staging, offline_context, previous=destination, source_index=source_index,
+            resource_only=resource_scope != 'ALL')
         compile_done = time.perf_counter()
         source.assert_current()
         for material_baseline in material_sources.values():
             material_baseline.assert_current()
         package, offline = publish_reload(staging, destination,
-            lambda: publish(staging,destination,read_package), offline_context, source_index, offline)
+            lambda: publish(staging,destination,read_package), offline_context,
+            source_index, offline, resource_only=resource_scope != 'ALL')
         texture_paths = modules['ini_package'].ini_document(destination)
         written_texture_files = {texture_paths[section]['path'] for section in texture_paths
                                  if section in textures and textures[section].get('_written', True)}

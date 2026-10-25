@@ -286,6 +286,20 @@ for index in corner_indices(custom_result):
 no_uv = make_object('NoUV', uv=False)
 assert export(no_uv, 'no-uv')['tangents'] == []
 
+# Deleted/empty author Meshes may retain the old 4D UV dimension metadata.
+# There are no point Z/W values to index in this case, but the empty Mesh is
+# still a valid input for the writer and must not raise an ndarray shape error.
+empty_mesh = bpy.data.meshes.new('EmptyUV4')
+empty_mesh['eiem_coordinate_space'] = 'unity-y-up-left-handed'
+empty_mesh['eiem_uv_dimensions_json'] = '[2,0,4,0,0,0,0,0]'
+empty_mesh.uv_layers.new(name='UV0')
+empty_mesh.uv_layers.new(name='UV2')
+empty_obj = bpy.data.objects.new('EmptyUV4', empty_mesh)
+bpy.context.scene.collection.objects.link(empty_obj)
+empty_result = addon.write_mesh(None, empty_obj, return_snapshot=True)
+assert empty_result['vertex_count'] == 0
+assert empty_result['uvs'][2] == []
+
 # Loose vertices can retain a stale source tangent after geometry edits. They
 # are not rendered and must not make native frame packing reject the faces.
 # The editable exchange writer still preserves them for a lossless roundtrip.

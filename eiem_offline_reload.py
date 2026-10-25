@@ -38,6 +38,7 @@ STATIC_SOURCE_INPUTS = 'mod-static-catalog/selected-sources'
 SOURCE_PREPARATION = 'in-process/index-vfs+author-declarations'
 EXPORT_CARRYOVER = 'validated-source-selection+published-discoveries'
 COMPILED_STORE = 'EFF_MOD_BLOCKS/2'
+RESOURCE_UPDATE = 'addressed-resource-rebind/1'
 
 
 @contextlib.contextmanager
@@ -90,7 +91,8 @@ def published_revision(destination):
         return (status.st_dev, status.st_ino, 'packet', digest.hexdigest())
 
 
-def publish_reload(staging, destination, publisher, context, source_index, compiled):
+def publish_reload(staging, destination, publisher, context, source_index, compiled,
+                   resource_only=False):
     """Optimistically merge a concurrent discovery before swapping author files."""
     for attempt in range(3):
         with publication_lock(destination):
@@ -99,7 +101,9 @@ def publish_reload(staging, destination, publisher, context, source_index, compi
         if attempt == 2:
             break
         # Compilation must run outside the game writer's mutex.
-        compiled = compile_reload(staging, context, previous=destination, source_index=source_index)
+        compiled = compile_reload(staging, context, previous=destination,
+                                  source_index=source_index,
+                                  resource_only=resource_only)
     raise ValueError('游戏在导出期间持续补写命中，暂存结果未发布；上一完整 Mod 保持')
 
 
@@ -409,7 +413,8 @@ def prepare_static_sources(destination, source_package, context, previous=None):
     return index
 
 
-def compile_reload(destination, context=None, previous=None, source_index=None):
+def compile_reload(destination, context=None, previous=None, source_index=None,
+                   resource_only=False):
     context = context if context is not None else reload_context(destination)
     if context is None:
         return dict(offlineReloadPrepared=False, offlineReloadReason='workspace-author-export')
@@ -438,6 +443,18 @@ def compile_reload(destination, context=None, previous=None, source_index=None):
         if protocol.get('sourcePreparation') != SOURCE_PREPARATION:
             raise ValueError('插件缺少支持进程内来源查询的编译器，请安装完整插件包')
         command.extend(['--source-index', str(Path(source_index).resolve())])
+    if resource_only:
+        # The native compiler first attempts an addressed resource rebind
+        # against the previous committed snapshot.  It falls back to the
+        # ordinary source-selection path when declarations or layout changed.
+        # Keeping this as an explicit protocol flag lets the compiler skip
+        # rebuilding the source index for the common resource-edit case.
+        if (protocol.get('compiledModStore') != COMPILED_STORE or
+                protocol.get('resourceUpdate') != RESOURCE_UPDATE):
+            raise ValueError('当前编译器不支持资源替换通道，请更新完整 Blender 插件')
+        if consumer is not None and consumer.get('resourceUpdate') != RESOURCE_UPDATE:
+            raise ValueError('当前游戏 DLL 不支持资源替换通道，请先更新配套 eff.dll；上一 Mod 保留')
+        command.append('--resource-only')
     revision = None
     if previous is not None:
         with publication_lock(previous):

@@ -184,6 +184,46 @@ class OfflineExportTests(unittest.TestCase):
             self.assertEqual(sentinel.read_bytes(),b'other Mod');self.assertEqual(len(calls),2)
             self.assertFalse((game/'plugin/resource-reload-cache').exists())
 
+    def test_resource_only_compile_requests_addressed_rebind_before_source_selection(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game=Path(folder);stage=game/'stage';stage.mkdir();prior=game/'published';prior.mkdir()
+            (prior/'compiled.bin').write_bytes(b'previous Mod')
+            index=game/'index.eidx';index.write_bytes(b'index')
+            calls=[]
+            def invoke(command,**kwargs):
+                calls.append(command)
+                if command[-1]=='--protocol':
+                    declaration=self.protocol();declaration['compiledModStore']=module.COMPILED_STORE;declaration['resourceUpdate']=module.RESOURCE_UPDATE
+                    return SimpleNamespace(returncode=0,stdout=json.dumps(declaration),stderr='')
+                self.assertIn('--resource-only',command)
+                self.assertIn('--source-index',command)
+                self.assertIn('--previous-mod',command)
+                payload=b'addressed result'
+                blob='compiled.blocks/'+hashlib.sha256(payload).hexdigest().upper()+'.bin'
+                (stage/blob).parent.mkdir(parents=True,exist_ok=True)
+                (stage/blob).write_bytes(payload)
+                (stage/'compiled.bin').write_bytes(block_fixture(generation=2,payload=payload,external=True))
+                return SimpleNamespace(returncode=0,stdout='COMPILED-MOD-RESOURCE-ONLY\nCOMPILED-MOD-PUBLISHED',stderr='')
+            with patch.object(module.subprocess,'run',side_effect=invoke):
+                result=module.compile_reload(stage,(game/'compiler.exe',None,None,game),
+                                             previous=prior,source_index=index,
+                                             resource_only=True)
+            self.assertTrue(result['offlineReloadPrepared'])
+            self.assertEqual(len(calls),2)
+            self.assertEqual((prior/'compiled.bin').read_bytes(),b'previous Mod')
+
+    def test_resource_only_rejects_dll_without_resource_rebind_capability(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);stage=root/'stage';stage.mkdir();prior=root/'published';prior.mkdir()
+            (prior/'compiled.bin').write_bytes(b'previous Mod')
+            declaration=self.protocol();declaration['compiledModStore']=module.COMPILED_STORE;declaration['resourceUpdate']=module.RESOURCE_UPDATE
+            with patch.object(module,'_game_protocol',return_value=self.protocol()),patch.object(
+                    module.subprocess,'run',return_value=SimpleNamespace(
+                        returncode=0,stdout=json.dumps(declaration),stderr='')):
+                with self.assertRaises(ValueError):
+                    module.compile_reload(stage,(root/'compiler',None,None,root),
+                                         previous=prior,resource_only=True)
+
     def test_updated_game_refreshes_index_once_then_retries_same_author_stage(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder);stage=root/'stage';stage.mkdir();prior=root/'published';prior.mkdir()
@@ -314,6 +354,22 @@ class OfflineExportTests(unittest.TestCase):
             with patch.object(module,'compile_reload',side_effect=compile_current):
                 result,receipt=module.publish_reload(stage,published,publish,None,None,first)
             self.assertEqual(result,'committed');self.assertEqual(events,['compile','publish'])
+
+    def test_concurrent_resource_publish_preserves_resource_only_mode(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);published=root/'published';published.mkdir();stage=root/'stage';stage.mkdir()
+            path=published/'compiled.bin';path.write_bytes(b'PFB-A')
+            first={'offlinePreviousRevision':module.published_revision(published)}
+            path.write_bytes(b'PFB-A+PFB-B')
+            calls=[]
+            def compile_current(*args,**kwargs):
+                calls.append(kwargs.get('resource_only'))
+                (stage/'compiled.bin').write_bytes(path.read_bytes()+b'+resource')
+                return {'offlinePreviousRevision':module.published_revision(published)}
+            with patch.object(module,'compile_reload',side_effect=compile_current):
+                result,receipt=module.publish_reload(stage,published,lambda:'committed',None,None,first,
+                                                     resource_only=True)
+            self.assertEqual(result,'committed');self.assertEqual(calls,[True])
 
     def test_continuous_concurrent_changes_keep_old_publication(self):
         with tempfile.TemporaryDirectory() as folder:

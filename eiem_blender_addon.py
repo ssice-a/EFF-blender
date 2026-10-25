@@ -1478,12 +1478,16 @@ def mesh_export_uv_channels(mesh):
                 attribute_name = resolve_author_attribute(
                     mesh, "uv_zw", channel, "FLOAT2")
             zw = get_point_attribute(mesh, attribute_name, "vector")
-            if zw is None:
+            if zw is None or not len(mesh.vertices) or len(zw) != len(mesh.vertices):
                 # Blender's native UV layer is always a valid 2D source.  A
                 # missing Z/W author attribute therefore exports the data we
                 # actually have instead of failing because an old custom
-                # attribute name disappeared during a .blend migration.
+                # attribute name disappeared during a .blend migration.  An
+                # empty Mesh can still retain a stale 4D dimension record,
+                # while Blender returns an empty point attribute; treat that
+                # the same way so the zero-length export remains valid.
                 dimension = 2
+                zw = None
         output.append((dimension, xy, zw))
     return output
 

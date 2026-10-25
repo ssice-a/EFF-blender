@@ -1,11 +1,11 @@
-# EFF Blender v0.49.1
+# EFF Blender v0.49.2
 
-配套：[EFF v1.10.1](https://github.com/ssice-a/EFF/releases/tag/v1.10.1)、[AnimeStudio v1.8.1](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.8.1)。
+配套：[EFF v1.10.2](https://github.com/ssice-a/EFF/releases/tag/v1.10.2)、[AnimeStudio v1.8.1](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.8.1)。
 
 - 物理碰撞体作为 Rig 下独立对象创建和管理，不再创建后自动关联当前物理组；需要碰撞时再从物理组显式引用。
 - 导入源物理时递归查找解包目录中的组件证据和 `.physics` 作者包。
 - 保留 Chen 软飘带物理预设，通过紧凑下拉框应用；预设不包含角色专属碰撞体。
-- 与 EFF v1.10.1 的命名按键切换、资源增量更新和静态多部件 Mesh 装配校验配套；原生基础包由 DLL Release 工作流构建并固定大小与 SHA256。
+- 与 EFF v1.10.2 的命名按键切换、资源地址增量替换和静态多部件 Mesh 装配校验配套；原生基础包由 DLL Release 工作流构建并固定大小与 SHA256。
 
 - 移动后的 Blender 工程会按当前游戏安装查找 AnimeStudio 登记的完整索引，不用把全量索引复制到每个项目。
 - 来源清单里的旧绝对索引路径失效时，自动尝试共享索引，并保留来源清单和摘要不变。
