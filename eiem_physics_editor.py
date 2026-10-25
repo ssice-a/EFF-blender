@@ -6,8 +6,10 @@ Legacy compact author values remain import/export adapters for old projects.
 import copy
 import json
 import math
+from pathlib import Path
 
 import bpy
+from bpy_extras.io_utils import ExportHelper, ImportHelper
 from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, FloatProperty, FloatVectorProperty,
                        IntProperty, PointerProperty, StringProperty)
 from mathutils import Vector
@@ -17,6 +19,8 @@ NATIVE = None
 GROUPS = {"GROUP", "NATIVE_GROUP"}
 COLLIDERS = {"COLLIDER", "NATIVE_COLLIDER"}
 _ENUM_ITEM_CACHE = {}
+PRESET_FORMAT = "EFF_PHYSICS_PRESET/1"
+PRESET_DIRECTORY = Path(__file__).with_name("physics_presets")
 
 # Each field belongs to exactly one section. Curves stay next to their base.
 SECTIONS = (
@@ -240,6 +244,7 @@ class EFF_PG_physics_editor_values(bpy.types.PropertyGroup):
 class EFF_PG_physics_editor_preset(bpy.types.PropertyGroup):
     name: StringProperty(name="预设名称")
     payload: StringProperty(options={"HIDDEN"})
+    source: StringProperty(options={"HIDDEN"})
 
 
 def define_property(path, label, kind):
@@ -344,7 +349,8 @@ def parameter_targets(context, active):
 
 
 def scalar_paths(scope):
-    return {full_path(path) for tab, label, fields in SECTIONS if scope == "ALL" or tab == scope
+    return {full_path(path) for tab, label, fields in SECTIONS
+            if scope == "ALL" or scope == "PRESET" and tab != "COLLISION" or tab == scope
             for path, name, kind in fields}
 
 
@@ -389,17 +395,133 @@ def capture_parameters(obj, scope="ALL"):
             records.extend(({"path": full_path("radius.value"), "floating": True, "value": radius["value"]},
                             {"path": full_path("radius.useCurve"), "floating": False, "value": int(radius["useCurve"])}))
             curves[full_path("radius")] = copy.deepcopy(radius["keys"])
-    return {"fields": records, "curves": curves, "scope": scope}
+    payload = {"fields": records, "curves": curves, "scope": scope}
+    if scope == "PRESET":
+        payload["chainType"] = int(read_number(obj, "clothType")) if has_parameter(obj, "clothType") else None
+    return payload
+
+
+def make_preset_document(obj, name):
+    name = str(name).strip()
+    AUTHOR.document.require(bool(name), "请填写预设名称")
+    return {"format": PRESET_FORMAT, "name": name,
+            "description": "动力与高级模拟参数及曲线；不含碰撞、骨骼、链拓扑或节点尺寸。",
+            "sourceChain": obj.eiem_physics.label or obj.name,
+            "payload": capture_parameters(obj, "PRESET")}
+
+
+def validate_preset_document(document):
+    AUTHOR.document.require(isinstance(document, dict) and document.get("format") == PRESET_FORMAT,
+                            "不支持的 Physics 预设文件")
+    name = str(document.get("name", "")).strip()
+    payload = document.get("payload")
+    AUTHOR.document.require(bool(name) and isinstance(payload, dict) and
+                            set(payload) == {"fields", "curves", "scope", "chainType"} and
+                            payload["scope"] == "PRESET", "Physics 预设结构无效")
+    allowed = scalar_paths("PRESET")
+    fields = payload["fields"]
+    curves = payload["curves"]
+    AUTHOR.document.require(isinstance(fields, list) and bool(fields) and isinstance(curves, dict), "Physics 预设参数无效")
+    seen = set()
+    for record in fields:
+        AUTHOR.document.require(isinstance(record, dict) and set(record) == {"path", "floating", "value"},
+                                "Physics 预设字段结构无效")
+        path = record["path"]
+        AUTHOR.document.require(isinstance(path, str) and
+                                any(path == prefix or path.startswith(prefix + ".") for prefix in allowed) and
+                                path not in seen,
+                                "Physics 预设包含碰撞或不可复用字段")
+        AUTHOR.document.native_parameter(record)
+        seen.add(path)
+    curve_paths = {full_path(path) for tab, label, section in SECTIONS if tab == "DYNAMICS"
+                   for path, title, kind in section if kind == "CURVE"}
+    for path, keys in curves.items():
+        AUTHOR.document.require(path in curve_paths and isinstance(keys, list) and len(keys) >= 2,
+                                "Physics 预设曲线无效")
+        previous = -1.0
+        for key in keys:
+            AUTHOR.document.require(isinstance(key, dict) and math.isfinite(key["time"]) and
+                                    previous < key["time"] <= 1 and key["time"] >= 0,
+                                    "Physics 预设曲线深度无效")
+            previous = key["time"]
+            for suffix in ("value", "inSlope", "outSlope", "inWeight", "outWeight"):
+                AUTHOR.document.require(math.isfinite(key[suffix]), "Physics 预设曲线数值无效")
+            AUTHOR.document.require(key["weightedMode"] in (0, 1, 2, 3), "Physics 预设曲线权重模式无效")
+    chain_type = payload["chainType"]
+    AUTHOR.document.require(chain_type is None or type(chain_type) is int,
+                            "Physics 预设模拟类型无效")
+    return name, payload
+
+
+def add_scene_preset(scene, name, payload, source):
+    presets = scene.eiem_physics_editor_presets
+    existing = next((preset for preset in presets if preset.name == name and preset.source != "BUILTIN"), None)
+    if existing is None and any(preset.name == name for preset in presets):
+        name += "（导入）" if source == "IMPORTED" else "（本工程）"
+        existing = next((preset for preset in presets if preset.name == name and preset.source != "BUILTIN"), None)
+    preset = existing or presets.add()
+    preset.name = name
+    preset.payload = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    preset.source = source
+    scene.eiem_physics_editor_preset_index = next(index for index, item in enumerate(presets) if item == preset)
+    return preset
+
+
+def refresh_bundled_presets(*_args):
+    if not hasattr(bpy.types.Scene, "eiem_physics_editor_presets"):
+        return False
+    scenes = getattr(bpy.data, "scenes", None)
+    if scenes is None:
+        return False
+    documents = []
+    for path in sorted(PRESET_DIRECTORY.glob("*.json")):
+        document = json.loads(path.read_text(encoding="utf-8-sig"))
+        name, payload = validate_preset_document(document)
+        documents.append((name, payload))
+    for scene in scenes:
+        for index in reversed(range(len(scene.eiem_physics_editor_presets))):
+            if scene.eiem_physics_editor_presets[index].source == "BUILTIN":
+                scene.eiem_physics_editor_presets.remove(index)
+        for name, payload in documents:
+            preset = scene.eiem_physics_editor_presets.add()
+            preset.name = name
+            preset.payload = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+            preset.source = "BUILTIN"
+        if scene.eiem_physics_editor_presets:
+            scene.eiem_physics_editor_preset_index = max(
+                0, min(scene.eiem_physics_editor_preset_index, len(scene.eiem_physics_editor_presets) - 1))
+    return True
+
+
+def _physics_preset_refresh_timer():
+    if not hasattr(bpy.types.Scene, "eiem_physics_editor_presets"):
+        return None
+    if not refresh_bundled_presets():
+        return 0.1
+    return None
+
+
+@bpy.app.handlers.persistent
+def _physics_preset_load_post(_unused):
+    try:
+        refresh_bundled_presets()
+    except Exception as error:
+        print("[EFF Physics] Could not load bundled presets:", error)
 
 
 def validate_plan(obj, payload):
     AUTHOR.document.require(isinstance(payload, dict) and set(payload) in (
-                            {"fields", "curves", "scope"}, {"fields", "curves", "scope", "colliderRefs"}),
+                            {"fields", "curves", "scope"}, {"fields", "curves", "scope", "colliderRefs"},
+                            {"fields", "curves", "scope", "chainType"}),
                             "物理参数剪贴板无效")
     records = payload["fields"]
     AUTHOR.document.require(isinstance(records, list) and isinstance(payload["curves"], dict), "参数剪贴板结构无效")
     permitted = scalar_paths(payload["scope"])
-    AUTHOR.document.require(payload["scope"] in {"ALL", "DYNAMICS", "COLLISION", "ADVANCED"}, "参数复制区域无效")
+    AUTHOR.document.require(payload["scope"] in {"ALL", "DYNAMICS", "COLLISION", "ADVANCED", "PRESET"}, "参数复制区域无效")
+    if payload["scope"] == "PRESET" and payload.get("chainType") is not None:
+        target_type = NATIVE.native_field(obj, full_path("clothType"))
+        AUTHOR.document.require(target_type is not None and int(target_type.value if target_type.floating else target_type.integer) == payload["chainType"],
+                                "Physics 预设的模拟类型与目标链不匹配")
     wanted = set()
     for record in records:
         AUTHOR.document.native_parameter(record)
@@ -607,21 +729,17 @@ class EFF_OT_physics_editor_action(bpy.types.Operator):
             elif self.action == "SAVE_PRESET":
                 name = context.scene.eiem_physics_editor_preset_name.strip()
                 AUTHOR.document.require(bool(name), "请填写预设名称")
-                presets = context.scene.eiem_physics_editor_presets
-                preset = next((preset for preset in presets if preset.name == name), None)
-                if preset is None:
-                    preset = presets.add()
-                preset.name = name
-                preset.payload = json.dumps(capture_parameters(obj), ensure_ascii=False, allow_nan=False)
-                context.scene.eiem_physics_editor_preset_index = next(index for index, item in enumerate(presets) if item == preset)
-                self.report({"INFO"}, "参数预设已保存到当前工程；不含骨骼或碰撞引用")
+                preset = add_scene_preset(context.scene, name, capture_parameters(obj, "PRESET"), "PROJECT")
+                self.report({"INFO"}, "参数预设已保存到当前工程；应用时保留目标链的碰撞与拓扑")
             elif self.action in {"APPLY_PRESET", "DELETE_PRESET"}:
                 presets = context.scene.eiem_physics_editor_presets
                 index = context.scene.eiem_physics_editor_preset_index
                 AUTHOR.document.require(0 <= index < len(presets), "请选择参数预设")
                 if self.action == "APPLY_PRESET":
                     paste_to_targets(parameter_targets(context, obj), json.loads(presets[index].payload))
+                    self.report({"INFO"}, "预设已应用；目标链原有碰撞引用与拓扑已保留")
                 else:
+                    AUTHOR.document.require(presets[index].source != "BUILTIN", "随插件提供的内置预设不能删除")
                     presets.remove(index)
                     context.scene.eiem_physics_editor_preset_index = max(0, min(index, len(presets) - 1))
             elif self.action == "RESET":
@@ -650,6 +768,57 @@ class EFF_OT_physics_editor_action(bpy.types.Operator):
                         write_number(obj, name, AUTHOR.document.DEFAULTS[name])
             else:
                 raise ValueError("未知物理编辑操作")
+            return {"FINISHED"}
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+
+
+class EFF_OT_physics_preset_export(bpy.types.Operator, ExportHelper):
+    bl_idname = "eiem.physics_preset_export"
+    bl_label = "导出 Physics 预设"
+    bl_options = {"REGISTER"}
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
+    target: StringProperty(options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        obj = bpy.data.objects.get(self.target) if self.target else active_item(context)
+        if obj:
+            name = obj.eiem_physics.label or obj.name
+            safe = "".join(char if char.isalnum() or char in "-_ " else "_" for char in name).strip()
+            self.filepath = bpy.path.abspath("//") + safe + ".json"
+        return ExportHelper.invoke(self, context, event)
+
+    def execute(self, context):
+        try:
+            obj = bpy.data.objects.get(self.target) if self.target else active_item(context)
+            AUTHOR.document.require(obj is not None and obj.eiem_physics.kind in GROUPS, "请选择物理链")
+            name = context.scene.eiem_physics_editor_preset_name.strip() or obj.eiem_physics.label or obj.name
+            document = make_preset_document(obj, name)
+            Path(self.filepath).write_text(json.dumps(document, ensure_ascii=False, indent=2, allow_nan=False),
+                                           encoding="utf-8")
+            self.report({"INFO"}, "已导出不含碰撞的 Physics 参数预设")
+            return {"FINISHED"}
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+
+
+class EFF_OT_physics_preset_import(bpy.types.Operator, ImportHelper):
+    bl_idname = "eiem.physics_preset_import"
+    bl_label = "导入 Physics 预设"
+    bl_options = {"REGISTER", "UNDO"}
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
+
+    def execute(self, context):
+        try:
+            document = json.loads(Path(self.filepath).read_text(encoding="utf-8-sig"))
+            name, payload = validate_preset_document(document)
+            preset = add_scene_preset(context.scene, name, payload, "IMPORTED")
+            context.scene.eiem_physics_editor_preset_name = preset.name
+            self.report({"INFO"}, "预设已加入当前工程；选中目标链后应用")
             return {"FINISHED"}
         except Exception as error:
             self.report({"ERROR"}, str(error))
@@ -853,16 +1022,25 @@ class EFF_PT_physics_editor(bpy.types.Panel):
                 op = row.operator("eiem.physics_editor_action", text="粘贴到所选（%d）" % len(parameter_targets(context, obj)))
                 op.action = "PASTE"
                 layout.label(text="复制参数不复制骨骼拓扑、动画或游戏运行时权重", icon="INFO")
-                header, body = layout.panel("eiem_physics_presets", default_closed=True)
-                header.label(text="参数预设（当前工程）")
-                if body:
-                    body.template_list("UI_UL_list", "eiem_physics_presets", scene, "eiem_physics_editor_presets",
-                                       scene, "eiem_physics_editor_preset_index", rows=2)
-                    body.prop(scene, "eiem_physics_editor_preset_name", text="名称")
-                    row = body.row(align=True)
-                    row.operator("eiem.physics_editor_action", text="保存 / 更新").action = "SAVE_PRESET"
-                    row.operator("eiem.physics_editor_action", text="应用到所选").action = "APPLY_PRESET"
-                    row.operator("eiem.physics_editor_action", text="", icon="X").action = "DELETE_PRESET"
+                layout.label(text="物理参数预设")
+                layout.template_list("UI_UL_list", "eiem_physics_presets", scene, "eiem_physics_editor_presets",
+                                     scene, "eiem_physics_editor_preset_index", rows=2)
+                preset_index = scene.eiem_physics_editor_preset_index
+                if 0 <= preset_index < len(scene.eiem_physics_editor_presets):
+                    source = scene.eiem_physics_editor_presets[preset_index].source
+                    source_label = {"BUILTIN": "随插件提供", "IMPORTED": "从文件导入", "PROJECT": "当前工程"}.get(source, "")
+                    if source_label:
+                        layout.label(text=source_label)
+                layout.prop(scene, "eiem_physics_editor_preset_name", text="名称")
+                row = layout.row(align=True)
+                row.operator("eiem.physics_editor_action", text="新增 / 更新预设", icon="ADD").action = "SAVE_PRESET"
+                row.operator("eiem.physics_editor_action", text="应用预设", icon="CHECKMARK").action = "APPLY_PRESET"
+                row.operator("eiem.physics_editor_action", text="删除预设", icon="TRASH").action = "DELETE_PRESET"
+                row = layout.row(align=True)
+                row.operator("eiem.physics_preset_import", text="导入预设文件", icon="IMPORT")
+                op = row.operator("eiem.physics_preset_export", text="导出当前链", icon="EXPORT")
+                op.target = obj.name
+                layout.label(text="预设只复制参数与曲线；碰撞体、骨骼和链结构沿用目标链")
                 layout.prop(scene, "eiem_physics_editor_tab", expand=True)
                 layout.prop(scene, "eiem_physics_editor_search", text="查找参数", icon="VIEWZOOM")
                 tab = scene.eiem_physics_editor_tab
@@ -908,7 +1086,8 @@ class EFF_PT_physics_editor(bpy.types.Panel):
 
 
 CLASSES = (EFF_PG_physics_editor_values, EFF_PG_physics_editor_preset, EFF_UL_physics_items,
-           EFF_OT_physics_editor_action, EFF_PT_physics_editor)
+           EFF_OT_physics_editor_action, EFF_OT_physics_preset_export, EFF_OT_physics_preset_import,
+           EFF_PT_physics_editor)
 SCENE_PROPERTIES = ("eiem_physics_editor_item", "eiem_physics_editor_category", "eiem_physics_editor_index",
                     "eiem_physics_editor_tab", "eiem_physics_editor_search", "eiem_physics_editor_clipboard",
                     "eiem_physics_editor_presets", "eiem_physics_editor_preset_index", "eiem_physics_editor_preset_name")
@@ -934,9 +1113,17 @@ def register(author, native):
     bpy.types.Scene.eiem_physics_editor_presets = CollectionProperty(type=EFF_PG_physics_editor_preset)
     bpy.types.Scene.eiem_physics_editor_preset_index = IntProperty(default=0)
     bpy.types.Scene.eiem_physics_editor_preset_name = StringProperty(name="预设名称")
+    if _physics_preset_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_physics_preset_load_post)
+    if not refresh_bundled_presets() and not bpy.app.timers.is_registered(_physics_preset_refresh_timer):
+        bpy.app.timers.register(_physics_preset_refresh_timer, first_interval=0.1)
 
 
 def unregister():
+    if _physics_preset_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_physics_preset_load_post)
+    if bpy.app.timers.is_registered(_physics_preset_refresh_timer):
+        bpy.app.timers.unregister(_physics_preset_refresh_timer)
     del bpy.types.Object.eiem_physics_editor_values
     for name in SCENE_PROPERTIES:
         delattr(bpy.types.Scene, name)

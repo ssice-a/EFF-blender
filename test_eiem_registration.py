@@ -49,7 +49,7 @@ for cycle in range(3):
     assert hasattr(bpy.types.Scene,'eiem_export_last_directory')
     resource_scope = bpy.ops.eiem.export_package.get_rna_type().properties['resource_scope']
     assert resource_scope.default == 'ALL'
-    assert [item.identifier for item in resource_scope.enum_items] == ['ALL', 'MESH', 'MATERIALS', 'TEXTURES']
+    assert [item.identifier for item in resource_scope.enum_items] == ['ALL', 'MESH', 'MATERIALS', 'TEXTURES', 'PHYSICS']
     assert bpy.ops.eiem.export_mesh_only.get_rna_type() is not None
     assert bpy.ops.eiem.detect_game_directory.get_rna_type() is not None
     assert bpy.ops.eiem.install_update.get_rna_type() is not None

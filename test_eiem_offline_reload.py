@@ -14,6 +14,24 @@ import subprocess
 spec=importlib.util.spec_from_file_location('eiem_offline_reload',Path(__file__).with_name('eiem_offline_reload.py'))
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 
+
+def block_fixture(generation=7, payload=b'payload', index_override=None, index_generation=None, external=False):
+    def string(value):
+        data=value.encode('utf-8')
+        return struct.pack('<Q',len(data))+data
+    digest=hashlib.sha256(payload).hexdigest().upper()
+    index=(string('EFF_MOD_BLOCK_INDEX/external-blobs/le64' if external else 'EFF_MOD_BLOCK_INDEX/le64')+
+           struct.pack('<QQ',generation if index_generation is None else index_generation,1)+
+           string('resource')+struct.pack('<QQ',0 if external else 192,len(payload))+
+           string(hashlib.sha256(payload).hexdigest().upper()))
+    if external:
+        index+=string('compiled.blocks/'+digest+'.bin')
+    if index_override is not None:index=index_override
+    slot=struct.pack('<QQQ',generation,192 if external else 192+len(payload),len(index))+hashlib.sha256(index).digest()
+    slot+=hashlib.sha256(slot).digest()
+    slots=(bytes(88)+slot) if generation%2 else (slot+bytes(88))
+    return (b'EFF_MOD_BLOCKS/2' if external else b'EFF_MOD_BLOCKS/1')+slots+(b'' if external else payload)+index
+
 class OfflineExportTests(unittest.TestCase):
     def make_game(self, root):
         (root/'Endfield_Data/StreamingAssets/VFS').mkdir(parents=True)
@@ -308,16 +326,85 @@ class OfflineExportTests(unittest.TestCase):
 
     def test_block_revision_reads_committed_index_and_ignores_tail(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=Path(folder);path=root/'compiled.bin';index=b'validated index'
-            slot=struct.pack('<QQQ',7,192,len(index))+hashlib.sha256(index).digest()
-            slot+=hashlib.sha256(slot).digest()
-            path.write_bytes(b'EFF_MOD_BLOCKS/1'+bytes(88)+slot+index)
+            root=Path(folder);path=root/'compiled.bin'
+            path.write_bytes(block_fixture())
             before=module.published_revision(root)
             self.assertEqual(before[2:4],('blocks',7))
             with path.open('ab') as stream:stream.write(b'uncommitted data')
             self.assertEqual(module.published_revision(root),before)
             corrupted=bytearray(path.read_bytes());corrupted[104+56]^=1;path.write_bytes(corrupted)
             with self.assertRaisesRegex(ValueError,'代际'):module.published_revision(root)
+
+    def test_block_revision_rejects_checksummed_invalid_directory(self):
+        for options in (dict(index_override=b'not an index'),dict(index_generation=8)):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as folder:
+                root=Path(folder);(root/'compiled.bin').write_bytes(block_fixture(**options))
+                with self.assertRaisesRegex(ValueError,'代际'):module.published_revision(root)
+
+    def test_block_compiler_rejects_old_dll_before_first_export(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);stage=root/'stage';stage.mkdir()
+            declaration=self.protocol();declaration['compiledModStore']=module.COMPILED_STORE
+            consumer=self.protocol()
+            with patch.object(module,'_game_protocol',return_value=consumer),patch.object(module.subprocess,'run',
+                    return_value=SimpleNamespace(returncode=0,stdout=json.dumps(declaration),stderr='')) as run:
+                with self.assertRaisesRegex(ValueError,'分块 Mod'):
+                    module.compile_reload(stage,(root/'compiler',None,None,root))
+                self.assertEqual(run.call_count,1)
+            self.assertFalse((stage/'compiled.bin').exists())
+
+    def test_block_compile_receipt_does_not_hash_source_payload(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);stage=root/'stage';stage.mkdir()
+            declaration=self.protocol();declaration['compiledModStore']='EFF_MOD_BLOCKS/1'
+            artifact=block_fixture(payload=b'x'*(4*1024*1024))
+            def invoke(command,**kwargs):
+                if command[-1]=='--protocol':
+                    return SimpleNamespace(returncode=0,stdout=json.dumps(declaration),stderr='')
+                (stage/'compiled.bin').write_bytes(artifact)
+                return SimpleNamespace(returncode=0,stdout='COMPILED-MOD-PUBLISHED',stderr='')
+            hashes=[];sha=hashlib.sha256
+            def checked_hash(data=b''):
+                hashes.append(len(data))
+                self.assertLess(len(data),1024*1024,'compiled payload was hashed again')
+                return sha(data)
+            with patch.object(module.subprocess,'run',side_effect=invoke),patch.object(module.hashlib,'sha256',side_effect=checked_hash):
+                result=module.compile_reload(stage,(root/'compiler',None,None,root))
+            self.assertTrue(hashes)
+            self.assertEqual(result['offlineReloadKey'],module.published_revision(stage)[-1].upper())
+
+    def test_external_block_compile_checks_blob_presence_without_hashing_payload(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);stage=root/'stage';stage.mkdir()
+            declaration=self.protocol();declaration['compiledModStore']=module.COMPILED_STORE
+            payload=b'x'*(4*1024*1024);digest=hashlib.sha256(payload).hexdigest().upper()
+            artifact=block_fixture(payload=payload,external=True)
+            blob=stage/'compiled.blocks'/(digest+'.bin')
+            def invoke(command,**kwargs):
+                if command[-1]=='--protocol':
+                    return SimpleNamespace(returncode=0,stdout=json.dumps(declaration),stderr='')
+                (stage/'compiled.bin').write_bytes(artifact)
+                blob.parent.mkdir(exist_ok=True);blob.write_bytes(payload)
+                return SimpleNamespace(returncode=0,stdout='COMPILED-MOD-PUBLISHED',stderr='')
+            with patch.object(module.subprocess,'run',side_effect=invoke),patch.object(Path,'read_bytes',side_effect=AssertionError('full file read')):
+                result=module.compile_reload(stage,(root/'compiler',None,None,root))
+            self.assertEqual(result['offlineReloadKey'],module.published_revision(stage)[-1].upper())
+            blob.unlink()
+            with self.assertRaisesRegex(ValueError,'分块文件缺失'):
+                module.compiled_snapshot(stage,validate_files=True)
+
+    def test_block_compiler_must_produce_its_declared_container(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);stage=root/'stage';stage.mkdir()
+            declaration=self.protocol();declaration['compiledModStore']='EFF_MOD_BLOCKS/1'
+            def invoke(command,**kwargs):
+                if command[-1]=='--protocol':
+                    return SimpleNamespace(returncode=0,stdout=json.dumps(declaration),stderr='')
+                (stage/'compiled.bin').write_bytes(b'old packet output')
+                return SimpleNamespace(returncode=0,stdout='COMPILED-MOD-PUBLISHED',stderr='')
+            with patch.object(module.subprocess,'run',side_effect=invoke):
+                with self.assertRaisesRegex(ValueError,'声明的分块'):
+                    module.compile_reload(stage,(root/'compiler',None,None,root))
 
     @unittest.skipUnless(os.name=='nt' and os.environ.get('EIEM_CARRYOVER_SMOKE'), 'optional real C++ writer fixture')
     def test_cpp_writer_shares_python_publication_mutex(self):
@@ -332,6 +419,23 @@ class OfflineExportTests(unittest.TestCase):
             output,error=process.communicate(timeout=5)
             self.assertEqual(process.returncode,0,error);self.assertIn(b'COMMITTED 2',output)
             self.assertEqual(module.published_revision(root)[3],2)
+
+    @unittest.skipUnless(os.name=='nt' and os.environ.get('EIEM_CARRYOVER_SMOKE'), 'optional real C++ author-reader fixture')
+    def test_cpp_author_reader_returns_under_python_publication_mutex(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);tool=os.environ['EIEM_CARRYOVER_SMOKE'];path=root/'compiled.bin'
+            subprocess.run([tool,'--commit-fixture',str(path)],check=True,capture_output=True)
+            before=module.published_revision(root)
+            with module.publication_lock(root):
+                process=subprocess.Popen([tool,'--author-read-fixture',str(path)],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                try:
+                    output,error=process.communicate(timeout=5)
+                finally:
+                    if process.poll() is None:
+                        process.kill();process.communicate()
+                self.assertEqual(process.returncode,0,error)
+                self.assertIn(b'AUTHOR-READER-RETURNED',output)
+                self.assertEqual(module.published_revision(root),before)
 
     def test_game_and_workspace_exports_use_addon_compiler_only(self):
         with tempfile.TemporaryDirectory() as folder:

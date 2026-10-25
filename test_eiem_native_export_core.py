@@ -560,6 +560,61 @@ class NativeExportCoreTests(unittest.TestCase):
             self.assertEqual(original.read_bytes(), b'original')
             self.assertEqual(staged.read_bytes(), b'updated')
 
+    def test_export_staging_closes_frozen_resources_before_cleanup(self):
+        class Stream:
+            closed = False
+            def close(self): self.closed = True
+
+        stream = Stream()
+        cache = {'__frozen_files__': {('device', 'inode', 3): (stream, (), {})}}
+        events = []
+        with tempfile.TemporaryDirectory() as folder:
+            destination_parent = Path(folder) / 'mods' / 'chen'
+            destination_parent.mkdir(parents=True)
+            destination = destination_parent / 'mod.ini'
+
+            class TemporaryDirectory:
+                def __enter__(self): return 'staging-root'
+                def __exit__(self, *_): events.append(('cleanup', stream.closed))
+
+            with patch.object(exporter.tempfile, 'TemporaryDirectory',
+                              return_value=TemporaryDirectory()):
+                with self.assertRaisesRegex(RuntimeError, 'export failed'):
+                    with exporter._export_temporary_directory(
+                            cache, destination, prefix='test-export-'):
+                        raise RuntimeError('export failed')
+
+        self.assertEqual(events, [('cleanup', True)])
+        self.assertEqual(cache['__frozen_files__'], {})
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows resource file handle semantics')
+    def test_export_staging_removes_directory_after_frozen_texture_read(self):
+        resource_file = exporter.pack_modules()[0]['ini_reader']
+        resource_file = __import__(resource_file.__package__ + '.resource_file', fromlist=['*'])
+        with tempfile.TemporaryDirectory() as parent:
+            cache = {'__frozen_files__': {}}
+            mods = Path(parent) / 'mods'
+            package = mods / 'chen'
+            package.mkdir(parents=True)
+            destination = package / 'mod.ini'
+            staging = None
+            with self.assertRaisesRegex(RuntimeError, 'export failed'):
+                with exporter._export_temporary_directory(
+                        cache, destination, prefix='eff-export-test-') as temporary:
+                    staging = Path(temporary)
+                    self.assertEqual(staging.parent.name, '.eff-export-staging')
+                    texture = staging / 'mod' / 'textures' / 'clothes_P.tex'
+                    texture.parent.mkdir(parents=True)
+                    texture.write_bytes(resource_file.encode_resource(
+                        resource_file.PIXELS, '00' * 16, {'pixels': b'pixels'}))
+                    resource_file.read_resource(texture, resource_file.PIXELS, cache)
+                    self.assertTrue(next(iter(cache['__frozen_files__'].values()))[0].closed is False)
+                    raise RuntimeError('export failed')
+
+            self.assertFalse(staging.exists())
+            self.assertFalse((mods / '.eff-export-staging').exists())
+            self.assertEqual(cache['__frozen_files__'], {})
+
     def test_export_imports_installed_addon_nativepack(self):
         modules, _ = exporter.pack_modules()
         self.assertEqual(Path(modules['author_source'].__file__).resolve().parent,
@@ -652,6 +707,15 @@ class NativeExportCoreTests(unittest.TestCase):
         self.assertFalse(namespace['_EXPORT_IN_PROGRESS'])
         self.assertIsNone(namespace['_EXPORT_SKELETON_TOKENS'])
         self.assertEqual(calls, ['update', 'update'])
+
+    def test_physics_only_export_resolves_source_from_selected_rig(self):
+        with tempfile.TemporaryDirectory() as folder:
+            package = Path(folder)
+            (package / 'source').mkdir()
+            (package / 'source/manifest.json').write_text('{}', encoding='utf-8')
+            rig = {'eiem_author_package': str(package)}
+            group = SimpleNamespace(eiem_physics=SimpleNamespace(rig=rig))
+            self.assertEqual(exporter.baseline_for([], '', [group]), package.resolve())
 
     def test_bundle_includes_hashing_and_accepts_known_layouts(self):
         self.assertIn('hashing', bundler.MODULES)

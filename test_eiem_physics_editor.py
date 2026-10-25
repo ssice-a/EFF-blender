@@ -10,10 +10,13 @@ import bpy
 from mathutils import Vector
 
 addon_path, evidence, output = map(Path, sys.argv[sys.argv.index("--") + 1:])
-spec = importlib.util.spec_from_file_location("eiem_editor_test", addon_path)
-addon = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = addon
-spec.loader.exec_module(addon)
+package_name = "eiem_editor_test_package"
+package_spec = importlib.util.spec_from_file_location(package_name, addon_path.with_name("__init__.py"),
+    submodule_search_locations=[str(addon_path.resolve().parent)])
+package = importlib.util.module_from_spec(package_spec)
+sys.modules[package_name] = package
+package_spec.loader.exec_module(package)
+addon = sys.modules[package_name + ".eiem_blender_addon"]
 addon.register()
 author = addon.physics_authoring
 native, editor = author.native, author.editor
@@ -24,6 +27,15 @@ first, second = groups[:2]
 assert hasattr(bpy.types, "EFF_PT_physics_editor")
 assert not hasattr(bpy.types, "EFF_PT_physics_object")
 assert not hasattr(bpy.types, "EFF_PT_physics")
+builtin_names = {preset.name for preset in bpy.context.scene.eiem_physics_editor_presets
+                 if preset.source == "BUILTIN"}
+assert "Chen 软飘带" in builtin_names
+builtin = next(preset for preset in bpy.context.scene.eiem_physics_editor_presets
+               if preset.name == "Chen 软飘带")
+builtin_payload = json.loads(builtin.payload)
+assert builtin_payload["scope"] == "PRESET"
+assert not any("colliderCollisionConstraint" in item["path"] or
+               "selfCollisionConstraint" in item["path"] for item in builtin_payload["fields"])
 
 # Reading every available typed control does not rewrite serialized values.
 before = native.current_record(first)
@@ -143,13 +155,42 @@ context = bpy.context
 context.scene.eiem_physics_editor_item = first
 context.scene.eiem_physics_editor_preset_name = "源参数测试"
 assert bpy.ops.eiem.physics_editor_action(action="SAVE_PRESET", target=first.name) == {"FINISHED"}
-assert len(context.scene.eiem_physics_editor_presets) == 1
+assert len(context.scene.eiem_physics_editor_presets) == len(builtin_names) + 1
 preset = json.loads(context.scene.eiem_physics_editor_presets[0].payload)
-assert set(preset) == {"scope", "fields", "curves"}
+assert set(preset) == {"scope", "fields", "curves", "chainType"}
+assert preset["scope"] == "PRESET"
 saved_gravity = editor.read_number(first, "gravity")
 first.eiem_physics_editor_values.p_gravity = 8.5
 assert bpy.ops.eiem.physics_editor_action(action="APPLY_PRESET", target=first.name) == {"FINISHED"}
 assert abs(editor.read_number(first, "gravity") - saved_gravity) < 1e-6
+
+# Portable presets round-trip through JSON, omit collision parameters, enforce
+# simulation type, and leave each destination chain's collision set untouched.
+preset_path = output / "chen-ribbon-test.json"
+output.mkdir(parents=True, exist_ok=True)
+document = editor.make_preset_document(first, "文件飘带预设")
+assert editor.validate_preset_document(document)[0] == "文件飘带预设"
+assert bpy.ops.eiem.physics_preset_export(filepath=str(preset_path), target=first.name) == {"FINISHED"}
+disk_document = json.loads(preset_path.read_text(encoding="utf-8"))
+assert disk_document["payload"] == document["payload"]
+collision_before = editor.capture_parameters(second, "COLLISION")
+colliders_before = [ref.object for ref in second.eiem_physics.colliders]
+assert bpy.ops.eiem.physics_preset_import(filepath=str(preset_path)) == {"FINISHED"}
+assert bpy.ops.eiem.physics_editor_action(action="APPLY_PRESET", target=second.name) == {"FINISHED"}
+assert editor.capture_parameters(second, "PRESET") == document["payload"]
+assert editor.capture_parameters(second, "COLLISION") == collision_before
+assert [ref.object for ref in second.eiem_physics.colliders] == colliders_before
+wrong_type = copy.deepcopy(document["payload"])
+wrong_type["chainType"] += 10
+prior = editor.backup_parameters(second)
+try:
+    editor.paste_to_targets([second], wrong_type)
+except ValueError:
+    pass
+else:
+    raise AssertionError("physics preset with a different simulation type was accepted")
+assert editor.backup_parameters(second) == prior
+
 assert bpy.ops.eiem.physics_editor_action(action="RESET", target=first.name, path="serializeData.damping") == {"FINISHED"}
 restored = native.current_record(first)["fields"]["serializeData"]["damping"]
 def float32_values(value):
@@ -235,12 +276,14 @@ assert any(item["path"] == "serializeData.normalAxis" for item in record["native
 output.mkdir(parents=True, exist_ok=True)
 filepath = output / "editor.blend"
 source_name, collider_name = first.name, collider.name
+preset_rows = {(item.name, item.source, item.payload)
+               for item in bpy.context.scene.eiem_physics_editor_presets}
 bpy.ops.wm.save_as_mainfile(filepath=str(filepath))
 new_name = new.name
 bpy.ops.wm.open_mainfile(filepath=str(filepath))
 new = bpy.data.objects[new_name]
 assert abs(new.eiem_physics_editor_values.p_gravity - 3.25) < 1e-6
-assert len(bpy.context.scene.eiem_physics_editor_presets) == 1
+assert {(item.name, item.source, item.payload) for item in bpy.context.scene.eiem_physics_editor_presets} == preset_rows
 
 # Display filters never change serialized game enable or parameter values.
 pinned = bpy.data.objects[collider_name]

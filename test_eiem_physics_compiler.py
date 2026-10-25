@@ -4,10 +4,10 @@ from pathlib import Path
 import sys
 import unittest
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from nativepack import physics
-from nativepack.type_tree import Schema, from_data, decode, encode
-from nativepack.resource_file import encode_resource, decode_resource
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools.nativepack import physics
+from tools.nativepack.type_tree import Schema, from_data, decode, encode
+from tools.nativepack.resource_file import encode_resource, decode_resource
 
 
 def schema(kind, name, children=()):
@@ -23,6 +23,27 @@ def ref(name):
 
 
 class PhysicsCompilerTests(unittest.TestCase):
+    def test_existing_resource_layout_keeps_targets_and_topology(self):
+        writer = physics.Writer()
+        writer.text(physics.STRUCTURE); writer.text('rig-id')
+        writer.n(1); writer.text('root'); writer.text(''); writer.n(1); writer.n(0)
+        writer.numbers((0, 0, 0, 0, 0, 0, 1, 1, 1, 1))
+        writer.n(0); writer.n(1)
+        writer.text('collider-id'); writer.text('sphere'); writer.text('root'); writer.text('CAB-1')
+        writer.n(456); writer.numbers((0, 0, 0, 0, 0, 0, 1))
+        writer.n(1); writer.text('group-id'); writer.text('tail'); writer.text('CAB-1')
+        writer.n(123); writer.n(1); writer.text('assets/coat'); writer.text('Coat_LOD0')
+        writer.n(2); writer.text('root/fixed'); writer.n(0)
+        writer.text('root/fixed/tail'); writer.n(1)
+        writer.n(1); writer.text('collider-id')
+        layout = physics.read_resource_layout(bytes(writer.data))
+        self.assertEqual(layout['identity'], 'rig-id')
+        self.assertEqual(layout['skeleton'], [('root', '', True, False, (0, 0, 0, 0, 0, 0, 1, 1, 1, 1))])
+        self.assertEqual(layout['groups']['group-id']['targets'], [('assets/coat', 'Coat_LOD0')])
+        self.assertEqual(layout['groups']['group-id']['nodes'], [('root/fixed', False), ('root/fixed/tail', True)])
+        with self.assertRaisesRegex(ValueError, 'unreferenced'):
+            physics.read_resource_layout(bytes(writer.data) + b'\0')
+
     def test_mesh_scope_tracks_weighted_parts_and_all_declared_lods(self):
         group = {'name': 'tail', 'nodes': [{'bone': 'root/fixed', 'role': 'FIXED'},
                                          {'bone': 'root/fixed/tail', 'role': 'MOVE'}]}

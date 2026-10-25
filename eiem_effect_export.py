@@ -44,11 +44,17 @@ def publish(destination, effects, game_directory=''):
             if not any(native.package_changes(staging,destination,previous,candidate)):
                 return True
             compiler,_,_,game=offline.reload_context(destination,game_directory,effect_update=True)
+            # The compiler reads --update-effects' published input explicitly;
+            # its output must be private, never an append to the cloned link.
+            (staging/'compiled.bin').unlink(missing_ok=True)
             result=subprocess.run([str(compiler),'--update-effects',str(staging),str(destination),str(game)],
                 stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,encoding='utf-8',errors='replace',
                 creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
             if result.returncode or 'EFFECT-AUTHOR-UPDATED' not in result.stdout:
                 raise ValueError('特效更新未发布，上一角色包保留：'+result.stdout[-1800:])
+            # The compiler can add content-addressed blocks. Its completed
+            # candidate, rather than the precompile author file set, publishes.
+            candidate=reader(staging)
             native.publish(staging,destination,reader,previous=previous,candidate=candidate)
         finally:
             shutil.rmtree(staging,ignore_errors=True)

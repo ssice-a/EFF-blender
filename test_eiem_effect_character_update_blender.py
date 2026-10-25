@@ -21,7 +21,8 @@ fx.effect_cache=lambda:str(output/'cache')
 modules,_=addon.native_export.pack_modules();reader=modules['ini_reader'].read_package
 before=reader(target)
 preserved={p.relative_to(target).as_posix():p.read_bytes() for p in target.rglob('*')
-    if p.is_file() and p.name not in ('mod.ini','compiled.bin','effectattachment_'+root['eff_effect_id']+'.bin')}
+    if p.is_file() and 'compiled.blocks' not in p.relative_to(target).parts and
+    p.name not in ('mod.ini','compiled.bin','effectattachment_'+root['eff_effect_id']+'.bin')}
 (target/'state.ini').write_text('preserve-player-state=1',encoding='utf-8')
 child=target/'group'/'unrelated';child.mkdir(parents=True)
 (child/'mod.ini').write_text('[Mod]\nformat=2\nid=Unrelated\ntype=effect\n',encoding='utf-8')
@@ -63,7 +64,8 @@ assert other_file.read_bytes()==other_bytes and {e['id'] for e in reader(target)
 assert all((target/name).read_bytes()==data for name,data in preserved.items())
 assert (target/'state.ini').read_text('utf-8')=='preserve-player-state=1'
 assert (child/'mod.ini').read_text('utf-8').startswith('[Mod]')
-snapshot={p.relative_to(target).as_posix():p.read_bytes() for p in target.rglob('*') if p.is_file()}
+snapshot={p.relative_to(target).as_posix():p.read_bytes() for p in target.rglob('*')
+    if p.is_file() and 'compiled.blocks' not in p.relative_to(target).parts}
 replace=addon.native_export._replace_published_file
 failed=False
 def fail_resource(source,destination):
@@ -78,7 +80,9 @@ try:
     except RuntimeError as error:assert 'injected effect publication failure' in str(error)
     else:raise AssertionError('publication failure did not propagate')
 finally:addon.native_export._replace_published_file=replace
-assert failed and snapshot=={p.relative_to(target).as_posix():p.read_bytes() for p in target.rglob('*') if p.is_file()}
+assert failed and snapshot=={p.relative_to(target).as_posix():p.read_bytes() for p in target.rglob('*')
+    if p.is_file() and 'compiled.blocks' not in p.relative_to(target).parts}
+reader(target)
 report=dict(passed=True,firstSeconds=first_seconds,updateSeconds=update_seconds,
     characterPreserved=True,otherEffectsPreserved=True,partBound=True,stateAndNestedModsPreserved=True,
     midPublicationRollback=True)

@@ -1,5 +1,6 @@
 """Publish author resources while Windows readers retain the Mod directory."""
 import ctypes
+import hashlib
 from contextlib import contextmanager
 import importlib.util
 import os
@@ -13,6 +14,7 @@ from unittest.mock import patch
 
 from nativepack.ini_package import export_directory, update_directory
 from nativepack.ini_reader import read_package
+from test_eiem_offline_reload import block_fixture
 fixture_spec = importlib.util.spec_from_file_location(
     'directory_fixture', Path(__file__).parents[1] / 'nativepack' / 'test_directory_package.py')
 fixture_module = importlib.util.module_from_spec(fixture_spec)
@@ -24,8 +26,16 @@ exporter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(exporter)
 
 
+def external_fixture(root, generation=7, payload=b'payload'):
+    root=Path(root)
+    name='compiled.blocks/'+hashlib.sha256(payload).hexdigest().upper()+'.bin'
+    path=root/name;path.parent.mkdir(exist_ok=True);path.write_bytes(payload)
+    (root/'compiled.bin').write_bytes(block_fixture(generation=generation,payload=payload,external=True))
+    return name
+
+
 @contextmanager
-def windows_reader(path, directory=False):
+def windows_reader(path, directory=False, delete_shared=False):
     from ctypes import wintypes
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
     kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
@@ -35,12 +45,12 @@ def windows_reader(path, directory=False):
     kernel.CloseHandle.restype = wintypes.BOOL
     # Permit reads/writes of the directory, but forbid its rename/deletion.
     # The unchanged Mesh is deliberately read-only and cannot be overwritten.
-    handle = kernel.CreateFileW(str(path), 0x80000000, 3 if directory else 1,
+    handle = kernel.CreateFileW(str(path), 0x80000000, 7 if delete_shared else 3 if directory else 1,
                                None, 3, 0x02000000 if directory else 0x80, None)
     if handle == wintypes.HANDLE(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        yield
+        yield handle
     finally:
         kernel.CloseHandle(handle)
 
@@ -137,6 +147,142 @@ class PublishTests(unittest.TestCase):
         self.assertEqual((self.root/'compiled.bin').read_bytes(), b'new compiled rules')
         self.assertEqual((self.root/'textures/body.tex').read_bytes(),
                          (self.stage/'textures/body.tex').read_bytes())
+
+    def test_same_committed_blocks_ignore_uncommitted_tail_without_comparing_payloads(self):
+        (self.root/'compiled.bin').write_bytes(block_fixture(payload=b'x'*(4*1024*1024)))
+        shutil.copyfile(self.root/'compiled.bin',self.stage/'compiled.bin')
+        with (self.stage/'compiled.bin').open('ab') as stream:stream.write(b'uncommitted tail')
+        previous,candidate=read_package(self.root),read_package(self.stage)
+        with patch.object(exporter.os.path,'samefile',wraps=os.path.samefile) as samefile:
+            changed,removed=exporter.package_changes(self.stage,self.root,previous,candidate)
+        self.assertNotIn('compiled.bin',changed)
+        self.assertFalse(removed)
+        self.assertTrue(samefile.called)
+
+    def test_compiled_publication_links_candidate_and_backup_without_full_copies(self):
+        (self.root/'compiled.bin').write_bytes(block_fixture())
+        (self.stage/'compiled.bin').write_bytes(block_fixture(generation=8,payload=b'new payload'))
+        copied=shutil.copy2
+        def copy_without_compiled(source,target,*args,**kwargs):
+            self.assertNotEqual(Path(source).name,'compiled.bin','compiled snapshot was fully copied')
+            return copied(source,target,*args,**kwargs)
+        with patch.object(shutil,'copy2',side_effect=copy_without_compiled):
+            exporter.publish(self.stage,self.root,read_package)
+        self.assertTrue(os.path.samefile(self.stage/'compiled.bin',self.root/'compiled.bin'))
+
+    def test_compiled_backup_link_restores_snapshot_when_later_publication_fails(self):
+        old=block_fixture();(self.root/'compiled.bin').write_bytes(old)
+        (self.stage/'compiled.bin').write_bytes(block_fixture(generation=8,payload=b'new payload'))
+        self.change_texture(rename=True)
+        replace=exporter._replace_published_file
+        blocked=False
+        def fail_ini_once(source,target):
+            nonlocal blocked
+            if Path(target)==self.root/'mod.ini' and not blocked:
+                blocked=True
+                raise PermissionError('INI publication denied')
+            return replace(source,target)
+        copied=shutil.copy2
+        def copy_without_compiled(source,target,*args,**kwargs):
+            self.assertNotEqual(Path(source).name,'compiled.bin')
+            return copied(source,target,*args,**kwargs)
+        with patch.object(exporter,'_replace_published_file',side_effect=fail_ini_once),patch.object(shutil,'copy2',side_effect=copy_without_compiled):
+            with self.assertRaisesRegex(PermissionError,'INI publication denied'):
+                exporter.publish(self.stage,self.root,read_package)
+        self.assertEqual((self.root/'compiled.bin').read_bytes(),old)
+        read_package(self.root)
+
+    def test_compiled_publication_falls_back_when_hardlinks_are_unavailable(self):
+        (self.root/'compiled.bin').write_bytes(block_fixture())
+        new=block_fixture(generation=8,payload=b'new payload')
+        (self.stage/'compiled.bin').write_bytes(new)
+        with patch.object(exporter.os,'link',side_effect=OSError('hardlinks unavailable')):
+            exporter.publish(self.stage,self.root,read_package)
+        self.assertEqual((self.root/'compiled.bin').read_bytes(),new)
+
+    def test_external_blocks_publish_before_index_and_pinned_old_snapshot_survives_gc(self):
+        old=external_fixture(self.root)
+        new=external_fixture(self.stage,generation=8,payload=b'new shared resource')
+        pin=Path(self.temp.name)/'runtime-pin';pin.mkdir()
+        os.link(self.root/old,pin/'old-block.bin')
+        old_index=(self.root/'compiled.bin').read_bytes()
+        replace=exporter._replace_published_file
+        def verify_order(source,target):
+            if Path(target)==self.root/'compiled.bin':
+                self.assertTrue((self.root/new).is_file(),'index published before its resource block')
+            return replace(source,target)
+        with patch.object(exporter,'_replace_published_file',side_effect=verify_order):
+            result=exporter.publish(self.stage,self.root,read_package)
+        self.assertIn(new,result['_files'])
+        self.assertNotIn(old,result['_files'])
+        self.assertFalse((self.root/old).exists(),'retired content accumulated after commit')
+        self.assertEqual((pin/'old-block.bin').read_bytes(),b'payload')
+        self.assertEqual(old_index,block_fixture(external=True))
+        self.assertTrue(os.path.samefile(self.root/new,self.stage/new))
+        orphan=self.root/old;orphan.write_bytes(b'payload')
+        clone=Path(self.temp.name)/'external-stage'
+        exporter._clone_staging_tree(self.root,clone)
+        self.assertFalse((clone/old).exists(),'unreferenced history was cloned into author staging')
+        read_package(clone)
+
+    def test_external_index_missing_or_corrupt_blocks_keeps_previous_publication(self):
+        external_fixture(self.root);before=(self.root/'compiled.bin').read_bytes()
+        new=external_fixture(self.stage,generation=8,payload=b'new shared resource')
+        blob=self.stage/new
+        blob.unlink()
+        with self.assertRaisesRegex(ValueError,'分块文件缺失'):
+            exporter.publish(self.stage,self.root,read_package)
+        blob.write_bytes(b'x'*len(b'new shared resource'))
+        with self.assertRaisesRegex(ValueError,'内容块校验失败'):
+            exporter.publish(self.stage,self.root,read_package)
+        self.assertEqual((self.root/'compiled.bin').read_bytes(),before)
+        read_package(self.root)
+
+    def test_interrupted_block_writes_do_not_invalidate_or_enter_the_author_stage(self):
+        current=external_fixture(self.root)
+        temporary=current+'.tmp-123-456-789'
+        (self.root/temporary).write_bytes(b'incomplete blob')
+        (self.root/'compiled.bin.tmp-123-456-789').write_bytes(b'incomplete root')
+        package=read_package(self.root)
+        self.assertNotIn(temporary,package['_files'])
+        stage=Path(self.temp.name)/'interrupted-stage'
+        exporter._clone_staging_tree(self.root,stage)
+        self.assertFalse((stage/temporary).exists())
+        self.assertFalse((stage/'compiled.bin.tmp-123-456-789').exists())
+        read_package(stage)
+
+    def test_external_block_failure_after_index_restores_complete_old_snapshot(self):
+        old=external_fixture(self.root);before=(self.root/'compiled.bin').read_bytes()
+        external_fixture(self.stage,generation=8,payload=b'new shared resource')
+        self.change_texture(rename=True)
+        replace=exporter._replace_published_file;blocked=False
+        def fail_ini_once(source,target):
+            nonlocal blocked
+            if Path(target)==self.root/'mod.ini' and not blocked:
+                blocked=True
+                raise PermissionError('INI publication denied')
+            return replace(source,target)
+        with patch.object(exporter,'_replace_published_file',side_effect=fail_ini_once):
+            with self.assertRaisesRegex(PermissionError,'INI publication denied'):
+                exporter.publish(self.stage,self.root,read_package)
+        self.assertEqual((self.root/'compiled.bin').read_bytes(),before)
+        self.assertTrue((self.root/old).exists())
+        read_package(self.root)
+
+    @unittest.skipUnless(os.name=='nt','requires Windows sharing flags')
+    def test_linked_publication_keeps_pinned_runtime_snapshot_readable(self):
+        from ctypes import wintypes
+        old=block_fixture();new=block_fixture(generation=8,payload=b'updated')
+        (self.root/'compiled.bin').write_bytes(old)
+        (self.stage/'compiled.bin').write_bytes(new)
+        with windows_reader(self.root/'compiled.bin',delete_shared=True) as handle:
+            exporter.publish(self.stage,self.root,read_package)
+            api=ctypes.WinDLL('kernel32',use_last_error=True)
+            api.ReadFile.argtypes=[wintypes.HANDLE,ctypes.c_void_p,wintypes.DWORD,ctypes.POINTER(wintypes.DWORD),ctypes.c_void_p]
+            data=ctypes.create_string_buffer(len(old));count=wintypes.DWORD()
+            self.assertTrue(api.ReadFile(handle,data,len(old),ctypes.byref(count),None))
+            self.assertEqual(data.raw[:count.value],old)
+        self.assertEqual((self.root/'compiled.bin').read_bytes(),new)
 
     @unittest.skipUnless(os.name == 'nt', 'requires Windows sharing flags')
     def test_texture_export_with_directory_and_unchanged_mesh_locked(self):
@@ -258,6 +404,27 @@ class PublishTests(unittest.TestCase):
             with windows_reader(mesh):
                 exporter._clone_staging_tree(self.root, fresh)
                 shutil.rmtree(fresh)
+        finally:
+            if fresh.exists():
+                shutil.rmtree(fresh)
+
+    @unittest.skipUnless(os.name == 'nt', 'requires Windows sharing flags')
+    def test_locked_texture_output_is_copied_before_staging_update(self):
+        texture = self.root / 'textures' / 'body.tex'
+        original = texture.read_bytes()
+        mesh = next(self.root.glob('meshes/*.mesh'))
+        fresh = Path(self.temp.name) / 'locked-texture-stage'
+        try:
+            with windows_reader(texture):
+                exporter._clone_staging_tree(
+                    self.root, fresh, copy_paths={'textures/body.tex'})
+                staged_texture = fresh / 'textures' / 'body.tex'
+                self.assertFalse(os.path.samefile(texture, staged_texture))
+                self.assertTrue(os.path.samefile(mesh, fresh / mesh.relative_to(self.root)))
+                exporter._detach_staging_files([staged_texture])
+                staged_texture.write_bytes(b'updated texture')
+            self.assertEqual(texture.read_bytes(), original)
+            self.assertEqual(staged_texture.read_bytes(), b'updated texture')
         finally:
             if fresh.exists():
                 shutil.rmtree(fresh)

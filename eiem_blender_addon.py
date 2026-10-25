@@ -709,17 +709,22 @@ def normal_state_matches_source(mesh, source_normals, minimum_alignment=0.9998):
     """Ignore Blender's harmless split-normal re-encoding after save/update.
 
     A real normal edit still changes direction beyond the same tolerance used
-    by the import round-trip check. Zero-filled attributes on joined geometry
-    remain a mismatch and therefore cannot resurrect stale source normals.
+    by the import round-trip check. Undefined zero corner normals may use a
+    valid source point normal; missing or invalid source values still mismatch.
     """
     if source_normals is None or len(source_normals) != len(mesh.vertices):
         return False
     for loop, corner in zip(mesh.loops, mesh.corner_normals):
         source = Vector(source_normals[loop.vertex_index])
         current = Vector(corner.vector)
-        if source.length_squared == 0.0 or current.length_squared == 0.0:
-            if source.length_squared != current.length_squared:
-                return False
+        if not all(math.isfinite(value) for value in source) or not all(
+                math.isfinite(value) for value in current):
+            return False
+        source_length_squared = source.length_squared
+        current_length_squared = current.length_squared
+        if source_length_squared <= 1e-20:
+            return False
+        if current_length_squared <= 1e-20:
             continue
         if source.normalized().dot(current.normalized()) < minimum_alignment:
             return False
@@ -1518,7 +1523,7 @@ def _orthogonalize_missing_tangents(mesh_name, generated, normals):
               where=normal_length > 0)
     tx -= nx*dot; ty -= ny*dot; tz -= nz*dot
     tangent_length = tx*tx + ty*ty + tz*tz
-    valid_basis = ((normal_length > 0) & (tangent_length > 0) &
+    valid_basis = ((tangent_length > 0) & np.isfinite(normal_length) &
                    np.isfinite(normals).all(axis=1) & np.isfinite(tangent_length))
     invalid = np.flatnonzero(~(valid_frame & valid_basis))
     if len(invalid):
@@ -1765,7 +1770,13 @@ def mesh_export_tangents(mesh, source_normals, normal_corners, preserve_normals)
             # calc_tangents uses Blender's evaluated normals. Orthogonalize against
             # the exact normal selected for export in case a lossless source-normal
             # backup differs slightly from Blender's encoded custom-normal result.
-            tangent -= normal * (tangent.dot(normal) / normal.length_squared)
+            # A zero custom normal has no projection axis, so retain the UV tangent.
+            normal_length_squared = normal.length_squared
+            if not math.isfinite(normal_length_squared):
+                raise ValueError("%s corner %d has a non-finite exported normal" %
+                                 (mesh.name, loop_index))
+            if normal_length_squared > 0.0:
+                tangent -= normal * (tangent.dot(normal) / normal_length_squared)
             if tangent.length_squared == 0.0:
                 raise ValueError("%s corner %d tangent is parallel to its exported normal" %
                                  (mesh.name, loop_index))
@@ -2668,13 +2679,7 @@ def mod_export_directory(directory, filepath=None, mod_name=None):
 
 
 def visible_eiem_resources(context=None):
-    """Return only the EFF meshes visible in the current Blender view.
-
-    Every visible EFF mesh is part of this temporary validation export,
-    including a source mesh that the user edited in place.  Hidden meshes are
-    intentionally omitted. Armatures and physics are deliberately excluded;
-    this entry point is for the current mesh-only validation export.
-    """
+    """Return EFF meshes visible in the current Blender view."""
     context = context or bpy.context
     return sorted([
         obj for obj in context.scene.objects
@@ -2683,9 +2688,13 @@ def visible_eiem_resources(context=None):
         and obj.visible_get(view_layer=context.view_layer)
         and not obj.hide_viewport
         and not obj.hide_get(view_layer=context.view_layer)
-        and not obj.hide_render
     ], key=lambda obj: (
         str(obj.data.get("eiem_section", "")), obj.name))
+
+
+def export_meshes_for_scope(context, selected_meshes, resource_scope,
+                            effect_only=False, physics_only=False):
+    return list(selected_meshes)
 
 
 def selected_eiem_resources(context=None,allow_empty=False):
@@ -2711,9 +2720,35 @@ def selected_export_resources(context=None):
     context=context or bpy.context
     meshes,rigs=selected_eiem_resources(context,allow_empty=True)
     effects=effect_editor.export_roots(context.selected_objects,meshes,sys.modules[__name__])
-    if not meshes and not effects:
+    if not meshes and not effects and not selected_eiem_physics(context):
         raise ValueError('请选择 EFF 网格或特效根 / 发射器')
     return meshes,rigs,effects
+
+
+def export_scope_resources(context=None, resource_scope='ALL'):
+    context = context or bpy.context
+    selected_meshes, rigs = selected_eiem_resources(context, allow_empty=True)
+    physics = selected_eiem_physics(context)
+    effects = effect_editor.export_roots(
+        context.selected_objects, selected_meshes, sys.modules[__name__])
+    if not selected_meshes and effects and physics:
+        raise ValueError('请分别导出特效和 Physics')
+    effect_only = not selected_meshes and bool(effects)
+    physics_only = not selected_meshes and not effects and bool(physics)
+    if effect_only:
+        resource_scope = 'ALL'
+    elif physics_only:
+        resource_scope = 'PHYSICS'
+    elif resource_scope == 'PHYSICS':
+        resource_scope = 'ALL'
+    meshes = export_meshes_for_scope(
+        context, selected_meshes, resource_scope, effect_only, physics_only)
+    if resource_scope == 'ALL' and not effect_only and not physics_only:
+        effects = effect_editor.export_roots(
+            context.selected_objects, meshes, sys.modules[__name__])
+    if not meshes and not effects and not physics:
+        raise ValueError('No selected EFF mesh objects or selected effects/physics')
+    return meshes, rigs, effects, physics, effect_only, physics_only, resource_scope
 
 
 def plan_mesh_only_export(mesh_objects):
@@ -2896,6 +2931,29 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
         source_baseline = getattr(bpy.context.scene, 'eiem_source_baseline', '')
     if bpy.context.mode != 'OBJECT':
         raise ValueError('请回到物体模式后导出')
+    if resource_scope == 'PHYSICS':
+        physics_objects=list(physics_objects or selected_eiem_physics())
+        if not physics_objects:
+            raise ValueError('EFF Physics export requires a selected physics group')
+        packages={str(group.eiem_physics.rig.get('eiem_author_package','')).strip()
+                  for group in physics_objects if group.eiem_physics.rig}
+        packages.discard('')
+        if len(packages)>1:
+            raise ValueError('Selected Physics Rigs come from different unpacked source packages')
+        if packages:
+            rig_package=Path(next(iter(packages))).resolve()
+            if source_baseline and Path(source_baseline).resolve()!=rig_package:
+                raise ValueError('Source directory does not match the selected Physics Rig')
+            source_baseline=str(rig_package)
+        elif not source_baseline:
+            raise ValueError('Physics Rig must identify one unpacked source package')
+        game_directory=export_game_directory(root,game_directory)
+        bpy.context.view_layer.update()
+        return native_export.export_native_package(
+            sys.modules[__name__],root,[],armatures=[],physics_objects=physics_objects,
+            mesh_only=False,lod_levels=None,include_switches=include_switches,
+            source_baseline=source_baseline,resource_scope='PHYSICS',
+            game_directory=game_directory,effect_roots=[])
     if not mesh_objects:
         if resource_scope!='ALL':raise ValueError('仅选择特效时请使用全部资源导出')
         prefs=_addon_preferences(bpy.context)
@@ -3927,15 +3985,17 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
     directory: StringProperty(subtype="DIR_PATH")
     scope_message: StringProperty(options={"HIDDEN"})
     effect_only: BoolProperty(options={'HIDDEN'})
+    physics_only: BoolProperty(options={'HIDDEN'})
     package_directory: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     _effect_job=None
     _timer=None
     resource_scope: EnumProperty(
         name='导出资源', default='ALL',
-        items=(('ALL', '全部资源', '导出所选网格、特效及其材质、贴图、控制配置'),
+        items=(('ALL', '全部资源', '导出所选 EFF 网格，以及引用材质、贴图、挂载特效和物理依赖'),
                ('MESH', '仅 Mesh', '更新已有 Mod 中所选网格的几何、骨骼、形态和形态动画'),
                ('MATERIALS', '仅材质与贴图', '更新所选网格引用的材质、贴图及 INI 声明'),
-               ('TEXTURES', '仅贴图', '读取最新图片，更新贴图及绑定声明')))
+               ('TEXTURES', '仅贴图', '读取最新图片，更新贴图及绑定声明'),
+               ('PHYSICS', '仅物理', '只更新选中 Rig 的物理资源，保留 Mesh、材质和贴图')))
     include_switches: BoolProperty(
         name='导出按键切换', default=True,
         description="导出款式切换及快捷键；取消后只导出默认款式，保留形态键与滑块控制")
@@ -3954,20 +4014,19 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
         # A normal picker must also clear overrides remembered by older sessions.
         self.package_directory = ''
         try:
-            meshes, _,effects = selected_export_resources(context)
-            self.effect_only=not meshes
+            (meshes, _, effects, physics, self.effect_only, self.physics_only,
+             self.resource_scope) = export_scope_resources(context, self.resource_scope)
             plan = plan_mesh_only_export(meshes) if meshes else dict(objects=[],hidden=[],sources=[])
-            physics = selected_eiem_physics(context)
             levels = self._lod_levels(meshes) if meshes else []
-            self.scope_message = "所选 %d 个网格 / %d 个物理组 / 隐藏 %d 个 / %d 个源资源 / %d 个切换组" % (
-                len(plan["objects"]), len(physics), len(plan["hidden"]),
+            scope_label = '所选'
+            self.scope_message = "%s %d 个网格 / %d 个物理组 / 隐藏 %d 个 / %d 个源资源 / %d 个切换组" % (
+                scope_label, len(plan["objects"]), len(physics), len(plan["hidden"]),
                 len(plan["sources"]), sum(
                     bool(set(switch_members(group)) & set(meshes))
                     for group in switch_groups(context.scene)))
             self.scope_message += " / LOD: " + (
                 ",".join(str(level) for level in levels) or "无")
             self.scope_message += ' / %d 个特效'%len(effects)
-            if self.effect_only:self.resource_scope='ALL'
         except ValueError as error:
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
@@ -3983,6 +4042,10 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
         if self.effect_only:
             self.layout.label(text='仅导出所选特效及其引用资源')
             self.layout.label(text='已有角色包：追加 / 更新所选特效，保留角色与其他特效')
+        elif self.physics_only:
+            self.layout.label(text='仅更新选中 Rig 的全部新建物理组')
+            self.layout.label(text='保留目标 Mod 的其他资源')
+            self.layout.prop(context.scene, "eiem_source_baseline", text='原生来源目录')
         else:
             self.layout.prop(context.scene, "eiem_source_baseline", text='原生来源目录')
             self.layout.prop(self, "resource_scope")
@@ -3992,8 +4055,8 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
 
     def execute(self, context):
         try:
-            meshes, rigs,effects = selected_export_resources(context)
-            self.effect_only=not meshes
+            (meshes, rigs, effects, physics, self.effect_only, self.physics_only,
+             self.resource_scope) = export_scope_resources(context, self.resource_scope)
             destination=(Path(self.package_directory).resolve() if self.package_directory else
                 mod_export_directory(self.directory or os.path.dirname(self.filepath),
                     self.filepath,context.scene.eiem_export_mod_name))
@@ -4013,7 +4076,7 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
                 destination,
                 mesh_objects=meshes,
                 armatures=rigs,
-                physics_objects=selected_eiem_physics(context) if self.resource_scope == 'ALL' else [],
+                physics_objects=physics if self.resource_scope in ('ALL','PHYSICS') else [],
                 lod_levels=levels, include_switches=self.include_switches,
                 source_baseline=context.scene.eiem_source_baseline,
                 resource_scope=self.resource_scope,effect_roots=effects)
@@ -4038,6 +4101,10 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
         if stats.get('characterEffectUpdate'):
             self.report({'INFO'},'已更新角色包中的 %d 个特效（%.2f 秒）'%(stats['effects'],stats['exportSeconds']))
             return
+        if stats.get('resourceScope')=='PHYSICS':
+            self.report({'INFO'},'已更新 %d 个物理组 / %d 个骨架（%.2f 秒）'%(
+                stats.get('physics',0),stats.get('skeletons',0),stats['exportSeconds']))
+            return
         self.report({'INFO'},'已导出 %d 个 Mesh、%d 个材质、%d 张贴图、%d 个特效（%.2f 秒）'%(
             stats['meshes'],stats['materials'],stats['textures'],stats.get('effects',0),stats['exportSeconds']))
 
@@ -4060,8 +4127,18 @@ class EFF_OT_export_update(bpy.types.Operator):
 
     def execute(self,context):
         destination=Path(bpy.path.abspath(context.scene.eiem_export_last_directory)).resolve()
+        try:
+            meshes,_,effects=selected_export_resources(context)
+            physics=selected_eiem_physics(context)
+        except ValueError as error:
+            self.report({'ERROR'},str(error))
+            return {'CANCELLED'}
+        if not meshes and effects and physics:
+            self.report({'ERROR'},'请分别导出特效和 Physics')
+            return {'CANCELLED'}
+        scope='PHYSICS' if not meshes and not effects and physics else 'ALL'
         result=bpy.ops.eiem.export_package('EXEC_DEFAULT',directory=str(destination.parent),
-            filepath=str(destination),package_directory=str(destination),resource_scope='ALL')
+            filepath=str(destination),package_directory=str(destination),resource_scope=scope)
         return {'FINISHED'} if result=={'RUNNING_MODAL'} else result
 
 

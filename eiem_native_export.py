@@ -132,13 +132,18 @@ def mesh_part_id(name, slot, split_count):
     return identifier if split_count == 1 else identifier + '_mat' + str(slot)
 
 
-def baseline_for(objects, configured):
+def baseline_for(objects, configured, physics_objects=()):
     if configured:
         path = Path(configured).resolve()
         if not (path/'source/manifest.json').is_file():
             raise ValueError('原生来源目录缺少 source/manifest.json：'+str(path))
         return path
-    sources = {Path(o.get('eiem_author_package', '')).resolve() for o in objects}
+    sources = {Path(value).resolve() for value in
+               (str(o.get('eiem_author_package', '')).strip() for o in objects) if value}
+    if not sources and physics_objects:
+        sources = {Path(value).resolve() for value in
+                   (str(group.eiem_physics.rig.get('eiem_author_package', '')).strip()
+                    for group in physics_objects if group.eiem_physics.rig) if value}
     if len(sources) != 1 or not (next(iter(sources))/'source/manifest.json').is_file():
         raise ValueError('旧工程未保留完整原生来源，请在导出窗口指定包含 source/manifest.json 的解包目录')
     return next(iter(sources))
@@ -483,12 +488,26 @@ def package_changes(staging, destination, previous, candidate):
     new_files = candidate['_files']
 
     def same_bytes(a, b):
-        if not b.is_file() or a.stat().st_size != b.stat().st_size:
+        if not b.is_file():
             return False
         # Both packages have already passed checksum validation. An unchanged
         # staging hardlink names the same file, so rereading both adds no proof.
         if os.path.samefile(a, b):
             return True
+        if a == staging / 'compiled.bin':
+            try:
+                from .eiem_offline_reload import compiled_snapshot
+            except ImportError:
+                from eiem_offline_reload import compiled_snapshot
+            first, second = compiled_snapshot(staging), compiled_snapshot(destination)
+            if first is not None or second is not None:
+                # The compiler owns immutable blocks; the checked directory
+                # names their content hashes. Uncommitted/obsolete tail bytes
+                # are not part of the published snapshot's identity.
+                return (first is not None and second is not None and first['store'] == second['store'] and
+                        first['revision'][2:] == second['revision'][2:])
+        if a.stat().st_size != b.stat().st_size:
+            return False
         with a.open('rb') as first, b.open('rb') as second:
             while True:
                 chunk = first.read(1024*1024)
@@ -498,8 +517,50 @@ def package_changes(staging, destination, previous, candidate):
                     return True
 
     changed = [name for name in sorted(new_files) if not same_bytes(staging/name, destination/name)]
-    removed = sorted(old_files - new_files)
+    # Retired content blocks can still belong to a pinned runtime snapshot.
+    # Keep them until explicit package compaction, including on rollback.
+    removed = sorted(name for name in old_files - new_files if not name.startswith('compiled.blocks/'))
     return changed, removed
+
+
+def _prepare_publication_file(source, destination, name, verify_block=False):
+    """Retain immutable compiled snapshots without copying their payloads."""
+    source, destination = Path(source), Path(destination)
+    block = re.fullmatch(r'compiled\.blocks/([0-9A-F]{64})\.bin', name)
+    if block is not None and verify_block:
+        digest = hashlib.sha256()
+        with source.open('rb') as stream:
+            for data in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(data)
+        if digest.hexdigest().upper() != block[1]:
+            raise ValueError('Mod 内容块校验失败，上一发布保留：' + name)
+    if (name == 'compiled.bin' or block is not None) and source.stat().st_mode & stat.S_IWRITE:
+        try:
+            os.link(source, destination)
+            return
+        except OSError:
+            # Different volumes and filesystems without hardlinks still use
+            # complete private copies, with the same rollback semantics.
+            pass
+    shutil.copy2(source, destination)
+
+
+def _retire_compiled_blocks(destination, package):
+    """Collect unreferenced history only after a complete validated commit."""
+    root=Path(destination)/'compiled.blocks'
+    try:
+        paths=list(root.iterdir()) if root.is_dir() else []
+    except OSError:
+        return
+    for path in paths:
+        name='compiled.blocks/'+path.name
+        if re.fullmatch(r'compiled\.blocks/[0-9A-F]{64}\.bin',name) and name not in package['_files']:
+            try:
+                path.unlink()
+            except OSError:
+                # An active reader or filesystem can defer collection. It must
+                # never turn a successful commit into an unsafe late rollback.
+                pass
 
 
 def publish(staging, destination, reader, previous=None, candidate=None):
@@ -513,7 +574,9 @@ def publish(staging, destination, reader, previous=None, candidate=None):
     if candidate is None:candidate = reader(staging)
     changed, removed = package_changes(staging, destination, previous, candidate)
     if not changed and not removed:
-        return previous if previous is not None else candidate
+        package=previous if previous is not None else candidate
+        _retire_compiled_blocks(destination,package)
+        return package
     release = getattr(reader, 'release_files', None)
     if release:
         release([root/name for root in (destination,staging) for name in changed + removed])
@@ -532,31 +595,33 @@ def publish(staging, destination, reader, previous=None, candidate=None):
         for name in changed:
             output = pending/'new'/name
             output.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(staging/name, output)
+            _prepare_publication_file(staging/name, output, name, verify_block=True)
         for name in changed:
             original = destination/name
             if original.is_file():
                 saved = backup/name
                 saved.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(original, saved)
+                _prepare_publication_file(original, saved, name)
         for name in removed:
             saved = backup/name
             saved.parent.mkdir(parents=True, exist_ok=True)
             os.replace(destination/name, saved)
             applied.append(name)
-        for name in sorted(changed, key=lambda value: (value == 'mod.ini', value)):
+        for name in sorted(changed, key=lambda value: (value == 'mod.ini', value == 'compiled.bin', value)):
             output = destination/name
             output.parent.mkdir(parents=True, exist_ok=True)
             _replace_published_file(pending/'new'/name, output)
             applied.append(name)
-        return reader(destination)
+        package=reader(destination)
+        _retire_compiled_blocks(destination,package)
+        return package
     except Exception as error:
         try:
             for name in reversed(applied):
                 saved = backup/name
                 if saved.is_file():
                     _replace_published_file(saved, destination/name)
-                else:
+                elif not name.startswith('compiled.blocks/'):
                     (destination/name).unlink()
         except Exception as rollback:
             cleanup = False
@@ -568,14 +633,22 @@ def publish(staging, destination, reader, previous=None, candidate=None):
             shutil.rmtree(pending, ignore_errors=True)
 
 
-def _clone_staging_tree(source, destination):
-    """Clone a partial-export input with same-volume hardlinks when possible."""
+def _clone_staging_tree(source, destination, copy_paths=()):
+    """Clone a partial input, privately copying paths that will be replaced."""
     source, destination = Path(source), Path(destination)
+    copy_paths = set(copy_paths)
     destination.mkdir(parents=True, exist_ok=False)
     modules,_=pack_modules()
     package_files=importlib.import_module(modules['ini_reader'].__package__+'.mod_directory').package_files
+    store=importlib.import_module(modules['ini_reader'].__package__+'.compiled_store')
+    committed=store.snapshot(source)
+    blobs=committed['blobs'] if committed is not None else {}
     for path in package_files(source):
         relative = path.relative_to(source)
+        if store.TRANSIENT_PATH.fullmatch(relative.as_posix()):
+            continue
+        if store.BLOCK_PATH.fullmatch(relative.as_posix()) and relative.as_posix() not in blobs:
+            continue
         target = destination / relative
         if path.is_dir():
             target.mkdir(parents=True, exist_ok=True)
@@ -583,10 +656,11 @@ def _clone_staging_tree(source, destination):
         if not path.is_file():
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        if not path.stat().st_mode & stat.S_IWRITE:
+        if (relative.as_posix() in copy_paths or
+                not path.stat().st_mode & stat.S_IWRITE):
             # Windows read-only attributes belong to the shared file, not one
-            # link. A private writable copy lets cleanup/detach proceed without
-            # changing the author's attributes.
+            # link. Private writable copies also avoid replacing a hardlink
+            # whose source is currently open without FILE_SHARE_DELETE.
             shutil.copy2(path, target)
             os.chmod(target, target.stat().st_mode | stat.S_IWRITE)
             continue
@@ -602,6 +676,8 @@ def _detach_staging_files(paths):
     """Break hardlinks before update_directory writes a staged resource."""
     for path in {Path(value) for value in paths}:
         if not path.is_file():
+            continue
+        if path.stat().st_nlink <= 1:
             continue
         fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '.',
                                           suffix='.detach', dir=str(path.parent))
@@ -646,6 +722,34 @@ def _partial_output_paths(staging, resource_scope, existing_ini, materials,
                 paths.append(Path(staging) / existing_ini[section]['path'])
     return paths
 
+
+@contextlib.contextmanager
+def _export_temporary_directory(resource_cache, destination, **options):
+    """Keep staging invisible to recursive Mod discovery and release file handles."""
+    package_parent = Path(destination).resolve().parent
+    staging_parent = package_parent / '.eff-export-staging'
+    cleanup_parent = False
+    if package_parent.is_dir():
+        staging_parent.mkdir(exist_ok=True)
+        options['dir'] = str(staging_parent)
+        cleanup_parent = True
+    try:
+        with tempfile.TemporaryDirectory(**options) as temporary:
+            try:
+                yield temporary
+            finally:
+                frozen = resource_cache.get('__frozen_files__', {})
+                for stream, _signature, _result in frozen.values():
+                    stream.close()
+                frozen.clear()
+    finally:
+        if cleanup_parent:
+            try:
+                staging_parent.rmdir()
+            except OSError:
+                pass
+
+
 def export_native_package(*args, **kwargs):
     cache = {'__frozen_files__': {}}
     try:
@@ -655,7 +759,7 @@ def export_native_package(*args, **kwargs):
         else:
             kwargs['mesh_objects'] = objects
         configured = kwargs.get('source_baseline', args[8] if len(args) > 8 else '')
-        primary = baseline_for(objects, configured)
+        primary = baseline_for(objects, configured, kwargs.get('physics_objects') or ())
         packages = {primary}
         packages.update(Path(slot.material.get('eiem_author_package')).resolve()
                         for obj in objects for slot in obj.material_slots
@@ -678,17 +782,21 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
     started = time.perf_counter()
     detail = dict(meshSnapshot=0., materialTexture=0., meshEncoding=0., effect=0., writeAuthor=0.)
     snapshot_hits = snapshot_misses = 0
+    exported_physics = exported_skeletons = 0
     vendor=Path(__file__).parent/'vendor'
     if vendor.is_dir() and str(vendor) not in sys.path: sys.path.insert(0,str(vendor))
-    if resource_scope not in ('ALL', 'MESH', 'MATERIALS', 'TEXTURES'):
+    if resource_scope not in ('ALL', 'MESH', 'MATERIALS', 'TEXTURES', 'PHYSICS'):
         raise ValueError('未知导出资源范围：' + resource_scope)
     if bpy.context.mode != 'OBJECT': raise ValueError('请回到物体模式后导出')
     objects = list(mesh_objects)
     physics_objects = list(physics_objects or [])
-    if not objects: raise ValueError('没有选中的 EFF Mesh')
-    if physics_objects and resource_scope != 'ALL': raise ValueError('新增 Physics 需要选择全部资源导出')
+    if not objects and resource_scope != 'PHYSICS': raise ValueError('No EFF Mesh selected')
+    if physics_objects and resource_scope not in ('ALL', 'PHYSICS'):
+        raise ValueError('Physics can only be updated by full or physics-only export')
+    if resource_scope == 'PHYSICS' and not physics_objects:
+        raise ValueError('Physics-only export requires at least one selected group')
     modules, dll = pack_modules()
-    source = modules['author_source'].AuthorSource(baseline_for(objects, source_baseline),
+    source = modules['author_source'].AuthorSource(baseline_for(objects, source_baseline, physics_objects),
                 modules['author_source'].AuthorCore(dll))
     destination = Path(destination).resolve()
     resource_cache = resource_cache if resource_cache is not None else {}
@@ -717,7 +825,9 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
     if destination == source.package or source.package in destination.parents:
         raise ValueError('不能覆盖原生来源目录')
     bpy.context.view_layer.update()
-    plan = (addon.plan_mesh_only_export(objects) if mesh_only or resource_scope != 'ALL' else
+    plan = ({'objects': [], 'sources': [], 'groups': [], 'bindings': {}, 'hidden': set()}
+            if not objects else
+            addon.plan_mesh_only_export(objects) if mesh_only or resource_scope != 'ALL' else
             addon.plan_switch_export(objects, include_switches=include_switches))
     if resource_scope == 'ALL':
         if lod_levels is None:
@@ -774,20 +884,42 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                                                  include_hotkeys=include_switches)
         controls_by_object = {original.as_pointer(): shape_controls(addon, original, include_switches)
                               for original in originals}
-    temporary_parent = (str(destination.parent)
-                        if resource_scope != 'ALL' and destination.parent.is_dir()
-                        else None)
-    with tempfile.TemporaryDirectory(prefix='eff-native-export-',
-                                      dir=temporary_parent) as temporary:
+    with _export_temporary_directory(resource_cache, destination,
+                                      prefix='eff-native-export-') as temporary:
         staging = Path(temporary)/'mod'
-        if resource_scope != 'ALL':
+        if resource_scope in ('MATERIALS', 'TEXTURES'):
+            for view in objects:
+                original = addon.mesh_export_template(view)
+                slots = {polygon.material_index for polygon in original.data.polygons}
+                for slot in sorted(slots):
+                    mat = original.data.materials[slot] if slot < len(original.data.materials) else None
+                    if mat is None:
+                        raise ValueError(original.name+' 缂哄皯鏉愯川妲?'+str(slot))
+                    mid = material_sections[mat.as_pointer()]
+                    if mid not in materials:
+                        materials[mid] = collect_material(
+                            addon, material_source(source, mat, material_sources), mat,
+                            images, textures, temporary, encode, existing_ini,
+                            resource_scope == 'TEXTURES', mid, texture_cache,
+                            existing_package)
+            texture_paths = modules['ini_package'].texture_output_paths(
+                destination, existing_ini, list(textures.values()),
+                list(materials.values()))
+            output_paths = _partial_output_paths(
+                destination, resource_scope, existing_ini,
+                list(materials.values()), list(textures.values()), parts,
+                modules['ini_package'].identifier, texture_paths)
+            copy_paths = {path.relative_to(destination).as_posix()
+                          for path in output_paths}
+            _clone_staging_tree(destination, staging, copy_paths=copy_paths)
+        elif resource_scope != 'ALL':
             _clone_staging_tree(destination, staging)
         else:
             staging.mkdir()
         # Partial staging may share files with the live author through links.
         # It must hash current bytes even if a foreign writer preserves mtime.
         resource_cache['__trusted_roots__'] = (staging.resolve(),) if resource_scope == 'ALL' else ()
-        if resource_scope in ('MATERIALS', 'TEXTURES'):
+        if resource_scope in ('MATERIALS', 'TEXTURES') and not materials:
             for view in objects:
                 original = addon.mesh_export_template(view)
                 slots = {polygon.material_index for polygon in original.data.polygons}
@@ -919,6 +1051,7 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                 for rig in rigs:
                     groups = [obj for obj in physics_objects if obj.eiem_physics.rig == rig]
                     document = author.author_document(groups, 'shared.skeleton')
+                    exported_physics += len(groups); exported_skeletons += 1
                     skeleton = addon.skeleton_author_nodes(rig)
                     mesh_bones = {identity: {snapshot['bone_paths'][slot]
                                   for weights, slots in snapshot['skin']
@@ -934,6 +1067,71 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                     ini['ResourcePhysics' + document['id']] = {'path': relative}
                 modules['ini_package'].save_ini(staging, ini)
                 read_package(staging)
+        elif resource_scope == 'PHYSICS':
+            from importlib import import_module
+            physics = import_module(modules['author_source'].__package__ + '.physics')
+            author = sys.modules[addon.__package__ + '.eiem_physics_authoring']
+            native_source = sys.modules[addon.__package__ + '.eiem_physics_source']
+            evidence = native_source.read_evidence(source.package / 'physics/components.json')
+            ini = modules['ini_package'].ini_document(staging)
+            rigs = {group.eiem_physics.rig for group in physics_objects}
+            if not rigs or None in rigs:
+                raise ValueError('Physics groups must reference valid author Rigs')
+            for rig in rigs:
+                groups = [obj for obj in bpy.data.objects
+                          if obj.eiem_physics.kind == 'GROUP' and obj.eiem_physics.rig == rig]
+                if not groups:
+                    raise ValueError('Selected Rig has no authored Physics groups')
+                document = author.author_document(groups, 'shared.skeleton')
+                section = 'ResourcePhysics' + document['id']
+                if section not in ini:
+                    raise ValueError('Physics-only export requires an existing Physics resource; use full export for new groups')
+                old_relative = ini[section]['path']
+                old_resource = existing_package['_resources'].get(old_relative)
+                if not old_resource or '@physics' not in old_resource['blocks']:
+                    raise ValueError('Existing Physics resource layout is unavailable; use full export')
+                previous = physics.read_resource_layout(old_resource['blocks']['@physics'])
+                group_ids = {group['id'] for group in document['groups']}
+                if previous['identity'] != document['id'] or group_ids != set(previous['groups']):
+                    raise ValueError('Physics group membership changed; use full export')
+                for group in document['groups']:
+                    nodes = [(node['bone'], node['role'] == 'MOVE') for node in group['nodes']]
+                    if nodes != previous['groups'][group['id']]['nodes']:
+                        raise ValueError('Physics chain topology changed; use full export')
+                skeleton = addon.skeleton_author_nodes(rig)
+                current_skeleton = []
+                for bone, record, is_source in skeleton:
+                    path, parent, position, rotation, scale = record
+                    parent_path = skeleton[parent][1][0] if parent >= 0 else ''
+                    current_skeleton.append((path, parent_path, bool(is_source), parent >= 0,
+                                             tuple(float(value) for value in (*position, *rotation, *scale))))
+                same_skeleton = len(current_skeleton) == len(previous['skeleton'])
+                if same_skeleton:
+                    for current, saved in zip(current_skeleton, previous['skeleton']):
+                        if current[:4] != saved[:4] or any(abs(a-b) > 1e-7 for a, b in zip(current[4], saved[4])):
+                            same_skeleton = False; break
+                if not same_skeleton:
+                    raise ValueError('Rig skeleton changed; use full export')
+                exported_physics += len(groups); exported_skeletons += 1
+                targets = {group['id']: previous['groups'][group['id']]['targets']
+                           for group in document['groups']}
+                data = physics.build_resource(source, evidence, document, skeleton, targets)
+                relative = 'resources/physics_' + document['id'] + '.bin'
+                path = staging / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _detach_staging_files([staging / 'mod.ini', path])
+                if old_relative and old_relative != relative:
+                    if not any(name != section and values.get('path') == old_relative
+                               for name, values in ini.items()):
+                        safe_resource_path = import_module(
+                            modules['ini_package'].__package__ + '.resource_file').resource_path
+                        old_path = safe_resource_path(staging, old_relative)
+                        if old_path.is_file():
+                            old_path.unlink()
+                ini[section] = {'path': relative}
+                path.write_bytes(data)
+            modules['ini_package'].save_ini(staging, ini)
+            read_package(staging)
         else:
             texture_paths = modules['ini_package'].texture_output_paths(
                 staging, existing_ini, list(textures.values()), list(materials.values()))
@@ -945,11 +1143,11 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                         textures=list(textures.values()),texture_only=resource_scope == 'TEXTURES',
                         resource_cache=resource_cache,material_clips=material_clips,effects=effects)
         author_done = time.perf_counter()
-        _detach_staging_files([staging / 'compiled.bin', staging / 'source-inputs.bin'])
+        _detach_staging_files([staging / 'source-inputs.bin'])
         source_index = prepare_static_sources(staging, source.package, offline_context, previous=destination)
-        prior_compiled = destination / 'compiled.bin'
-        if prior_compiled.is_file() and not (staging / 'compiled.bin').is_file():
-            shutil.copyfile(prior_compiled, staging / 'compiled.bin')
+        # --previous-mod supplies the old snapshot. Do not detach/copy tens of
+        # MB only to have the compiler atomically replace them with a candidate.
+        (staging / 'compiled.bin').unlink(missing_ok=True)
         offline = compile_reload(staging, offline_context, previous=destination, source_index=source_index)
         compile_done = time.perf_counter()
         source.assert_current()
@@ -962,7 +1160,7 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                                  if section in textures and textures[section].get('_written', True)}
         return dict(meshes=len(parts),materials=0 if resource_scope == 'TEXTURES' else len(materials),
                     textures=len(written_texture_files),textureBindings=len(textures),
-                    skeletons=len({obj.eiem_physics.rig for obj in physics_objects or []}),physics=len(physics_objects or []),format=2,
+                    skeletons=exported_skeletons,physics=exported_physics,format=2,
                     rules=len(rules) if resource_scope == 'ALL' else 0,
                     resourceScope=resource_scope,nativeSubmission=False,
                     exportSeconds=time.perf_counter()-started,effects=len(effects or []),

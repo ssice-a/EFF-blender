@@ -3,6 +3,7 @@ import importlib.util
 import math
 import struct
 import sys
+import types
 from pathlib import Path
 
 import bpy
@@ -10,7 +11,15 @@ from mathutils import Vector
 
 addon_path, output = map(Path, sys.argv[sys.argv.index('--') + 1:])
 sys.path.insert(0, str(addon_path.parent))
-spec = importlib.util.spec_from_file_location('eiem_tangent_export_test', addon_path)
+package_name = 'EIEM_Blender'
+for module_name in tuple(sys.modules):
+    if module_name == package_name or module_name.startswith(package_name + '.'):
+        del sys.modules[module_name]
+package = types.ModuleType(package_name)
+package.__path__ = [str(addon_path.parent)]
+sys.modules[package_name] = package
+spec = importlib.util.spec_from_file_location(
+    package_name + '.eiem_blender_addon', addon_path)
 addon = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = addon
 spec.loader.exec_module(addon)
@@ -96,6 +105,25 @@ assert addon.normal_state_matches_source(normal_probe.data, source_normals)
 normal_probe.data.normals_split_custom_set([(0, .1, .994987)] * len(normal_probe.data.loops))
 normal_probe.data.update()
 assert not addon.normal_state_matches_source(normal_probe.data, source_normals)
+
+
+# Imported meshes can retain zero-valued custom corner normals even though
+# their point-domain source normal is valid. Blender's public setter repairs
+# such values, so exercise the exporter's source-normal decision seam directly.
+zero_corner_mesh = types.SimpleNamespace(
+    vertices=[None],
+    loops=[types.SimpleNamespace(vertex_index=0)],
+    corner_normals=[types.SimpleNamespace(vector=(0, 0, 0))])
+assert addon.normal_state_matches_source(zero_corner_mesh, [(0, 0, 1)]), (
+    'Undefined custom normal displaced a valid source normal')
+assert not addon.normal_state_matches_source(zero_corner_mesh, [(0, 0, 0)]), (
+    'Zero-filled source normal was treated as a valid backup')
+edited_corner_mesh = types.SimpleNamespace(
+    vertices=[None],
+    loops=[types.SimpleNamespace(vertex_index=0)],
+    corner_normals=[types.SimpleNamespace(vector=(0, 1, 0))])
+assert not addon.normal_state_matches_source(edited_corner_mesh, [(0, 0, 1)]), (
+    'A real normal edit incorrectly restored the source normal')
 
 
 # Missing tangents must produce actual UV0-derived data, not an empty array.
@@ -205,6 +233,30 @@ for corner, index in enumerate(corner_indices(mixed_result)):
     else:
         new_index = indices[corner]
         assert bits(actual) == bits(result['tangents'][new_index*4:new_index*4+4])
+
+# A zero authored corner normal can occur in imported meshes. When the point
+# tangent is missing, keep the UV-derived tangent instead of projecting it
+# through a zero-length normal.
+all_missing_zero_normal = make_object('AllMissingZeroNormal')
+all_missing_zero_corners = [tuple(c.vector) for c in all_missing_zero_normal.data.corner_normals]
+all_missing_zero_corners[0] = (0, 0, 0)
+_, all_missing_zero_tangents = addon.mesh_export_tangents(
+    all_missing_zero_normal.data, None, all_missing_zero_corners, False)
+all_missing_zero_tangent = Vector(all_missing_zero_tangents[0][:3])
+assert abs(all_missing_zero_tangent.length - 1) < 1e-5
+
+mixed_zero_normal = make_object('MixedZeroNormal')
+addon.set_point_attribute(mixed_zero_normal.data, 'EFF_Tangent', 'FLOAT_VECTOR',
+                          mixed_values, 'vector')
+addon.set_point_attribute(mixed_zero_normal.data, 'EFF_TangentSign', 'FLOAT',
+                          mixed_signs, 'value')
+zero_normal_corners = [tuple(c.vector) for c in mixed_zero_normal.data.corner_normals]
+zero_normal_corners[0] = (0, 0, 0)
+_, zero_normal_tangents = addon.mesh_export_tangents(
+    mixed_zero_normal.data, None, zero_normal_corners, False)
+zero_normal_tangent = Vector(zero_normal_tangents[0][:3])
+assert abs(zero_normal_tangent.length - 1) < 1e-5
+assert all(math.isfinite(value) for value in zero_normal_tangents[0])
 
 # A non-zero imported tangent can still be unusable after a join or a custom
 # normal edit. It must be regenerated against the normal that is serialized.

@@ -40,6 +40,7 @@ def build(output, revision, base_archive=None, name=None):
         if path.name == '__init__.py' or path.name.startswith('eiem_'):
             shutil.copy2(path, package / path.name)
     shutil.copytree(ROOT / 'docs', package / 'docs')
+    shutil.copytree(ROOT / 'physics_presets', package / 'physics_presets', dirs_exist_ok=True)
     for name_ in ('README.md', 'LICENSE', 'THIRD_PARTY_NOTICES'):
         shutil.copy2(ROOT / name_, package / name_)
     protocol = offline._compiler_protocol(package / 'nativepack/eff_resource_pack.exe')

@@ -8,7 +8,10 @@ import shutil
 import subprocess
 import hashlib
 import contextlib
-import struct
+try:
+    from .nativepack.compiled_store import snapshot as compiled_snapshot, STORES as COMPILED_STORES
+except ImportError:
+    from nativepack.compiled_store import snapshot as compiled_snapshot, STORES as COMPILED_STORES
 
 EXPECTED_PROTOCOL = 'EFF_OFFLINE_PACKAGE_PROTOCOL'
 EXPECTED_COMPILER = 'EFF_NATIVE_PACK_V35_1'
@@ -29,6 +32,7 @@ LEGACY_ARGUMENTS = [*COMPILER_ARGUMENTS, 'assembly']
 STATIC_SOURCE_INPUTS = 'mod-static-catalog/selected-sources'
 SOURCE_PREPARATION = 'in-process/index-vfs+author-declarations'
 EXPORT_CARRYOVER = 'validated-source-selection+published-discoveries'
+COMPILED_STORE = 'EFF_MOD_BLOCKS/2'
 
 
 @contextlib.contextmanager
@@ -70,34 +74,11 @@ def published_revision(destination):
     path = Path(destination).resolve() / 'compiled.bin'
     if not path.is_file():
         return None
+    committed = compiled_snapshot(destination)
+    if committed is not None:
+        return committed['revision']
     with path.open('rb') as stream:
         status = os.fstat(stream.fileno())
-        header = stream.read(192)
-        if header[:16] == b'EFF_MOD_BLOCKS/1':
-            valid = []
-            for number in range(2):
-                slot = header[16 + number * 88:16 + (number + 1) * 88]
-                if len(slot) != 88 or hashlib.sha256(slot[:56]).digest() != slot[56:]:
-                    continue
-                generation, offset, size = struct.unpack_from('<QQQ', slot)
-                if not generation or offset < 192 or offset > status.st_size or size > status.st_size - offset:
-                    continue
-                stream.seek(offset)
-                digest = hashlib.sha256()
-                remaining = size
-                while remaining:
-                    data = stream.read(min(1024 * 1024, remaining))
-                    if not data:
-                        raise ValueError('Mod 提交索引被截断，保留上一发布')
-                    digest.update(data)
-                    remaining -= len(data)
-                if digest.digest() == slot[24:56]:
-                    valid.append((generation, digest.hexdigest()))
-            if not valid:
-                raise ValueError('Mod 没有可读的已提交代际，不能丢弃新增命中')
-            generation, digest = max(valid)
-            return (status.st_dev, status.st_ino, 'blocks', generation, digest)
-        stream.seek(0)
         digest = hashlib.sha256()
         for data in iter(lambda: stream.read(1024 * 1024), b''):
             digest.update(data)
@@ -158,6 +139,14 @@ def _require_manifest_reader(produced, consumer):
         raise ValueError('DLL 无法读取编译器输出的运行索引布局，请同步部署 DLL：' + str(runtime))
 
 
+def _require_compiled_store_reader(produced, consumer):
+    store = produced.get('compiledModStore')
+    if store is not None and store not in COMPILED_STORES:
+        raise ValueError('插件不支持编译器输出的 compiled.bin 容器：' + str(store))
+    if store is not None and consumer is not None and consumer.get('compiledModStore') != store:
+        raise ValueError('当前 DLL 不支持编译器输出的分块 Mod，请先部署配套 DLL；上一 Mod 保留')
+
+
 def _compiler_protocol(path, expected=None):
     """Read the compiler's declared byte structures before author export."""
     path = Path(path)
@@ -184,6 +173,7 @@ def _compiler_protocol(path, expected=None):
                 if 'modSet' in required and declared.get('modSet') != required['modSet']:
                     raise ValueError('资源编译器不支持 DLL 的完整作者集合结构')
                 _require_manifest_reader(declared, required)
+            _require_compiled_store_reader(value, expected)
             value['structures'] = declared
             return value
         raise ValueError('资源编译器没有返回完整的 EFF 协议声明：' + str(path))
@@ -330,6 +320,7 @@ def reload_context(destination, game_directory='', effect_update=False):
         raise ValueError('当前 DLL 不支持独立 Mod 编译结构，请安装配套 DLL')
     candidates = [Path(__file__).parent / 'nativepack/eff_resource_pack.exe']
     compiler, declaration = _select_compiler(candidates, protocol)
+    _require_compiled_store_reader(declaration, protocol)
     if effect_update and declaration.get('effectAuthorUpdate')!='effects-only/validated-character-inputs/1':
         raise ValueError('配套资源编译器不支持向角色包追加特效，请更新完整 Blender 插件')
     if declaration.get('compiledMod') != COMPILED_MOD:
@@ -448,7 +439,8 @@ def compile_reload(destination, context=None, previous=None, source_index=None):
     if revision is not None:
         if protocol.get('compiledExportCarryover') != EXPORT_CARRYOVER:
             raise ValueError('编译器不支持继承已提交的 PFB 命中，不能覆盖旧 Mod；请更新 Blender 配套编译器')
-        if revision[2] == 'blocks' and consumer is not None and consumer.get('compiledModStore') != 'EFF_MOD_BLOCKS/1':
+        prior_store = compiled_snapshot(previous)['store'] if revision[2] == 'blocks' else None
+        if prior_store is not None and consumer is not None and consumer.get('compiledModStore') not in (COMPILED_STORE, prior_store):
             raise ValueError('当前 DLL 不支持该 Mod 的来源块存储，保留上一发布；需要配套 reader 迁移')
         command.extend(['--previous-mod', str(Path(previous).resolve())])
     result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace',
@@ -469,7 +461,16 @@ def compile_reload(destination, context=None, previous=None, source_index=None):
     artifact = destination / 'compiled.bin'
     if not artifact.is_file():
         raise ValueError('资源编译没有生成完整的 compiled.bin')
-    digest = hashlib.sha256(artifact.read_bytes()).hexdigest().upper()
+    artifact_revision = published_revision(destination)
+    committed = compiled_snapshot(destination, validate_files=True)
+    declared_store = protocol.get('compiledModStore')
+    if declared_store is not None and (committed is None or committed['store'] != declared_store):
+        raise ValueError('编译器未生成声明的分块 compiled.bin；上一 Mod 保留')
+    if artifact_revision[2] == 'blocks':
+        if declared_store is None:
+            raise ValueError('编译器输出了未声明的分块 compiled.bin；上一 Mod 保留')
+        _require_compiled_store_reader(protocol, consumer)
+    digest = artifact_revision[-1].upper()
     costs = {}
     for row in result.stdout.splitlines():
         fields = row.split()
