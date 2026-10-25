@@ -2,7 +2,7 @@
 
 EFF Blender 用于把 AnimeStudio 导出的资源制作成游戏 Mod。你可以在 Blender 中编辑网格、材质、贴图、款式切换、形态键和粒子特效，然后导出可放入 EFF `plugin/mods` 的 Mod 文件夹。
 
-本次发布 **v0.49.0**，配套 [EFF v1.10.0](https://github.com/ssice-a/EFF/releases/tag/v1.10.0) 与 [AnimeStudio v1.8.1](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.8.1)。Windows x64 插件包含原生导出核心、统一资源编译器、索引刷新工具及 Pillow；已在 Blender 5.0.1 / Python 3.11 验证。当前包支持 Windows x64 / Blender 5.0，内置依赖使用 Python 3.11 ABI；不同 Python ABI 需要另行构建依赖。
+本次发布 **v0.49.0**，配套 [EFF v1.10.1](https://github.com/ssice-a/EFF/releases/tag/v1.10.1) 与 [AnimeStudio v1.8.1](https://github.com/ssice-a/AnimeStudio/releases/tag/v1.8.1)。Windows x64 插件包含原生导出核心、统一资源编译器、索引刷新工具及 Pillow；已在 Blender 5.0.1 / Python 3.11 验证。当前包支持 Windows x64 / Blender 5.0，内置依赖使用 Python 3.11 ABI；不同 Python ABI 需要另行构建依赖。
 
 带截图的[简易 Mod 制作教程](https://github.com/ssice-a/EFF/blob/main/Mod%20Tutorial.md)包含安装、解包、材质编辑和所选网格导出步骤；也提供[英文版](https://github.com/ssice-a/EFF/blob/main/Mod%20Tutorial_EN.md)。
 
