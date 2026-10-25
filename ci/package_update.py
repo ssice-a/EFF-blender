@@ -29,6 +29,14 @@ def build(output, revision, base_archive=None, name=None):
     if archive.stat().st_size != base['bytes'] or updates.digest(archive) != base['sha256']:
         raise ValueError('Pinned native base digest differs')
     package = updates.extract_package(archive, output / 'package')
+    compiled_store_candidates = (
+        ROOT.parent / 'nativepack' / 'compiled_store.py',
+        ROOT / 'framework' / 'tools' / 'nativepack' / 'compiled_store.py',
+    )
+    compiled_store = next((path for path in compiled_store_candidates if path.is_file()), None)
+    if compiled_store is None:
+        raise FileNotFoundError('Missing paired nativepack/compiled_store.py source')
+    shutil.copy2(compiled_store, package / 'nativepack' / 'compiled_store.py')
     # Delete only old packaged top-level Python and docs in this new staging
     # directory. The current author's installed add-on is never a build input.
     for path in package.glob('*.py'):
