@@ -17,10 +17,15 @@ EXPECTED_PROTOCOL = 'EFF_OFFLINE_PACKAGE_PROTOCOL'
 EXPECTED_COMPILER = 'EFF_NATIVE_PACK_V35_1'
 COMPILERS = {35: EXPECTED_COMPILER, 36: 'EFF_NATIVE_PACK_V36_ASSEMBLY_1'}
 STRUCTURES = dict(
+    manifest='author-graph+inputs+roots+closure+parts+materials+key-label/le64/sha256',
+    author='mod-ini/parts+replace+resources+controls+key-label',
+    resource='block-directory/le64/sha256/type-tree',
+    current='key+manifest-sha256/tsv',
+    runtimeRules='author-references+prefab-renderer-rules+source-ranges+key-label/le64/sha256')
+LEGACY_STRUCTURES = dict(
     manifest='author-graph+inputs+roots+closure+parts+materials/le64/sha256',
     author='mod-ini/parts+replace+resources+controls',
-    resource='block-directory/le64/sha256/type-tree',
-    current='key+manifest-sha256/tsv')
+    runtimeRules='author-references+prefab-renderer-rules+source-ranges/le64/sha256')
 MOD_SET_STRUCTURE = 'authors+shared-inputs/transaction'
 COMPILED_MOD = 'native-view-index+assembly-dictionary+verified-source-stamps+per-input-proofs/le64/sha256'
 MANIFEST_ENCODING = 'self-described-roots/le64'
@@ -109,6 +114,7 @@ def _structures(value):
         if value.get('compiler') not in COMPILERS.values():
             raise ValueError('旧资源编译器没有可识别的数据结构声明')
         declared = dict(STRUCTURES)
+        declared.update(LEGACY_STRUCTURES)
         declared['manifestEncoding'] = LEGACY_ENCODINGS[value['compiler']]
         declared['manifestInputs'] = [declared['manifestEncoding']]
         if 'modSetVersion' in value:

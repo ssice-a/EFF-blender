@@ -13,7 +13,6 @@ from pathlib import Path
 
 import bpy
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
-from bpy_extras.io_utils import ImportHelper
 from mathutils import Matrix, Quaternion, Vector
 
 if __package__:
@@ -1960,13 +1959,15 @@ class EFF_OT_native_curve_key(bpy.types.Operator):
             return {"CANCELLED"}
 
 
-def import_source(filename, rig=None):
+def import_source(filename, rig=None, payload=None):
     source.require(bpy.context.mode == "OBJECT", "请回到物体模式后导入")
     filename = Path(filename).resolve()
-    payload = source.read(filename) if filename.suffix == ".physics" else source.read_evidence(filename)
-    source.validate(payload, filename.suffix == ".physics")
+    is_package = filename.suffix.lower() == ".physics"
+    if payload is None:
+        payload = source.read(filename) if is_package else source.read_evidence(filename)
+    source.validate(payload, is_package)
     skeleton = source_skeleton(payload)
-    if filename.suffix == ".physics":
+    if is_package:
         skeleton = API["read_skeleton"](API["safe_path"](filename.parent, payload["skeleton"]))
         expected = {t["bone"] for t in source.required_transforms(payload)}
         source.require(expected <= {n[0] for n in skeleton["nodes"]}, "Physics 的 Skeleton 依赖缺少源节点")
@@ -1984,7 +1985,7 @@ def import_source(filename, rig=None):
         else:
             extended_bones = extend_rig(payload, rig)
         validate_rig(payload, rig)
-        if existing_rig and filename.suffix == ".physics":
+        if existing_rig and is_package:
             source.require(AUTHOR.skeleton_equal(API["skeleton_author_nodes"](rig), skeleton), "当前 Rig 与 Physics 骨架依赖不一致")
         lookup = rig_paths(rig)
         text = bpy.data.texts.new("EFF Physics Source " + payload["id"])
@@ -2044,6 +2045,63 @@ def import_source(filename, rig=None):
         raise
 
 
+def _source_prefab(payload):
+    return str(payload.get("source", {}).get("prefab", "")).replace("\\", "/").casefold()
+
+
+def find_import_source(directory, rig=None):
+    candidates = source.find_import_sources(directory)
+    source.require(bool(candidates), "所选解包目录及其子目录中没有 components.json 或 .physics")
+    package = str(rig.get("eiem_author_package", "")).strip() if rig else ""
+    package_stem = Path(package).name.casefold()
+    if package_stem.endswith(".eff"):
+        package_stem = package_stem[:-4]
+    loaded, failures = [], []
+    for filename in candidates:
+        try:
+            is_package = filename.suffix.casefold() == ".physics"
+            payload = (source.read(filename) if is_package
+                       else source.read_evidence(filename))
+            source.validate(payload, is_package)
+            loaded.append((filename, payload))
+        except Exception as error:
+            failures.append((filename, str(error)))
+    source.require(bool(loaded), "找到物理候选文件，但都无法读取：" +
+                   ("；".join("%s：%s" % (path.name, error) for path, error in failures[:3]) or "无有效候选"))
+
+    if package_stem:
+        exact = [(path, payload) for path, payload in loaded
+                 if Path(_source_prefab(payload)).stem.casefold() == package_stem]
+        if exact:
+            raw = [item for item in exact if item[0].name.casefold() == "components.json"]
+            matches = raw or exact
+            source.require(len(matches) == 1,
+                           "当前 Rig 的物理源文件不唯一，请选择更具体的解包目录：" +
+                           "、".join(str(path) for path, _ in matches[:5]))
+            return matches[0]
+
+        path_matches = [(path, payload) for path, payload in loaded
+                        if package_stem in str(path).casefold()]
+        if path_matches:
+            raw = [item for item in path_matches if item[0].name.casefold() == "components.json"]
+            matches = raw or path_matches
+            source.require(len(matches) == 1,
+                           "当前 Rig 的物理源文件不唯一，请选择更具体的解包目录：" +
+                           "、".join(str(path) for path, _ in matches[:5]))
+            return matches[0]
+
+    if len(loaded) == 1:
+        return loaded[0]
+    source.require(False, "找到多个物理文件，但无法按当前 Rig 唯一匹配；请将目录选到 Wulfa 的 .eff 包：" +
+                   "、".join(str(path) for path, _ in loaded[:5]))
+
+
+def _rig_physics_directory(rig):
+    package = str(rig.get("eiem_author_package", "")).strip() if rig else ""
+    path = Path(package).expanduser() if package else None
+    return path if path and path.is_dir() else None
+
+
 def export_source(filename, objects):
     objects = list(objects)
     source.require(bool(objects) and all(is_native(o) for o in objects), "请选择源物理组或碰撞体")
@@ -2093,16 +2151,45 @@ def export_source(filename, objects):
             "colliders": sum(c["type"] != "BeyondBoneCloth" for c in value["components"]), "skeletons": 1}
 
 
-class EFF_OT_native_import(ImportHelper, bpy.types.Operator):
+class EFF_OT_native_import(bpy.types.Operator):
     bl_idname = "eiem.import_native_physics"
     bl_label = "导入源物理"
     bl_options = {"REGISTER", "UNDO"}
-    filter_glob: StringProperty(default="components.json;*.physics", options={"HIDDEN"})
+    directory: StringProperty(name="解包资源目录", subtype="DIR_PATH", options={"HIDDEN"})
+    filter_folder: BoolProperty(default=True, options={"HIDDEN"})
+
+    def _import(self, context):
+        rig = AUTHOR.rig_of(context.object)
+        source.require(rig is not None, "请先选择要挂载物理的角色 Rig")
+        root = self.directory or str(_rig_physics_directory(rig) or "")
+        source.require(bool(root), "当前 Rig 没有解包资源路径，请选择角色 .eff 解包目录")
+        filename, payload = find_import_source(root, rig)
+        _, objects = import_source(filename, rig, payload)
+        return len(objects), filename
+
+    def invoke(self, context, event):
+        rig = AUTHOR.rig_of(context.object)
+        default = _rig_physics_directory(rig)
+        if default:
+            self.directory = str(default) + ("\\" if "\\" in str(default) else "/")
+            try:
+                count, filename = self._import(context)
+                self.report({"INFO"}, "已从 %s 导入 %d 个源物理组件" % (filename.parent, count))
+                return {"FINISHED"}
+            except Exception as error:
+                if not source.find_import_sources(default):
+                    self.report({"INFO"}, "Rig 资源包内未找到物理源文件，请选择解包目录")
+                else:
+                    self.report({"ERROR"}, str(error))
+                    return {"CANCELLED"}
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
     def execute(self, context):
         try:
-            rig = AUTHOR.rig_of(context.object)
-            _, objects = import_source(self.filepath, rig)
-            self.report({"INFO"}, "已导入 %d 个源物理组件" % len(objects)); return {"FINISHED"}
+            count, filename = self._import(context)
+            self.report({"INFO"}, "已从 %s 导入 %d 个源物理组件" % (filename.parent, count))
+            return {"FINISHED"}
         except Exception as error:
             self.report({"ERROR"}, str(error)); return {"CANCELLED"}
 

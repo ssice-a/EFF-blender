@@ -53,6 +53,7 @@ jobs:
       - name: Assemble complete package with verified existing native tools
         shell: pwsh
         run: |
+          $env:PYTHONPATH = "$pwd/framework/tools"
           python ci/package_update.py --output dist/update --revision '${{ steps.source.outputs.revision }}' --name '${{ steps.source.outputs.archive }}'
           if ($LASTEXITCODE -ne 0) { throw 'Complete package validation failed' }
       - name: Verify pushed source against paired author contracts

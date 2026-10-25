@@ -84,7 +84,8 @@ def native_mesh_fields(modules, source, target, author, snapshot, slot, name, en
 
 def pack_modules():
     local = Path(__file__).parent / 'nativepack'
-    root = local
+    canonical = Path(__file__).resolve().parents[1] / 'nativepack'
+    root = canonical if (canonical / 'author_source.py').is_file() else local
     if not (root/'author_source.py').is_file():
         raise ValueError('缺少 EFF 原生导出模块，请安装完整插件包')
     # Blender loads this file as part of the add-on package, while small
@@ -112,7 +113,7 @@ def pack_modules():
     from importlib import import_module
     modules = {n: import_module(name+'.'+n) for n in
                ('author_source', 'mesh', 'delta_apply', 'type_tree', 'ini_package', 'ini_reader')}
-    dll = root/'eff_author_core.dll'
+    dll = local/'eff_author_core.dll'
     if not dll.is_file():
         raise ValueError('缺少 eff_author_core.dll，请安装完整插件包')
     return modules, dll
@@ -834,6 +835,32 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
             lod_levels = addon.lod_levels_for_export(objects, all_levels=True)
         if lod_levels:
             plan = addon.expand_lod_plan(plan, lod_levels)
+    material_switch_by_object_slot = {}
+    material_switch_definitions = []
+    if resource_scope == 'ALL':
+        seen_material_switches = set()
+        for family in plan['sources']:
+            if not family:
+                continue
+            canonical = min(family, key=lambda obj: addon.mesh_lod_level(obj))
+            original = addon.mesh_export_template(canonical)
+            claimed_slots = set()
+            for group in original.eiem_material_switches:
+                definition = addon.material_switch_definition(group)
+                if definition['identity'] in seen_material_switches:
+                    raise ValueError('材质切换组 ID 重复，请重新创建该组')
+                if definition['slot'] in claimed_slots:
+                    raise ValueError(original.name + ' 的同一材质槽不能配置多个切换组')
+                seen_material_switches.add(definition['identity'])
+                claimed_slots.add(definition['slot'])
+                definition['variable'] = '$material_' + definition['identity']
+                definition['mesh'] = original
+                material_switch_definitions.append(definition)
+                for view in family:
+                    target_mesh = addon.mesh_export_template(view)
+                    if definition['slot'] >= len(target_mesh.material_slots):
+                        raise ValueError(target_mesh.name + ' 缺少材质切换目标槽')
+                    material_switch_by_object_slot[(target_mesh.as_pointer(), definition['slot'])] = definition
     encode = modules['type_tree'].encode
     # Image sections are package-local.  Restrict lookup to the source package
     # being exported so a second imported Mod with the same section/path
@@ -846,6 +873,10 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
         str(slot.material.get('eiem_author_package', '')).replace('\\', '/').casefold()
         for obj in plan['objects'] for slot in addon.mesh_export_template(obj).material_slots
         if slot.material and slot.material.get('eiem_author_package'))
+    source_packages.update(
+        str(material.get('eiem_author_package', '')).replace('\\', '/').casefold()
+        for switch in material_switch_definitions for material in switch['options']
+        if material.get('eiem_author_package'))
     images = {}
     for image in bpy.data.images:
         section = str(image.get('eiem_section', ''))
@@ -859,7 +890,12 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
     for view in objects:
         original = addon.mesh_export_template(view)
         for slot in {polygon.material_index for polygon in original.data.polygons}:
-            if slot < len(original.data.materials) and original.data.materials[slot] is not None:
+            if slot >= len(original.data.materials) or original.data.materials[slot] is None:
+                continue
+            switch = material_switch_by_object_slot.get((original.as_pointer(), slot))
+            if switch:
+                selected_materials.update(addon.material_switch_export_options(switch,include_switches))
+            else:
                 selected_materials.add(original.data.materials[slot])
     material_sections = material_ids(selected_materials)
     parts, materials, textures, rules = [], {}, {}, []
@@ -867,9 +903,13 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
     material_sources = {}
     snapshots, part_cache, snapshot_rigs = {}, {}, {}
     skin_cache = {}
-    switches = [dict(variable=var, key=key, stateCount=len(states),
+    switches = [dict(variable=var, label=group.name, key=key, stateCount=len(states),
                      stateValues=addon.switch_state_values(group), default=default)
                 for group, states, default, key, var in plan['groups']]
+    if include_switches:
+        switches.extend(dict(variable=row['variable'], label=row['label'], key=row['key'],
+                             stateCount=len(row['options']), stateValues=list(range(len(row['options']))),
+                             default=row['default']) for row in material_switch_definitions)
     controls_by_object = {}
     clips_by_object = {}
     if resource_scope in {'ALL', 'MESH'}:
@@ -959,28 +999,43 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                     for slot, author in splits:
                         mat = original.data.materials[slot] if slot < len(original.data.materials) else None
                         if mat is None: raise ValueError(original.name+' 缺少材质槽 '+str(slot))
-                        mid = material_sections[mat.as_pointer()]
-                        if resource_scope == 'ALL' and mid not in materials:
-                            phase = time.perf_counter()
-                            materials[mid] = collect_material(addon, material_source(source, mat, material_sources), mat, images, textures, temporary,
-                                                              encode, mid=mid, texture_cache=texture_cache,
-                                                              existing_package=existing_package)
-                            detail['materialTexture'] += (time.perf_counter()-phase)*1000
+                        switch = material_switch_by_object_slot.get((identity, slot))
+                        variants = (addon.material_switch_export_options(switch,include_switches)
+                                    if switch else [mat])
+                        for variant in variants:
+                            mid = material_sections[variant.as_pointer()]
+                            if resource_scope == 'ALL' and mid not in materials:
+                                phase = time.perf_counter()
+                                materials[mid] = collect_material(
+                                    addon, material_source(source, variant, material_sources), variant,
+                                    images, textures, temporary, encode, mid=mid,
+                                    texture_cache=texture_cache, existing_package=existing_package)
+                                detail['materialTexture'] += (time.perf_counter()-phase)*1000
                         phase = time.perf_counter()
                         fields = native_mesh_fields(modules, source, target, author,
                                                     snapshots[identity], slot, asset, encode)
                         detail['meshEncoding'] += (time.perf_counter()-phase)*1000
                         pid = mesh_part_id(original.name, slot, len(splits))
                         controls = controls_by_object.get(identity, [])
-                        parts.append(dict(partId=pid,object=pid,material=mid,vertices=author['vertex_count'],
-                                          indices=len(author['indices']),bonePaths=author['bone_paths'],
-                                          shapeNames=[c[0] for c in author['blend_channels']],shapeControls=controls,
-                                          shapeOwner=str(original.data.get('eiem_control_id', '')),
-                                          shapeAnimations=clips_by_object.get(identity, []),
-                                          visibilityBindings=plan['bindings'].get(view,[]),
-                                          nativeTypeHash=target['native']['typeHash'],
-                                          fieldData=fields))
-                        cache.append(pid)
+                        common = dict(object=pid,vertices=author['vertex_count'],
+                                      indices=len(author['indices']),bonePaths=author['bone_paths'],
+                                      shapeNames=[c[0] for c in author['blend_channels']],shapeControls=controls,
+                                      shapeOwner=str(original.data.get('eiem_control_id', '')),
+                                      shapeAnimations=clips_by_object.get(identity, []),
+                                      nativeTypeHash=target['native']['typeHash'],fieldData=fields)
+                        bindings = list(plan['bindings'].get(view,[]))
+                        if switch and include_switches:
+                            for option_index, variant in enumerate(variants):
+                                variant_id = pid + '_switch_' + switch['identity'] + '_' + str(option_index)
+                                mid = material_sections[variant.as_pointer()]
+                                parts.append(dict(common,partId=variant_id,material=mid,
+                                    visibilityBindings=bindings+[dict(variable=switch['variable'],visible=[option_index])]))
+                                cache.append(variant_id)
+                        else:
+                            selected_material=variants[0] if switch else mat
+                            parts.append(dict(common,partId=pid,material=material_sections[selected_material.as_pointer()],
+                                              visibilityBindings=bindings))
+                            cache.append(pid)
                     part_cache[identity]=cache
                 members.extend(part_cache[identity])
             key = tuple(members) if members else ('hidden', tuple(addon.mesh_export_template(v).as_pointer() for v in group))
@@ -995,8 +1050,8 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
         if resource_scope in {'ALL','MATERIALS'}:
             material_clips=[];seen_materials=set()
             for view in objects:
-                original=addon.mesh_export_template(view)
-                for mat in original.data.materials:
+                for mat in sorted(selected_materials,
+                                  key=lambda material:material_sections[material.as_pointer()]):
                     if mat and mat.as_pointer() not in seen_materials and mat.as_pointer() in material_sections:
                         seen_materials.add(mat.as_pointer());material_clips.extend(addon.material_animation.export_clips(mat,material_sections[mat.as_pointer()],addon,include_switches))
         phase = time.perf_counter()

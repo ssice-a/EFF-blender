@@ -47,9 +47,9 @@ class MaterialCollection(list):
         return result
 
 
-def addon_function(name, namespace):
+def addon_function(name, namespace, path=ADDON):
     """Execute the real function with tiny Blender-shaped dependencies."""
-    tree = ast.parse(ADDON.read_text('utf-8'))
+    tree = ast.parse(path.read_text('utf-8'))
     function = next(node for node in tree.body
                     if isinstance(node, ast.FunctionDef) and node.name == name)
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(ADDON), 'exec'),
@@ -58,6 +58,27 @@ def addon_function(name, namespace):
 
 
 class NativeExportCoreTests(unittest.TestCase):
+    def test_material_switch_definition_validates_user_selected_materials(self):
+        validate = addon_function('material_switch_definition', {
+            're': __import__('re'), 'validate_switch_key': lambda key: key},
+            Path(__file__).with_name('eiem_blender_controls.py'))
+        first = Material('Body', {'eiem_section': 'MaterialBody'})
+        alternate = Material('BodyAlt', {'eiem_section': 'MaterialBodyAlt'})
+        group = SimpleNamespace(identity='0123456789abcdef', label='裙子材质', key='F7',
+                                 slot_index=1, default_option=1,
+                                 options=[SimpleNamespace(material=first),
+                                          SimpleNamespace(material=alternate)])
+        definition = validate(group)
+        self.assertEqual((definition['slot'], definition['default'], definition['key']), (1, 1, 'F7'))
+        self.assertEqual(definition['options'], [first, alternate])
+        options = addon_function('material_switch_export_options', {},
+                                 Path(__file__).with_name('eiem_blender_controls.py'))
+        self.assertEqual(options(definition, True), [first, alternate])
+        self.assertEqual(options(definition, False), [alternate])
+        group.options[1].material = first
+        with self.assertRaisesRegex(ValueError, '不能重复'):
+            validate(group)
+
     def shape_frame_snapshot(self, metadata, names):
         class Keys(list):
             def get(self, name):
@@ -615,10 +636,10 @@ class NativeExportCoreTests(unittest.TestCase):
             self.assertFalse((mods / '.eff-export-staging').exists())
             self.assertEqual(cache['__frozen_files__'], {})
 
-    def test_export_imports_installed_addon_nativepack(self):
+    def test_source_checkout_imports_canonical_nativepack(self):
         modules, _ = exporter.pack_modules()
         self.assertEqual(Path(modules['author_source'].__file__).resolve().parent,
-                         (ROOT / 'tools/Blender/nativepack').resolve())
+                         (ROOT / 'tools/nativepack').resolve())
 
     def test_parent_export_preserves_nested_mods(self):
         import nativepack.ini_package as writer
@@ -717,7 +738,7 @@ class NativeExportCoreTests(unittest.TestCase):
             group = SimpleNamespace(eiem_physics=SimpleNamespace(rig=rig))
             self.assertEqual(exporter.baseline_for([], '', [group]), package.resolve())
 
-    def test_bundle_includes_hashing_and_accepts_known_layouts(self):
+    def test_bundle_includes_hashing_and_rejects_label_unaware_layouts(self):
         self.assertIn('hashing', bundler.MODULES)
         with tempfile.TemporaryDirectory() as folder:
             compiler = Path(folder) / 'eff_resource_pack.exe'
@@ -725,7 +746,8 @@ class NativeExportCoreTests(unittest.TestCase):
             protocol = dict(format='EFF_OFFLINE_PACKAGE_PROTOCOL', compiler='EFF_NATIVE_PACK_V36_ASSEMBLY_1', abi=36)
             with patch.object(bundler._protocol_module.subprocess,'run',return_value=SimpleNamespace(
                     returncode=0,stdout=json.dumps(protocol),stderr='')):
-                self.assertEqual(bundler._protocol(compiler)['structures']['manifestEncoding'],'legacy-root-addresses/le64')
+                with self.assertRaisesRegex(ValueError,'数据结构不兼容'):
+                    bundler._protocol(compiler)
             with patch.object(bundler._protocol_module.subprocess,'run',return_value=SimpleNamespace(
                     returncode=1,stdout='',stderr='query failed')):
                 with self.assertRaisesRegex(ValueError,'协议查询失败'):

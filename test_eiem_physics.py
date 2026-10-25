@@ -83,7 +83,8 @@ bpy.ops.object.mode_set(mode="EDIT")
 rig.data.edit_bones.remove(rig.data.edit_bones["Follow"])
 rig.data.edit_bones.remove(rig.data.edit_bones["Detached"])
 bpy.ops.object.mode_set(mode="OBJECT")
-collider = physics.create_collider(group, rig.data.bones["Rig"], "CAPSULE", "身体胶囊")
+collider = physics.create_collider(rig, rig.data.bones["Rig"], "CAPSULE", "身体胶囊")
+group.eiem_physics.colliders.add().object = collider
 collider.location = (0.01,0.02,0.03)
 collider.rotation_quaternion = Quaternion(Vector((1,0,0)), 0.3)
 collider.eiem_physics.radius, collider.eiem_physics.span = 0.04, 0.2
@@ -236,6 +237,7 @@ rig.data.bones.active = rig.data.bones["Extra"]
 assert bpy.ops.eiem.physics_edit(action="SPHERE") == {"FINISHED"}
 ui_collider = bpy.context.object
 assert ui_collider.eiem_physics.shape == "SPHERE"
+assert not ui_group.eiem_physics.colliders
 visual_name = ui_collider.eiem_physics.visual.name
 assert bpy.ops.eiem.physics_edit(action="DELETE_COLLIDER") == {"FINISHED"}
 assert bpy.data.objects.get(visual_name) is None and len(ui_group.eiem_physics.colliders) == 0

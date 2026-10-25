@@ -8,6 +8,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import struct
 from pathlib import Path
 
@@ -90,6 +91,22 @@ def read_evidence(filename):
             "backend": "BeyondDynamicBone", "id": identity(source["prefab"] + source["vfsFingerprint"]),
             "skeleton": "", "source": {"prefab": source["prefab"], "fingerprint": source["vfsFingerprint"]},
             "components": records, "transforms": transforms}
+
+
+def find_import_sources(directory):
+    """Find raw game component evidence and native authoring packages below a directory."""
+    root = Path(directory).expanduser().resolve()
+    require(root.is_dir(), "select an extracted resource directory")
+    results = []
+    ignored = {".git", "__pycache__", "compiled.blocks", "blocks", "node_modules"}
+    for current, directories, files in os.walk(str(root)):
+        directories[:] = sorted(name for name in directories if name not in ignored and
+                                not name.startswith("."))
+        for name in files:
+            path = Path(current, name)
+            if name.casefold() == "components.json" or path.suffix.casefold() == ".physics":
+                results.append(path.resolve())
+    return sorted(set(results), key=lambda path: str(path).casefold())
 
 
 def validate(value, skeleton_required=True):

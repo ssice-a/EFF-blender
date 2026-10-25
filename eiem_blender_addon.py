@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 48, 0),
+    "version": (0, 49, 0),
     "blender": (5, 0, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
@@ -299,6 +299,8 @@ validate_switch_key = controls.validate_switch_key
 switch_key_from_event = controls.switch_key_from_event
 classify_switch_key_event = controls.classify_switch_key_event
 set_switch_group_key = controls.set_switch_group_key
+material_switch_definition = controls.material_switch_definition
+material_switch_export_options = controls.material_switch_export_options
 set_shape_control_hotkey = controls.set_shape_control_hotkey
 add_switch_state = controls.add_switch_state
 set_switch_state_order = controls.set_switch_state_order
@@ -3096,6 +3098,19 @@ class EFF_PG_shape_control(bpy.types.PropertyGroup):
         description="形态键实际权重每秒向按键指定的目标变化多少")
 
 
+class EFF_PG_material_switch_option(bpy.types.PropertyGroup):
+    material: PointerProperty(name="材质", type=bpy.types.Material)
+
+
+class EFF_PG_material_switch(bpy.types.PropertyGroup):
+    identity: StringProperty(options={"HIDDEN"})
+    label: StringProperty(name="切换组名")
+    key: StringProperty(name="游戏快捷键", default="F7")
+    slot_index: IntProperty(name="材质槽", default=0, min=0)
+    default_option: IntProperty(name="默认项", default=0, min=0)
+    options: CollectionProperty(type=EFF_PG_material_switch_option)
+
+
 class EFF_OT_shape_control(bpy.types.Operator):
     bl_idname = "eiem.shape_control"
     bl_label = "接管当前形态键"
@@ -3777,6 +3792,151 @@ class EFF_OT_switch_restore(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class EFF_OT_material_switch_group(bpy.types.Operator):
+    bl_idname = "eiem.material_switch_group"
+    bl_label = "新增材质切换组"
+    bl_options = {"REGISTER", "UNDO"}
+    remove_index: IntProperty(default=-1, options={"HIDDEN"})
+
+    @classmethod
+    def poll(cls, context):
+        obj = getattr(context, "object", None)
+        return bool(obj and obj.type == "MESH" and obj.get("eiem_section"))
+
+    def execute(self, context):
+        obj = context.object
+        groups = obj.eiem_material_switches
+        if self.remove_index >= 0:
+            if self.remove_index < len(groups):
+                groups.remove(self.remove_index)
+            return {"FINISHED"}
+        slot_index = int(obj.active_material_index)
+        if not 0 <= slot_index < len(obj.material_slots):
+            self.report({"ERROR"}, "请先为当前 Mesh 分配材质")
+            return {"CANCELLED"}
+        if any(group.slot_index == slot_index for group in groups):
+            self.report({"ERROR"}, "该材质槽已经有切换组")
+            return {"CANCELLED"}
+        material = obj.material_slots[slot_index].material
+        if material is None or not material.get("eiem_section"):
+            self.report({"ERROR"}, "当前材质不是已导入的 EFF 材质")
+            return {"CANCELLED"}
+        group = groups.add()
+        group.identity = uuid.uuid4().hex[:16]
+        group.label = obj.name + " 材质"
+        group.key = "F7"
+        group.slot_index = slot_index
+        group.default_option = 0
+        option = group.options.add()
+        option.material = material
+        return {"FINISHED"}
+
+
+class EFF_OT_material_switch_option(bpy.types.Operator):
+    bl_idname = "eiem.material_switch_option"
+    bl_label = "材质选项"
+    bl_options = {"REGISTER", "UNDO"}
+    group_index: IntProperty(options={"HIDDEN"})
+    option_index: IntProperty(default=-1, options={"HIDDEN"})
+    set_default: BoolProperty(default=False, options={"HIDDEN"})
+
+    @classmethod
+    def poll(cls, context):
+        obj = getattr(context, "object", None)
+        return bool(obj and obj.type == "MESH" and hasattr(obj, "eiem_material_switches"))
+
+    def execute(self, context):
+        groups = context.object.eiem_material_switches
+        if not 0 <= self.group_index < len(groups):
+            return {"CANCELLED"}
+        group = groups[self.group_index]
+        if self.set_default:
+            if 0 <= self.option_index < len(group.options):
+                group.default_option = self.option_index
+        elif self.option_index < 0:
+            group.options.add()
+        elif self.option_index < len(group.options):
+            group.options.remove(self.option_index)
+            group.default_option = max(0, min(group.default_option, len(group.options) - 1))
+        return {"FINISHED"}
+
+
+class EFF_OT_material_switch_key_record(bpy.types.Operator):
+    bl_idname = "eiem.material_switch_key_record"
+    bl_label = "录制材质切换按键"
+    bl_options = {"REGISTER", "UNDO"}
+    group_index: IntProperty(options={"HIDDEN"})
+
+    @classmethod
+    def poll(cls, context):
+        obj = getattr(context, "object", None)
+        return bool(obj and obj.type == "MESH" and hasattr(obj, "eiem_material_switches"))
+
+    def invoke(self, context, event):
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        result, key = classify_switch_key_event(event)
+        if result == "WAIT":
+            return {"RUNNING_MODAL"}
+        if result == "CANCEL":
+            return {"CANCELLED"}
+        if result == "INVALID":
+            self.report({"WARNING"}, "此键不能用于材质切换")
+            return {"RUNNING_MODAL"}
+        groups = context.object.eiem_material_switches
+        if not 0 <= self.group_index < len(groups):
+            self.report({"ERROR"}, "材质切换组已改变")
+            return {"CANCELLED"}
+        groups[self.group_index].key = key
+        return {"FINISHED"}
+
+
+class EFF_PT_material_switches(bpy.types.Panel):
+    bl_label = "EFF 材质切换"
+    bl_idname = "OBJECT_PT_eiem_material_switches"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "object"
+
+    @classmethod
+    def poll(cls, context):
+        obj = getattr(context, "object", None)
+        return bool(obj and obj.type == "MESH" and obj.get("eiem_section"))
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.object
+        layout.operator("eiem.material_switch_group", icon="ADD")
+        for index, group in enumerate(obj.eiem_material_switches):
+            box = layout.box()
+            row = box.row(align=True)
+            row.prop(group, "label", text="组名")
+            remove = row.operator("eiem.material_switch_group", text="", icon="TRASH")
+            remove.remove_index = index
+            box.prop(group, "key", text="快捷键")
+            key = box.operator("eiem.material_switch_key_record", text="录制快捷键", icon="REC")
+            key.group_index = index
+            slot_name = (obj.material_slots[group.slot_index].name
+                         if group.slot_index < len(obj.material_slots) else "缺失材质槽")
+            box.label(text="目标槽：%s" % slot_name, icon="MATERIAL")
+            for option_index, option in enumerate(group.options):
+                row = box.row(align=True)
+                default = row.operator("eiem.material_switch_option", text="", icon=(
+                    "RADIOBUT_ON" if option_index == group.default_option else "RADIOBUT_OFF"),
+                    emboss=False)
+                default.group_index = index
+                default.option_index = option_index
+                default.set_default = True
+                row.prop(option, "material", text="默认" if option_index == group.default_option else "材质")
+                remove_option = row.operator("eiem.material_switch_option", text="", icon="X")
+                remove_option.group_index = index
+                remove_option.option_index = option_index
+            add = box.operator("eiem.material_switch_option", text="添加材质", icon="ADD")
+            add.group_index = index
+
+
 class EFF_PT_switches(bpy.types.Panel):
     bl_label = '网格切换'
     bl_idname = "VIEW3D_PT_eiem_switches"
@@ -4437,6 +4597,8 @@ classes = (
     EFF_OT_ignore_update_release,
     EFF_OT_import_material,
     EFF_PG_shape_control,
+    EFF_PG_material_switch_option,
+    EFF_PG_material_switch,
     EFF_OT_shape_control,
     EFF_OT_shape_key_record,
     EFF_PT_shape_controls,
@@ -4450,6 +4612,10 @@ classes = (
     EFF_OT_switch_member_remove_selected,
     EFF_OT_switch_state,
     EFF_OT_switch_restore,
+    EFF_OT_material_switch_group,
+    EFF_OT_material_switch_option,
+    EFF_OT_material_switch_key_record,
+    EFF_PT_material_switches,
     EFF_PT_switches,
     EFF_PT_updates,
     EFF_OT_import,
@@ -4478,6 +4644,7 @@ def register():
     physics_authoring.register(globals())
     effect_editor.register()
     bpy.types.Mesh.eiem_shape_controls = CollectionProperty(type=EFF_PG_shape_control)
+    bpy.types.Object.eiem_material_switches = CollectionProperty(type=EFF_PG_material_switch)
     bpy.types.Collection.eiem_switch_state_index = IntProperty(
         name='当前款式', default=0, min=0)
     bpy.types.Scene.eiem_switch_active = PointerProperty(
@@ -4510,6 +4677,7 @@ def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_export)
     del bpy.types.Scene.eiem_switch_active
+    del bpy.types.Object.eiem_material_switches
     del bpy.types.Scene.eiem_export_mod_name
     del bpy.types.Scene.eiem_export_last_directory
     del bpy.types.Scene.eiem_source_baseline

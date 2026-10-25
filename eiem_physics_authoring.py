@@ -1170,15 +1170,20 @@ def rebuild_collider(self, context):
         ("球体" if self.shape == "SPHERE" else "胶囊"))
 
 
-def create_collider(group, bone, shape="CAPSULE", name="碰撞体"):
-    rig = group.eiem_physics.rig
-    document.require(shape in document.SHAPES and bone.id_data == rig.data, "碰撞体骨骼必须属于当前物理组的 Rig")
+def create_collider(rig, bone, shape="CAPSULE", name="碰撞体"):
+    """Create a standalone collider owned by a Rig.
+
+    Group membership is an explicit reference operation and is deliberately
+    kept out of collider creation. Imported author packages attach references
+    after all independent collider objects have been created.
+    """
+    document.require(rig and rig.type == "ARMATURE", "碰撞体必须属于一个 Rig")
+    document.require(shape in document.SHAPES and bone.id_data == rig.data, "碰撞体骨骼必须属于当前 Rig")
     obj = new_helper(name, rig, "COLLIDER")
     obj.rotation_mode = "QUATERNION"
     obj.eiem_physics.shape = shape
     bind_collider(obj, bone)
     rebuild_collider(obj.eiem_physics, bpy.context)
-    group.eiem_physics.colliders.add().object = obj
     return obj
 
 
@@ -1371,7 +1376,7 @@ def import_physics(filename, rig=None):
             made_groups.append(obj)
         by_id = {}
         for c in payload["colliders"]:
-            obj = create_collider(made_groups[0], by_path[c["bone"]], c["shape"], c["name"])
+            obj = create_collider(rig, by_path[c["bone"]], c["shape"], c["name"])
             p = obj.eiem_physics
             p.identity, p.radius, p.end_radius, p.span = (
                 c["id"], c["radius"], c.get("endRadius", c["radius"]), c["span"])
@@ -1554,15 +1559,18 @@ class EFF_OT_physics_edit(bpy.types.Operator):
                 document.require(group is not None, "请选择物理组")
                 created = duplicate_group(group)
             elif self.action in document.SHAPES:
-                document.require(group is not None, "请选择当前物理组")
-                rig = group.eiem_physics.rig
+                rig = (group.eiem_physics.rig if group else None) or rig_of(obj)
+                if rig is None:
+                    item = getattr(context.scene, "eiem_physics_editor_item", None)
+                    rig = rig_of(item)
+                document.require(rig is not None, "请先选择要创建碰撞体的 Rig")
                 bone = rig.data.bones.active
                 document.require(bone is not None, "请先在 Rig 上选中碰撞体绑定骨骼")
                 name = bone.name
                 if context.mode != "OBJECT":
                     bpy.ops.object.mode_set(mode="OBJECT")
                 bone = rig.data.bones[name]
-                created = create_collider(group, bone, self.action)
+                created = create_collider(rig, bone, self.action)
             elif self.action == "LINK":
                 document.require(group and group.eiem_physics.kind == "GROUP" and obj and
                                  obj.eiem_physics.kind in ("COLLIDER", "NATIVE_COLLIDER") and
@@ -1719,11 +1727,6 @@ class EFF_MT_physics_create(bpy.types.Menu):
         layout = self.layout
         layout.operator("eiem.physics_edit", text="从所选骨骼新建物理链", icon="BONE_DATA").action = "CREATE"
         layout.operator("eiem.physics_edit", text="复制所选骨骼并新建物理链", icon="DUPLICATE").action = "CLONE_CHAIN"
-        group = group_of(context)
-        if group and group.eiem_physics.kind == "GROUP":
-            layout.separator()
-            layout.operator("eiem.physics_edit", text="在活动骨骼添加球体", icon="MESH_UVSPHERE").action = "SPHERE"
-            layout.operator("eiem.physics_edit", text="在活动骨骼添加胶囊", icon="MESH_CAPSULE").action = "CAPSULE"
         layout.separator()
         layout.operator("eiem.import_native_physics", text="导入游戏源物理", icon="IMPORT")
         layout.operator("eiem.import_physics", text="导入 Physics 作者包", icon="IMPORT")

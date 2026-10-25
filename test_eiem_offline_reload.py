@@ -523,7 +523,7 @@ class OfflineExportTests(unittest.TestCase):
                     self.assertEqual(run.call_args.args[0],[str(compiler),'--protocol'])
                 self.assertEqual((cache/'current.tsv').read_bytes(),before)
 
-    def test_compatibility_uses_structures_and_ignores_release_labels(self):
+    def test_compatibility_requires_matching_structures(self):
         with tempfile.TemporaryDirectory() as folder:
             game = Path(folder)
             declaration = game / 'plugin/package-protocol.json'
@@ -532,11 +532,15 @@ class OfflineExportTests(unittest.TestCase):
             protocol = dict(format=module.EXPECTED_PROTOCOL, version=1, abi=36,
                             compiler=module.COMPILERS[36], authorFormat=2, resourceVersion=2)
             declaration.write_text(json.dumps(protocol))
-            self.assertEqual(module._game_protocol(game)['abi'], 36)
+            with self.assertRaisesRegex(ValueError, '结构'):
+                module._game_protocol(game)
             compiler = game / 'eff_resource_pack.exe'
             with patch.object(module.subprocess, 'run', return_value=SimpleNamespace(
                     returncode=0, stdout=json.dumps(protocol), stderr='')):
-                self.assertEqual(module._compiler_protocol(compiler)['abi'], 36)
+                with self.assertRaisesRegex(ValueError, '结构'):
+                    module._compiler_protocol(compiler)
+            protocol['structures'] = dict(module.STRUCTURES)
+            declaration.write_text(json.dumps(protocol))
             protocol.update(version=999, abi=999, compiler='future-build', authorFormat=999,
                             resourceVersion=999, structures=dict(module.STRUCTURES))
             declaration.write_text(json.dumps(protocol))

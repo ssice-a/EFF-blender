@@ -173,7 +173,8 @@ assert physics_skeleton==render_skeleton and physics_skeleton.is_file()
 
 # Authoring colliders are emitted into the combined package. The runtime uses
 # one component per author collider and shares that component across group refs.
-collider=physics.create_collider(group,rig.data.bones['Rig'],'CAPSULE','测试碰撞体')
+collider=physics.create_collider(rig,rig.data.bones['Rig'],'CAPSULE','测试碰撞体')
+group.eiem_physics.colliders.add().object = collider
 with_collider=output/'with-collider'
 stats=addon.export_package(with_collider,[first],[rig],[group])
 assert stats['physics']==1,stats

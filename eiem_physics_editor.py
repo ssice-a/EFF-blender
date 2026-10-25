@@ -1023,13 +1023,21 @@ class EFF_PT_physics_editor(bpy.types.Panel):
     def draw(self, context):
         layout, scene = self.layout, context.scene
         rig = rig_of_context(context)
-        layout.prop(scene, "eiem_physics_group", text="当前组")
+        if scene.eiem_physics_editor_category != "COLLIDERS":
+            layout.prop(scene, "eiem_physics_group", text="当前组")
         layout.menu("EFF_MT_physics_create", text="创建 / 导入", icon="ADD")
         if not rig:
             layout.label(text="选择 EFF 骨架或物理条目")
             return
         layout.label(text="骨架：" + rig.name)
         layout.prop(scene, "eiem_physics_editor_category", expand=True)
+        if scene.eiem_physics_editor_category == "COLLIDERS":
+            create = layout.box()
+            create.label(text="创建独立碰撞体", icon="ADD")
+            create.label(text="先在 Rig 上选择目标骨骼；碰撞体创建后不会自动加入任何物理组")
+            row = create.row(align=True)
+            row.operator("eiem.physics_edit", text="添加球体", icon="MESH_UVSPHERE").action = "SPHERE"
+            row.operator("eiem.physics_edit", text="添加胶囊", icon="MESH_CAPSULE").action = "CAPSULE"
         collection = role_collection(rig, scene.eiem_physics_editor_category)
         if collection:
             layout.template_list("EFF_UL_physics_items", "", collection, "objects", scene,

@@ -264,6 +264,31 @@ def set_switch_group_key(group, key, scene=None):
     return key
 
 
+def material_switch_definition(group):
+    identity = str(group.identity).lower()
+    if not re.fullmatch(r"[0-9a-f]{16}", identity):
+        raise ValueError("材质切换组缺少稳定 ID")
+    label = str(group.label).strip()
+    if not label or any(char in label for char in "\r\n"):
+        raise ValueError("材质切换组名称不能为空或包含换行")
+    options = [option.material for option in group.options]
+    if len(options) < 2 or any(material is None or not material.get("eiem_section")
+                               for material in options):
+        raise ValueError("材质切换至少需要两个已导入的 EFF 材质")
+    if len({int(material.as_pointer()) for material in options}) != len(options):
+        raise ValueError("材质切换选项不能重复")
+    default = int(group.default_option)
+    if not 0 <= default < len(options):
+        raise ValueError("材质切换默认项超出选项范围")
+    return dict(identity=identity, label=label, key=validate_switch_key(group.key),
+                slot=int(group.slot_index), options=options, default=default)
+
+
+def material_switch_export_options(definition, include_switches=True):
+    options = definition['options']
+    return options if include_switches else [options[definition['default']]]
+
+
 def shape_controls_in_scene(scene=None):
     """Yield each shared Mesh control once, together with one scene object."""
     scene = scene or bpy.context.scene
