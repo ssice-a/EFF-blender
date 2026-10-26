@@ -1,12 +1,10 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing version tag to build and release
+        description: Existing version tag to release after its paired EFF native base is published
         required: true
         type: string
 
