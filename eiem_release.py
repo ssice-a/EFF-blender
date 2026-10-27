@@ -126,12 +126,13 @@ def verify_package(directory, revision=None):
             or revision is not None and build['revision'] != revision):
         raise ValueError('更新包构建身份不匹配')
     for name in ('__init__.py', 'eiem_blender_addon.py', 'eiem_release.py', 'eiem_update_worker.py',
-                 'nativepack/eff_author_core.dll', 'nativepack/eff_resource_pack.exe',
-                 'nativepack/eff_source_index.exe', 'nativepack/package-protocol.json',
-                 'nativepack/compiled_store.py', 'vendor/PIL/__init__.py',
+                 'eiem_shared_resources.py', 'nativepack/author_source.py',
+                 'nativepack/compiled_store.py', 'nativepack/mesh.py',
                  'physics_presets/chen_soft_ribbon.json'):
         if name not in build['files']:
             raise ValueError('更新包缺少配套文件：' + name)
+    if any(name.endswith(('.exe', '.dll', '.pyd')) for name in build['files']):
+        raise ValueError('Blender 更新包不能重复分发 EFF 共享原生工具')
     for name, expected in build['files'].items():
         relative = PurePosixPath(name)
         if relative.is_absolute() or '..' in relative.parts or ':' in name or '\\' in name:

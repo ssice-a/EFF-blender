@@ -1,5 +1,9 @@
 """Compile one staged Mod with this add-on's own author tools."""
 from pathlib import Path
+try:
+    from . import eiem_shared_resources as shared_resources
+except ImportError:
+    import eiem_shared_resources as shared_resources
 import json
 import math
 import os
@@ -21,7 +25,8 @@ STRUCTURES = dict(
     author='mod-ini/parts+replace+resources+controls+key-label',
     resource='block-directory/le64/sha256/type-tree',
     current='key+manifest-sha256/tsv',
-    runtimeRules='author-references+prefab-renderer-rules+source-ranges+key-label/le64/sha256')
+    runtimeRules='author-references+prefab-renderer-rules+source-ranges+semantic-deltas+key-label/le64/sha256',
+    semanticRendererReplay='logical-mesh+field-path-overlay/current-typetree/1')
 LEGACY_STRUCTURES = dict(
     manifest='author-graph+inputs+roots+closure+parts+materials/le64/sha256',
     author='mod-ini/parts+replace+resources+controls',
@@ -328,7 +333,7 @@ def reload_context(destination, game_directory='', effect_update=False):
     protocol = _game_protocol(game)
     if protocol is not None and protocol.get('compiledMod') != COMPILED_MOD:
         raise ValueError('当前 DLL 不支持独立 Mod 编译结构，请安装配套 DLL')
-    candidates = [Path(__file__).parent / 'nativepack/eff_resource_pack.exe']
+    candidates = [shared_resources.native_tool_file('eff_resource_pack.exe')]
     compiler, declaration = _select_compiler(candidates, protocol)
     _require_compiled_store_reader(declaration, protocol)
     if effect_update and declaration.get('effectAuthorUpdate')!='effects-only/validated-character-inputs/1':
@@ -340,34 +345,7 @@ def reload_context(destination, game_directory='', effect_update=False):
 
 def shared_source_indexes(game):
     """Discover only indexes registered for this installation; never scan disks."""
-    configured = os.environ.get('EFF_RESOURCE_ROOT')
-    local = os.environ.get('LOCALAPPDATA')
-    try:
-        root = Path(configured) if configured else (Path(local) if local else Path.home() / 'AppData/Local') / 'EFF/Resources'
-        registry = json.loads((root / 'registry.json').read_text('utf-8-sig'))
-        if not isinstance(registry, dict) or registry.get('format') != 'EFF_SHARED_INDEXES/1':
-            return []
-        entries = registry.get('entries')
-        if not isinstance(entries, list):
-            return []
-        def identity(path):
-            return os.path.abspath(path).replace('\\', '/').rstrip('/').lower()
-        selected = identity(game)
-        indexes = []
-        for entry in entries:
-            if not isinstance(entry, dict) or not isinstance(entry.get('game'), str) or not isinstance(entry.get('workspace'), str):
-                continue
-            try:
-                if not entry['game'] or not entry['workspace'] or identity(entry['game']) != selected:
-                    continue
-                candidate = Path(entry['workspace']).resolve() / 'index/endfield_assets.eidx'
-                if candidate.is_file() and candidate not in indexes:
-                    indexes.append(candidate)
-            except (OSError, ValueError, RuntimeError):
-                continue
-        return indexes
-    except (OSError, ValueError, TypeError, RuntimeError):
-        return []
+    return shared_resources.shared_source_indexes(game)
 
 
 def prepare_static_sources(destination, source_package, context, previous=None):
@@ -409,7 +387,7 @@ def prepare_static_sources(destination, source_package, context, previous=None):
     # index header before reusing a descriptor; a full index read is needed
     # only when declarations or the installed resource catalog have changed.
     if index is None:
-        raise ValueError('未找到资源索引。请在 AnimeStudio 选择本次游戏，打开已有工作区，或下载／导入／构建索引后重试；不需要重新解包已有角色')
+        raise ValueError('未找到 AnimeStudio 索引。请在 EFF 面板选择 AnimeStudio 工作区（含 index/endfield_assets.eidx），或在 AnimeStudio 准备索引后重试；不需要重新解包已有角色')
     return index
 
 

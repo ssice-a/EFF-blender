@@ -17,9 +17,8 @@ REVISION = 'a' * 40
 
 def package(root):
     files = ('__init__.py', 'eiem_blender_addon.py', 'eiem_release.py', 'eiem_update_worker.py',
-             'nativepack/eff_author_core.dll', 'nativepack/eff_resource_pack.exe',
-             'nativepack/eff_source_index.exe', 'nativepack/package-protocol.json',
-             'nativepack/compiled_store.py', 'vendor/PIL/__init__.py')
+             'eiem_shared_resources.py', 'nativepack/author_source.py',
+             'nativepack/compiled_store.py', 'nativepack/mesh.py')
     files += ('physics_presets/chen_soft_ribbon.json',)
     for name in files:
         path = root / name

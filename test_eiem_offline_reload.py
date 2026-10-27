@@ -89,7 +89,7 @@ class OfflineExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder,patch.dict(os.environ,{},clear=True):
             root=Path(folder);game=self.make_game(root/'game');destination=root/'release/MyMod'
             compiler=root/'compiler.exe'
-            with patch.object(module,'_select_compiler',return_value=(compiler,self.protocol())):
+            with patch.object(module.shared_resources,'native_tool_file',return_value=compiler),patch.object(module,'_select_compiler',return_value=(compiler,self.protocol())):
                 self.assertEqual(module.reload_context(destination,game_directory=str(game)),
                                  (compiler,destination.resolve()/'compiled.bin',destination.resolve(),game))
             self.assertFalse(destination.exists())
@@ -122,7 +122,7 @@ class OfflineExportTests(unittest.TestCase):
                 self.assertEqual(module.shared_source_indexes(other),[wrong_index.resolve()])
                 self.assertEqual(manifest.read_text(),original)
                 registry.write_text('{broken')
-                with self.assertRaisesRegex(ValueError,'未找到资源索引'):
+                with self.assertRaisesRegex(ValueError,'AnimeStudio'):
                     module.prepare_static_sources(root/'stage',source,(None,None,None,game))
 
     def test_explicit_index_configuration_is_respected_and_does_not_silently_fall_back(self):
@@ -161,6 +161,15 @@ class OfflineExportTests(unittest.TestCase):
                     else:
                         with self.assertRaisesRegex(ValueError,'共享形态频道'):module.compile_reload(stage,(root/'compiler',None,None,root))
                         self.assertFalse((stage/'compiled.bin').exists())
+
+    def test_user_selected_animestudio_workspace_is_shared_with_the_addon(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ,{},clear=True):
+            root=Path(folder);workspace=root/'animestudio-workspace';index=workspace/'index/endfield_assets.eidx'
+            index.parent.mkdir(parents=True);index.touch()
+            with patch.dict(os.environ,{'LOCALAPPDATA':str(root/'local')}):
+                module.shared_resources.set_index_workspace(workspace)
+                self.assertEqual(module.shared_resources.index_workspace(),workspace.resolve())
+                self.assertEqual(module.shared_source_indexes(root/'selected-game'),[index.resolve()])
     def protocol(self):
         return dict(format=module.EXPECTED_PROTOCOL, compiledMod=module.COMPILED_MOD,
                     staticSourceInputs=module.STATIC_SOURCE_INPUTS,
@@ -493,13 +502,13 @@ class OfflineExportTests(unittest.TestCase):
                 self.assertIn(b'AUTHOR-READER-RETURNED',output)
                 self.assertEqual(module.published_revision(root),before)
 
-    def test_game_and_workspace_exports_use_addon_compiler_only(self):
+    def test_game_and_workspace_exports_use_shared_tools_compiler_only(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder);addon=root/'addon';tool=addon/'nativepack/eff_resource_pack.exe';tool.parent.mkdir(parents=True);tool.touch()
             game=self.make_game(root/'game');author=game/'plugin/mods/A';author.mkdir(parents=True)
             foreign=game/'plugin/tools/eff_resource_pack.exe';foreign.parent.mkdir();foreign.touch()
             reply=SimpleNamespace(returncode=0,stdout=json.dumps(self.protocol()),stderr='')
-            with patch.object(module,'__file__',str(addon/'eiem_offline_reload.py')),patch.object(module.subprocess,'run',return_value=reply) as run,patch.dict(module.os.environ,{},clear=True):
+            with patch.object(module,'__file__',str(addon/'eiem_offline_reload.py')),patch.object(module.subprocess,'run',return_value=reply) as run,patch.dict(module.os.environ,{'EFF_NATIVE_TOOLS_DIR':str(addon)},clear=True):
                 context=module.reload_context(author);self.assertEqual(context[0],tool);self.assertEqual(context[2],author.resolve())
                 with patch.dict(module.os.environ,{'EFF_RELOAD_GAME':str(game)}):self.assertEqual(module.reload_context(root/'export')[0],tool)
                 tool.unlink()
@@ -608,6 +617,22 @@ class OfflineExportTests(unittest.TestCase):
             declaration.write_text(json.dumps(protocol))
             with self.assertRaisesRegex(ValueError, '结构'):
                 module._game_protocol(game)
+
+    def test_semantic_replay_requires_exporter_and_runtime_contract(self):
+        current = self.protocol()
+        self.assertEqual(current['structures']['runtimeRules'],
+                         'author-references+prefab-renderer-rules+source-ranges+semantic-deltas+key-label/le64/sha256')
+        self.assertEqual(current['structures']['semanticRendererReplay'],
+                         'logical-mesh+field-path-overlay/current-typetree/1')
+        old = json.loads(json.dumps(current))
+        old['structures']['runtimeRules'] = 'author-references+prefab-renderer-rules+source-ranges+key-label/le64/sha256'
+        old['structures'].pop('semanticRendererReplay')
+        with self.assertRaises(ValueError):
+            module._structures(old)
+        incompatible = json.loads(json.dumps(current))
+        incompatible['structures']['semanticRendererReplay'] = 'pathid+whole-object-copy/1'
+        with self.assertRaises(ValueError):
+            module._structures(incompatible)
 
     def test_rule_encoding_requires_a_matching_reader(self):
         rules = 'compressed-rules/xpress-huffman/le64'

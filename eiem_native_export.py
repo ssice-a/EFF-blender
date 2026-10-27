@@ -18,6 +18,10 @@ import tempfile
 import time
 import types
 import contextlib
+try:
+    from . import eiem_shared_resources as shared_resources
+except ImportError:
+    import eiem_shared_resources as shared_resources
 
 
 # Native partial exports used to rebuild the Blender snapshot on every click,
@@ -113,9 +117,7 @@ def pack_modules():
     from importlib import import_module
     modules = {n: import_module(name+'.'+n) for n in
                ('author_source', 'mesh', 'delta_apply', 'type_tree', 'ini_package', 'ini_reader')}
-    dll = local/'eff_author_core.dll'
-    if not dll.is_file():
-        raise ValueError('缺少 eff_author_core.dll，请安装完整插件包')
+    dll = shared_resources.native_tool_file('eff_author_core.dll')
     return modules, dll
 
 def token(value):
@@ -976,11 +978,8 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
             if resource_scope in ('MATERIALS', 'TEXTURES'):
                 break
             obj = group[0]
-            path = str(obj.data.get('eiem_target_path', '') or obj.data.get('eiem_source', ''))
-            asset = str(obj.data.get('eiem_target_asset', '') or obj.data.get('eiem_asset', ''))
+            path, asset, level = addon.lod.mesh_export_target(obj)
             target = source.resolve('Mesh', path, asset)
-            level_match = re.search(r'_lod(\d+)$', asset)
-            level = int(level_match.group(1)) if level_match else 0
             members = []
             for view in group:
                 if view in plan['hidden']: continue

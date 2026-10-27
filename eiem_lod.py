@@ -99,29 +99,67 @@ class _MeshExportVariant:
         return getattr(self._source, name)
 
 
-def _lod_values(obj):
-    values = [
-        obj.get("eiem_render_asset", ""),
-        obj.data.get("eiem_target_asset", ""),
-        obj.data.get("eiem_target_path", ""),
-        obj.data.get("eiem_source", ""),
-        obj.data.get("eiem_section", ""),
-        obj.get("eiem_render_section", ""),
-    ]
-    return [str(value).strip() for value in values if str(value).strip()]
+def _lod_levels(value):
+    return {int(match.group(1)) for match in LOD_TOKEN_RE.finditer(str(value or ""))}
 
 
-def mesh_lod_level(obj):
-    """Return the single LOD encoded by imported resource metadata."""
-    levels = {
-        int(match.group(1))
-        for value in _lod_values(obj)
-        for match in LOD_TOKEN_RE.finditer(value)
-    }
+def _single_lod_level(obj, values):
+    levels = set()
+    for value in values:
+        levels.update(_lod_levels(value))
     if len(levels) > 1:
         raise ValueError("Mesh %s has inconsistent LOD metadata: %s" %
                          (obj.name, ", ".join(str(value) for value in sorted(levels))))
     return next(iter(levels), None)
+
+
+def _render_lod_level(obj):
+    # The Render section is the concrete binding on the prefab. Its asset can
+    # point at an independently named Mesh resource whose LOD token differs.
+    for value in (obj.get("eiem_render_section", ""),
+                  obj.get("eiem_render_asset", "")):
+        level = _single_lod_level(obj, (value,))
+        if level is not None:
+            return level
+    return None
+
+
+def _mesh_resource_lod_level(obj):
+    for value in (
+            obj.data.get("eiem_target_asset", ""),
+            obj.data.get("eiem_target_path", ""),
+            obj.data.get("eiem_asset", ""),
+            obj.data.get("eiem_source", ""),
+            obj.data.get("eiem_section", "")):
+        level = _single_lod_level(obj, (value,))
+        if level is not None:
+            return level
+    return None
+
+
+def _mesh_lod_is_independent_of_render(obj):
+    render_level = _render_lod_level(obj)
+    resource_level = _mesh_resource_lod_level(obj)
+    return (render_level is not None and resource_level is not None
+            and render_level != resource_level)
+
+
+def mesh_lod_level(obj):
+    """Return the target Render LOD, falling back to the Mesh resource LOD."""
+    render_level = _render_lod_level(obj)
+    return render_level if render_level is not None else _mesh_resource_lod_level(obj)
+
+
+def mesh_export_target(obj):
+    """Return (source Mesh path, source Mesh asset, bound Render LOD)."""
+    path = str(obj.data.get("eiem_target_path", "") or
+               obj.data.get("eiem_source", ""))
+    asset = str(obj.data.get("eiem_target_asset", "") or
+                obj.data.get("eiem_asset", ""))
+    level = mesh_lod_level(obj)
+    if level is None:
+        level = 0
+    return path, asset, level
 
 
 def _replace_lod(value, target_level):
@@ -141,19 +179,32 @@ def mesh_lod_family(obj):
     have no asset identity.
     """
     package = str(obj.get("eiem_author_package", "")).replace("\\", "/").lower()
-    asset = str(obj.get("eiem_render_asset", "") or
-                obj.data.get("eiem_target_asset", obj.data.get("eiem_asset", "")))
-    source = str(obj.data.get("eiem_target_path", "") or
-                 obj.data.get("eiem_source", ""))
-    if asset.strip() and LOD_TOKEN_RE.search(asset):
-        return (package, "asset", LOD_TOKEN_RE.sub("{lod}", asset.lower()))
-    if source.strip():
-        return (package, "source", LOD_TOKEN_RE.sub("{lod}", source.replace("\\", "/").lower()))
+    assets = (obj.get("eiem_render_asset", ""),
+              obj.data.get("eiem_target_asset", ""),
+              obj.data.get("eiem_asset", ""))
+    for asset in assets:
+        asset = str(asset or "")
+        if asset.strip() and LOD_TOKEN_RE.search(asset):
+            return (package, "asset", LOD_TOKEN_RE.sub("{lod}", asset.lower()))
+    sources = (obj.data.get("eiem_target_path", ""), obj.data.get("eiem_source", ""))
+    for source in sources:
+        source = str(source or "")
+        if source.strip() and LOD_TOKEN_RE.search(source):
+            return (package, "source", LOD_TOKEN_RE.sub("{lod}", source.replace("\\", "/").lower()))
+    asset = next((str(value) for value in assets if str(value or "").strip()), "")
     return (package, "asset", asset.lower())
+
+
+def _mesh_source_path(obj):
+    return str(obj.data.get("eiem_target_path", "") or
+               obj.data.get("eiem_source", "")).replace("\\", "/").strip().casefold()
 
 
 def discover_mesh_lods(obj, candidates):
     """Discover LODs actually imported for the same resource family."""
+    if _mesh_lod_is_independent_of_render(obj):
+        level = mesh_lod_level(obj)
+        return {level} if level is not None else set()
     family = mesh_lod_family(obj)
     levels = set()
     for candidate in candidates:
@@ -171,26 +222,33 @@ def _lod_variant(obj, target_level, candidates):
     source_level = mesh_lod_level(obj)
     if source_level is None:
         raise ValueError("Mesh %s has no LOD token to replicate" % obj.name)
-    observed = next((candidate for candidate in candidates
-                     if candidate.type == "MESH"
-                     and candidate.data.get("eiem_section")
-                     and mesh_lod_family(candidate) == mesh_lod_family(obj)
-                     and mesh_lod_level(candidate) == target_level), None)
+    matching = [candidate for candidate in candidates
+                if candidate.type == "MESH"
+                and candidate.data.get("eiem_section")
+                and mesh_lod_family(candidate) == mesh_lod_family(obj)
+                and mesh_lod_level(candidate) == target_level]
+    source_path = _mesh_source_path(obj)
+    observed = next((candidate for candidate in matching
+                     if source_path and _mesh_source_path(candidate) == source_path),
+                    matching[0] if matching else None)
     object_overrides = {}
     data_overrides = {}
     metadata = observed or obj
-    for owner, key in ((object_overrides, "eiem_render_asset"),
-                       (object_overrides, "eiem_render_section"),
-                       (data_overrides, "eiem_section"),
-                       (data_overrides, "eiem_source"),
-                       (data_overrides, "eiem_asset"),
-                       (data_overrides, "eiem_target_path"),
-                       (data_overrides, "eiem_target_asset")):
-        current = (metadata.get(key, "") if owner is object_overrides else
-                   metadata.data.get(key, ""))
+    for key in ("eiem_render_asset", "eiem_render_section"):
+        current = metadata.get(key, "")
         if str(current).strip():
-            owner[key] = (current if observed else
-                          _replace_lod(current, target_level))
+            object_overrides[key] = (current if observed else
+                                     _replace_lod(current, target_level))
+
+    resource_level = _mesh_resource_lod_level(obj)
+    follows_render_lod = (resource_level is None or resource_level == source_level)
+    if follows_render_lod:
+        for key in ("eiem_section", "eiem_source", "eiem_asset",
+                    "eiem_target_path", "eiem_target_asset"):
+            current = metadata.data.get(key, "")
+            if str(current).strip():
+                data_overrides[key] = (current if observed else
+                                       _replace_lod(current, target_level))
     return _MeshExportVariant(obj, target_level, object_overrides, data_overrides)
 
 

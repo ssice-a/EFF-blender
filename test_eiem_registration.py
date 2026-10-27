@@ -52,6 +52,9 @@ for cycle in range(3):
     assert [item.identifier for item in resource_scope.enum_items] == ['ALL', 'MESH', 'MATERIALS', 'TEXTURES', 'PHYSICS']
     assert bpy.ops.eiem.export_mesh_only.get_rna_type() is not None
     assert bpy.ops.eiem.detect_game_directory.get_rna_type() is not None
+    assert bpy.ops.eiem.choose_index_workspace.get_rna_type() is not None
+    assert bpy.ops.eiem.choose_resource_root.get_rna_type() is not None
+    assert bpy.ops.eiem.prepare_shared_tools.get_rna_type() is not None
     assert bpy.ops.eiem.install_update.get_rna_type() is not None
     assert 'update_channel' in module.eiem_blender_addon.EFF_AddonPreferences.bl_rna.properties
     assert 'game_directory' in module.eiem_blender_addon.EFF_AddonPreferences.bl_rna.properties
@@ -72,6 +75,8 @@ for cycle in range(3):
     assert bpy.ops.eiem.shape_key_record.get_rna_type() is not None
     assert hasattr(bpy.types, "EFF_UL_switch_states")
     assert hasattr(bpy.types, "VIEW3D_PT_eiem_updates")
+    assert hasattr(bpy.types, "VIEW3D_PT_eiem_index_workspace")
+    assert hasattr(bpy.types, "VIEW3D_PT_eiem_shared_tools")
     assert hasattr(bpy.types, "EFF_PT_physics_editor")
     assert hasattr(bpy.types, "EFF_PT_effect_object")
     assert hasattr(bpy.types, "MATERIAL_PT_eiem_properties")

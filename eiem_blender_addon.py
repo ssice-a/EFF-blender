@@ -1,8 +1,8 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 49, 1),
-    "blender": (5, 0, 0),
+    "version": (0, 50, 0),
+    "blender": (5, 2, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
 }
@@ -30,6 +30,10 @@ import bmesh
 from bpy.props import StringProperty, BoolProperty, PointerProperty, FloatProperty, IntProperty, CollectionProperty, EnumProperty
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 from mathutils import Matrix, Quaternion, Vector
+try:
+    from . import eiem_shared_resources as shared_resources
+except ImportError:
+    import eiem_shared_resources as shared_resources
 
 
 # Blender does not expose a persistent revision number for every editable
@@ -4066,6 +4070,53 @@ class EFF_PT_updates(bpy.types.Panel):
         draw_update_status(self.layout)
 
 
+class EFF_PT_shared_tools(bpy.types.Panel):
+    bl_label = 'EFF 工具存储'
+    bl_idname = 'VIEW3D_PT_eiem_shared_tools'
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'EFF'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        root = shared_resources.resource_root()
+        installed = shared_resources.find_native_tools()
+        layout.label(text='三端共用的编译器与资源工具')
+        layout.label(text=str(root) if root else '尚未选择存储目录', icon='FILE_FOLDER')
+        row = layout.row(align=True)
+        row.operator(EFF_OT_choose_resource_root.bl_idname, icon='FILEBROWSER')
+        busy = bool(_shared_tools_worker and _shared_tools_worker.is_alive())
+        prepare = row.operator(EFF_OT_prepare_shared_tools.bl_idname,
+                               text='准备工具', icon='IMPORT')
+        row.enabled = not busy
+        if installed:
+            layout.label(text='工具已就绪：' + str(installed), icon='CHECKMARK')
+        elif _shared_tools_state['status'] == 'downloading':
+            layout.label(text='正在下载并校验共享工具…', icon='TIME')
+        elif _shared_tools_state['status'] == 'error':
+            layout.label(text=_shared_tools_state['message'], icon='ERROR')
+        elif root:
+            layout.label(text='此目录尚无可用工具，点击“准备工具”下载。')
+
+
+class EFF_PT_index_workspace(bpy.types.Panel):
+    bl_label = 'AnimeStudio 解包索引'
+    bl_idname = 'VIEW3D_PT_eiem_index_workspace'
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'EFF'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        workspace = shared_resources.index_workspace()
+        layout.label(text='选择 AnimeStudio 解包索引的位置')
+        layout.label(text=str(workspace) if workspace else '尚未选择', icon='FILE_FOLDER')
+        layout.operator(EFF_OT_choose_index_workspace.bl_idname, icon='FILEBROWSER')
+        layout.label(text='选择工作区或其中的 index 文件夹')
+
+
 def operator_lod_levels(operator, meshes):
     selected = [index for index, enabled in enumerate((
         operator.lod0, operator.lod1, operator.lod2,
@@ -4364,6 +4415,8 @@ class EFF_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
 
 _update_state = {"status": "idle", "tag": "", "url": "", "message": ""}
 _update_worker = None
+_shared_tools_state = {'status': 'idle', 'message': ''}
+_shared_tools_worker = None
 
 
 def _addon_preferences(context):
@@ -4454,6 +4507,100 @@ class EFF_OT_detect_game_directory(bpy.types.Operator):
         except (OSError, ValueError, IndexError) as error:
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
+
+
+class EFF_OT_choose_index_workspace(bpy.types.Operator):
+    bl_idname = 'eiem.choose_index_workspace'
+    bl_label = '选择 AnimeStudio 索引位置'
+    bl_description = '选择 AnimeStudio 工作区或其中的 index 文件夹'
+
+    directory: StringProperty(name='AnimeStudio 索引位置', subtype='DIR_PATH')
+
+    def invoke(self, context, _event):
+        current = shared_resources.index_workspace()
+        self.directory = str(current) if current else ''
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, _context):
+        try:
+            shared_resources.set_index_workspace(self.directory)
+            self.report({'INFO'}, 'AnimeStudio 索引位置已保存')
+            return {'FINISHED'}
+        except (OSError, ValueError) as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+
+
+class EFF_OT_choose_resource_root(bpy.types.Operator):
+    bl_idname = 'eiem.choose_resource_root'
+    bl_label = '选择工具存储目录'
+    bl_description = '三端共用的工具将保存在此目录下的 tools 文件夹'
+
+    directory: StringProperty(name='工具存储目录', subtype='DIR_PATH')
+
+    def invoke(self, context, _event):
+        current = shared_resources.resource_root()
+        self.directory = str(current) if current else ''
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, _context):
+        try:
+            shared_resources.set_resource_root(self.directory)
+            self.report({'INFO'}, '三端共享工具目录已保存')
+            return {'FINISHED'}
+        except (OSError, ValueError) as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+
+
+class EFF_OT_prepare_shared_tools(bpy.types.Operator):
+    bl_idname = 'eiem.prepare_shared_tools'
+    bl_label = '准备 EFF 共享工具'
+    bl_description = '检查并下载工具到共享设置中的存储目录；下载在后台运行'
+
+    _timer = None
+
+    def execute(self, context):
+        global _shared_tools_worker
+        if _shared_tools_worker and _shared_tools_worker.is_alive():
+            return {'CANCELLED'}
+        if shared_resources.resource_root() is None:
+            self.report({'ERROR'}, '请先选择工具存储目录')
+            return {'CANCELLED'}
+
+        _shared_tools_state.update(status='downloading', message='')
+
+        def work():
+            try:
+                path = shared_resources.ensure_native_tools()
+                _shared_tools_state.update(status='ready', message=str(path))
+            except Exception as error:
+                _shared_tools_state.update(status='error', message=str(error)[:180])
+
+        _shared_tools_worker = threading.Thread(
+            target=work, name='EFF shared tools download', daemon=True)
+        _shared_tools_worker.start()
+        self._timer = context.window_manager.event_timer_add(
+            0.25, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+        for area in context.screen.areas:
+            area.tag_redraw()
+        if _shared_tools_worker and _shared_tools_worker.is_alive():
+            return {'RUNNING_MODAL'}
+        context.window_manager.event_timer_remove(self._timer)
+        self._timer = None
+        if _shared_tools_state['status'] == 'ready':
+            self.report({'INFO'}, 'EFF 共享工具已就绪：' + _shared_tools_state['message'])
+            return {'FINISHED'}
+        self.report({'ERROR'}, _shared_tools_state['message'] or 'EFF 共享工具准备失败')
+        return {'CANCELLED'}
 
 
 class EFF_AddonPreferences(bpy.types.AddonPreferences):
@@ -4594,6 +4741,9 @@ def menu_export(self, context):
 
 classes = (
     EFF_AddonPreferences,
+    EFF_OT_choose_resource_root,
+    EFF_OT_prepare_shared_tools,
+    EFF_OT_choose_index_workspace,
     EFF_OT_detect_game_directory,
     EFF_OT_check_update,
     EFF_OT_install_update,
@@ -4622,6 +4772,8 @@ classes = (
     EFF_PT_material_switches,
     EFF_PT_switches,
     EFF_PT_updates,
+    EFF_PT_shared_tools,
+    EFF_PT_index_workspace,
     EFF_OT_import,
     EFF_OT_import_animation,
     EFF_OT_export,

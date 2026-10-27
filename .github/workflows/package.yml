@@ -26,7 +26,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Read exact source and pinned native framework
+      - name: Read exact source and latest shared-tools framework
         id: source
         shell: pwsh
         env:
@@ -34,8 +34,22 @@ jobs:
         run: |
           $revision = git rev-parse HEAD
           "revision=$revision" >> $env:GITHUB_OUTPUT
-          $framework = (Get-Content native-base.json -Raw | ConvertFrom-Json).framework
+          $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/ssice-a/EFF/releases/latest' -Headers @{ 'User-Agent' = 'EFF-Blender-Build' }
+          $manifests = @($release.assets | Where-Object { $_.name -eq 'eff-native-tools.json' })
+          if ($manifests.Count -ne 1) { throw 'Latest published EFF release must contain one eff-native-tools.json' }
+          $tools = Invoke-RestMethod -Uri $manifests[0].browser_download_url -Headers @{ 'User-Agent' = 'EFF-Blender-Build' }
+          if ($tools.format -ne 'EFF_SHARED_NATIVE_TOOLS/1' -or $tools.framework -ne $release.tag_name -or $tools.bytes -le 0 -or $tools.sha256 -notmatch '^[0-9a-fA-F]{64}$') {
+            throw 'Latest EFF shared-tools receipt is invalid or does not match its release'
+          }
+          $toolsUri = [Uri]$tools.url
+          if ($toolsUri.Scheme -ne 'https' -or $toolsUri.Host -ne 'github.com' -or $toolsUri.AbsolutePath -notmatch ('^/ssice-a/EFF/releases/download/' + [regex]::Escape($release.tag_name) + '/EFF_Shared_Native_Tools_' + [regex]::Escape($release.tag_name) + '\.zip$')) {
+            throw 'Latest EFF shared-tools URL is not an immutable asset for its release'
+          }
+          $framework = $tools.framework
           "framework=$framework" >> $env:GITHUB_OUTPUT
+          "tools_url=$($tools.url)" >> $env:GITHUB_OUTPUT
+          "tools_bytes=$($tools.bytes)" >> $env:GITHUB_OUTPUT
+          "tools_sha256=$($tools.sha256)" >> $env:GITHUB_OUTPUT
           $archive = if ($env:REQUESTED_TAG) { "EFF_Blender_$env:REQUESTED_TAG.zip" } else { "EFF_Blender_main-$revision.zip" }
           "archive=$archive" >> $env:GITHUB_OUTPUT
           python -c "import ast,os; d=ast.parse(open('__init__.py',encoding='utf-8').read()); info=next(ast.literal_eval(n.value) for n in d.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='bl_info' for t in n.targets)); expected='v'+'.'.join(map(str,info['version'])); assert not os.environ['REQUESTED_TAG'] or os.environ['REQUESTED_TAG']==expected, (os.environ['REQUESTED_TAG'],expected)"
@@ -45,12 +59,26 @@ jobs:
           repository: ssice-a/EFF
           ref: ${{ steps.source.outputs.framework }}
           path: framework
+      - name: Download verified shared tools for contract tests
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'eff-shared-tools.zip'
+          Invoke-WebRequest -Uri '${{ steps.source.outputs.tools_url }}' -OutFile $archive
+          $actual = Get-FileHash $archive -Algorithm SHA256
+          if ((Get-Item $archive).Length -ne [long]'${{ steps.source.outputs.tools_bytes }}' -or $actual.Hash -ine '${{ steps.source.outputs.tools_sha256 }}') {
+            throw 'Latest EFF shared-tools archive failed size or SHA256 validation'
+          }
+          $destination = Join-Path $env:RUNNER_TEMP 'eff-shared-tools'
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $nativeRoot = Join-Path $destination 'EFF_Native_Tools'
+          if (-not (Test-Path (Join-Path $nativeRoot 'nativepack/eff_author_core.dll'))) { throw 'Shared author core is missing' }
+          "EFF_NATIVE_TOOLS_DIR=$nativeRoot" >> $env:GITHUB_ENV
       - name: Install test dependencies
         shell: pwsh
         run: |
           python -m pip install --only-binary=:all: numpy Pillow==12.3.0
           if ($LASTEXITCODE -ne 0) { throw 'Test dependencies failed' }
-      - name: Assemble complete package with verified existing native tools
+      - name: Assemble Python package with pinned EFF nativepack sources
         shell: pwsh
         run: |
           $env:PYTHONPATH = "$pwd/framework/tools"

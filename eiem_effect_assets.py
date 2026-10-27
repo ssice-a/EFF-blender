@@ -314,6 +314,11 @@ class NativeAssets:
 
 def texture_tree(native, image, settings):
     import sys
+    try:
+        from . import eiem_shared_resources as shared_resources
+    except ImportError:
+        import eiem_shared_resources as shared_resources
+    shared_resources.add_vendor_path()
     vendor=Path(__file__).parent/'vendor'
     if vendor.is_dir() and str(vendor) not in sys.path:sys.path.insert(0,str(vendor))
     from PIL import Image
