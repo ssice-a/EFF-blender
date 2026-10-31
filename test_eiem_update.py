@@ -19,7 +19,7 @@ def package(root):
     files = ('__init__.py', 'eiem_blender_addon.py', 'eiem_release.py', 'eiem_update_worker.py',
              'eiem_shared_resources.py', 'nativepack/author_source.py',
              'nativepack/author_format3.py',
-             'nativepack/compiled_store.py', 'nativepack/mesh.py',
+             'nativepack/effect_native.py', 'nativepack/mesh.py',
              'eiem_texture_compression.py')
     files += ('physics_presets/chen_soft_ribbon.json',)
     for name in files:
