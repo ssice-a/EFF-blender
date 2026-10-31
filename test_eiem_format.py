@@ -46,7 +46,7 @@ class FormatTests(unittest.TestCase):
 
         metadata = b"".join((
             string("EFF_AUTHOR_RESOURCE_METADATA/3"), struct.pack("<Q", 1),
-            string("PartBody"), string("native/meshes/PartBody.effres"),
+            string("PartBody"), string("meshes/PartBody.effres"),
             string("assets/body.mesh"), string("Body"), string("A" * 64),
             string("MaterialBody"), struct.pack("<QQQQQ", 3, 3, 0, 0, 0),
             struct.pack("<Q", 0), struct.pack("<Q", 0),
@@ -77,7 +77,7 @@ class FormatTests(unittest.TestCase):
 
         metadata = b"".join((
             string("EFF_AUTHOR_MATERIAL_EDITS/1"),
-            string("MaterialBody"), string("native/materials/MaterialBody.effres"),
+            string("MaterialBody"), string("materials/MaterialBody.effres"),
             string("assets/base/body.mat"), string("Body"),
             struct.pack("<Q", len(author)),
             string(hashlib.sha256(author).hexdigest().upper()),
@@ -89,7 +89,7 @@ class FormatTests(unittest.TestCase):
             path = Path(folder) / "material.effres"
             path.write_bytes(header + metadata + payload)
             result = eiem_format.read_format3_material_resource(
-                path, "MaterialBody", "native/materials/MaterialBody.effres")
+                path, "MaterialBody", "materials/MaterialBody.effres")
             self.assertEqual(result["float._Gloss"], ".4")
             self.assertEqual(result["source"], "assets/base/body.mat")
             damaged = bytearray(path.read_bytes())
@@ -118,10 +118,10 @@ class FormatTests(unittest.TestCase):
             raw = value.encode("utf-8")
             return struct.pack("<Q", len(raw)) + raw
 
-        relative = "native/physics/ResourcePhysicsA.effres"
+        relative = "physics/ResourcePhysicsA.effres"
         metadata = b"".join((
             string("EFF_AUTHOR_RESOURCE_METADATA/3"), struct.pack("<Q", 4),
-            string("ResourcePhysicsA"), string(relative),
+            string("ResourcePhysicsA"), string("native/physics/ResourcePhysicsA.effres"),
             string(hashlib.sha256(native).hexdigest().upper()),
             struct.pack("<QQQ", 5, len(native), 1),
             string("assets/character/body.mesh"), string("Body"),
@@ -136,6 +136,7 @@ class FormatTests(unittest.TestCase):
             result = eiem_format.read_format3_physics_resource(path, "ResourcePhysicsA", relative)
             self.assertEqual(result["document"], document)
             self.assertEqual(result["skeleton"], skeleton)
+            self.assertEqual(result["file"], relative)
             damaged = bytearray(path.read_bytes())
             damaged[-1] ^= 1
             path.write_bytes(damaged)
@@ -163,7 +164,8 @@ class FormatTests(unittest.TestCase):
                 sidecar, source, workspace, attachment)
             author = sidecar.read_bytes()
             resource_id = "ResourceEffectAuthorA"
-            relative = "native/effect-author/a.effres"
+            relative = "effects/author/a.effres"
+            metadata_file = "native/effect-author/a.effres"
 
             def string(value):
                 raw = value.encode("utf-8")
@@ -171,7 +173,7 @@ class FormatTests(unittest.TestCase):
 
             metadata = b"".join((
                 string("EFF_AUTHOR_RESOURCE_METADATA/3"), struct.pack("<Q", 7),
-                string(resource_id), string(relative), struct.pack("<Q", len(author)),
+                string(resource_id), string(metadata_file), struct.pack("<Q", len(author)),
                 string(hashlib.sha256(author).hexdigest().upper()),
             ))
             header = struct.pack("<16sIIQQ32s", b"EFF_AUTHOR_FILE3", 3, 7,
@@ -180,6 +182,7 @@ class FormatTests(unittest.TestCase):
             resource.write_bytes(header + metadata + author)
             result = eiem_format.read_format3_effect_author_resource(resource, resource_id, relative)
             self.assertEqual(result["attachment"], attachment)
+            self.assertEqual(result["file"], relative)
             self.assertEqual(result["workspace"]["format"], "EFF_EFFECT_WORKSPACE")
             restored, restored_attachment, source_path = eiem_format.materialize_format3_effect_author_resource(
                 resource, resource_id, relative, root / "cache")

@@ -749,7 +749,7 @@ def export_attachments(meshes,parts,addon,effect_roots=()):
 def effect_codec():
     from . import eiem_native_export
     modules,_=eiem_native_export.pack_modules()
-    return __import__(modules['ini_package'].__package__+'.runtime_controls',fromlist=['publish_effect_mod'])
+    return modules['effect_native']
 
 def effect_cache():
     return bpy.utils.user_resource('DATAFILES',path='eiem/effect-builds',create=True)
@@ -768,20 +768,14 @@ def ensure_built(root):
 
 class ExportBatch:
     """One selection, one destination, one publication for all effect roots."""
-    def __init__(self,roots,destination,game_directory=''):
+    def __init__(self,roots,destination):
         self.roots=export_roots(roots);self.destination=Path(destination).resolve()
-        self.game_directory=game_directory
         self.requests=[];self.index=0;self.current=None;self.stats=None;self.owns_build=False
         self.started=time.perf_counter()
         self.costs=dict(author=0.,compile=0.,publish=0.);self.compile_started=0.
         document.require(self.roots,'请选择 EFF 网格或特效根 / 发射器')
         document.require(not _BUILD_RUNNING,'已有特效正在构建')
-        from . import eiem_offline_reload
-        game=next((p.parent for p in self.destination.parents if p.name.lower()=='plugin' and (p/'mods') in self.destination.parents),None)
-        if game:
-            protocol=eiem_offline_reload._game_protocol(game)
-            expected={'standaloneEffect':'mod-ini/type=effect/independent-resource-graph/1','effectTarget':'source-prefab+renderer+mesh+bone-palette/strings/1'}
-            document.require(protocol and all(protocol.get('structures',{}).get(k)==v for k,v in expected.items()),'当前游戏 DLL 未声明独立特效和来源挂载支持，请安装配套 eff.dll 和 package-protocol.json')
+        raise ValueError('独立特效写回尚未接入 Format 3；请使用完整 Format 3 导出。')
         for root in self.roots:
             attachment(root)
             edit=synchronize(root);store(root,edit)
@@ -816,7 +810,7 @@ class ExportBatch:
         self.costs['author']+=(time.perf_counter()-phase)*1000
         from . import eiem_effect_export
         phase=time.perf_counter()
-        character_update=eiem_effect_export.publish(self.destination,rows,self.game_directory)
+        character_update=eiem_effect_export.publish(self.destination,rows)
         self.costs['publish']=(time.perf_counter()-phase)*1000
         elapsed=time.perf_counter()-self.started
         for root,request in zip(self.roots,self.requests):

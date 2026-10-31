@@ -22,24 +22,13 @@ destinations = []
 dialogs = []
 
 
-class BuildProbe:
-    """Record the destination at the real publishing boundary."""
-    def __init__(self, roots, destination):
-        destinations.append(Path(destination).resolve())
-        self.stats = dict(meshes=0, materials=0, textures=0, effects=1, exportSeconds=0)
-
-    def run(self):
-        return self.stats
-
-    def poll(self):
-        return True
-
-    def close(self):
-        pass
-
-
 real_execute = addon.EFF_OT_export.execute
 invoke_in_background = False
+
+
+def record_export(destination, **_kwargs):
+    destinations.append(Path(destination).resolve())
+    return dict(meshes=0, materials=0, textures=0, effects=1, exportSeconds=0)
 
 
 def accept_dialog(operator, context, event):
@@ -57,14 +46,12 @@ def dispatch(operator, context):
     return real_execute(operator, context)
 
 
-original = (addon.selected_export_resources, addon.effect_editor.ExportBatch,
-            addon.ExportHelper.invoke, addon.prefill_export_game_directory)
+original = (addon.selected_export_resources, addon.ExportHelper.invoke, addon.export_package)
 try:
-    addon.selected_export_resources = lambda context=None: ([], [], [object()])
-    addon.effect_editor.ExportBatch = BuildProbe
+    addon.selected_export_resources = lambda context=None: ([], [], [object()], [])
     addon.ExportHelper.invoke = accept_dialog
+    addon.export_package = record_export
     addon.EFF_OT_export.execute = dispatch
-    addon.prefill_export_game_directory = lambda *args: None
     internal = output / 'previous-quick-update'
     visible = output / 'chosen-parent'
     bpy.context.scene.eiem_export_mod_name = 'petals'
@@ -98,8 +85,7 @@ try:
     (output / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     print('PASS EXPORT DESTINATION ' + json.dumps(report), flush=True)
 finally:
-    (addon.selected_export_resources, addon.effect_editor.ExportBatch,
-     addon.ExportHelper.invoke, addon.prefill_export_game_directory) = original
+    (addon.selected_export_resources, addon.ExportHelper.invoke, addon.export_package) = original
     addon.EFF_OT_export.execute = real_execute
     package.unregister()
 if not bpy.app.background:

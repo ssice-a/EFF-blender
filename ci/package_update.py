@@ -24,11 +24,14 @@ def build(output, revision, name=None, framework_root=None):
     package.mkdir(parents=True)
     framework = Path(framework_root).resolve() if framework_root else ROOT / 'framework'
     nativepack = framework / 'tools' / 'nativepack'
-    if not (nativepack / 'compiled_store.py').is_file():
+    if not (nativepack / 'author_format3.py').is_file() or not (nativepack / 'effect_native.py').is_file():
         raise FileNotFoundError('Missing pinned EFF nativepack Python sources')
     shutil.copytree(nativepack, package / 'nativepack',
                     ignore=shutil.ignore_patterns('__pycache__', '*.pyc', 'test_*.py', '*_experiment.py',
-                                                  'verify_*.py', '*.dll', '*.exe', '*.pyd'))
+                                                  'verify_*.py', '*.dll', '*.exe', '*.pyd',
+                                                  'compiled_store.py', 'ini_package.py', 'ini_reader.py',
+                                                  'payload.py', 'resource_file.py', 'runtime_controls.py',
+                                                  'shape_animation.py', 'texture_fields.py'))
     for path in ROOT.glob('*.py'):
         if path.name == '__init__.py' or path.name.startswith('eiem_'):
             shutil.copy2(path, package / path.name)

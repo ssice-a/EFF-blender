@@ -14,11 +14,10 @@ import zipfile
 
 
 SETTINGS_FORMAT = 'EFF_SHARED_RESOURCES/1'
-INDEX_FORMAT = 'EFF_SHARED_INDEXES/1'
-TOOLS_FORMAT = 'EFF_SHARED_NATIVE_TOOLS/1'
+TOOLS_FORMAT = 'EFF_SHARED_NATIVE_TOOLS/2'
 TOOLS_API = 'https://api.github.com/repos/ssice-a/EFF/releases/latest'
 TOOLS_ASSET = 'eff-native-tools.json'
-TOOLS_INSTALL_FORMAT = 'EFF_SHARED_NATIVE_TOOLS_INSTALL/1'
+TOOLS_INSTALL_FORMAT = 'EFF_SHARED_NATIVE_TOOLS_INSTALL/2'
 MAX_TOOLS_BYTES = 512 * 1024 * 1024
 PIL_REQUIRED_FILES = (
     'PIL/__init__.py',
@@ -69,20 +68,6 @@ def resource_root():
     return Path(value).expanduser().resolve() if isinstance(value, str) and value else None
 
 
-def index_workspace():
-    value = _read_settings().get('indexWorkspace')
-    return Path(value).expanduser().resolve() if isinstance(value, str) and value else None
-
-
-def _index_file(location):
-    path = Path(location).expanduser().resolve()
-    if path.is_file():
-        return path if path.name.casefold() == 'endfield_assets.eidx' else None
-    if path.name.casefold() == 'index':
-        return path / 'endfield_assets.eidx'
-    return path / 'index' / 'endfield_assets.eidx'
-
-
 def set_resource_root(path):
     path = Path(path).expanduser().resolve()
     path.mkdir(parents=True, exist_ok=True)
@@ -90,58 +75,6 @@ def set_resource_root(path):
     value.update(format=SETTINGS_FORMAT, resourceRoot=str(path))
     _write_settings(value)
     return path
-
-
-def set_index_workspace(path):
-    path = Path(path).expanduser().resolve()
-    index = _index_file(path)
-    if index is None or not index.is_file():
-        raise ValueError('所选位置中没有 AnimeStudio 索引 endfield_assets.eidx')
-    value = _read_settings()
-    value.update(format=SETTINGS_FORMAT, indexWorkspace=str(path))
-    _write_settings(value)
-    return path
-
-
-def shared_source_indexes(game):
-    """Return registered indexes only; do not walk the user's disks."""
-    registries = [metadata_root() / 'registry.json']
-    root = resource_root()
-    if root is not None:
-        registries.append(root / 'registry.json')
-    game_id = os.path.normcase(os.path.abspath(game)).replace('\\', '/').rstrip('/').casefold()
-    seen = set()
-    indexes = []
-    workspace = index_workspace()
-    if workspace is not None:
-        index = _index_file(workspace)
-        if index is not None and index.is_file():
-            seen.add(os.path.normcase(str(index)).casefold())
-            indexes.append(index)
-    for registry_path in registries:
-        try:
-            registry = json.loads(registry_path.read_text(encoding='utf-8-sig'))
-        except (OSError, ValueError, TypeError, RuntimeError):
-            continue
-        if not isinstance(registry, dict) or registry.get('format') != INDEX_FORMAT or not isinstance(registry.get('entries'), list):
-            continue
-        for entry in registry['entries']:
-            try:
-                if not isinstance(entry, dict):
-                    continue
-                if not isinstance(entry.get('game'), str) or not isinstance(entry.get('workspace'), str):
-                    continue
-                identity = os.path.normcase(os.path.abspath(entry['game'])).replace('\\', '/').rstrip('/').casefold()
-                if identity != game_id:
-                    continue
-                index = Path(entry['workspace']).resolve() / 'index' / 'endfield_assets.eidx'
-                key = os.path.normcase(str(index)).casefold()
-                if index.is_file() and key not in seen:
-                    seen.add(key)
-                    indexes.append(index)
-            except (OSError, ValueError, TypeError, RuntimeError):
-                continue
-    return indexes
 
 
 def _read_json(url):
@@ -169,11 +102,8 @@ def _validate_tools_manifest(value):
     if len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
         raise ValueError('EFF 共享工具包 SHA256 无效')
     expected = {
-        'compiler': 'nativepack/eff_resource_pack.exe',
         'authorAssets': 'nativepack/eff_author_assets.dll',
-        'indexUpdater': 'nativepack/eff_source_index.exe',
         'authorCore': 'nativepack/eff_author_core.dll',
-        'protocol': 'nativepack/package-protocol.json',
         'textureCompressor': 'nativepack/texconv.exe',
         'archiveRoot': 'EFF_Native_Tools',
     }
@@ -212,11 +142,8 @@ def _digest(path):
 
 def _extract_tools(archive, destination):
     required = {
-        'nativepack/eff_resource_pack.exe',
         'nativepack/eff_author_assets.dll',
-        'nativepack/eff_source_index.exe',
         'nativepack/eff_author_core.dll',
-        'nativepack/package-protocol.json',
         'nativepack/texconv.exe',
         'nativepack/THIRD_PARTY_NOTICES',
         *('vendor/' + name for name in PIL_REQUIRED_FILES),
@@ -237,12 +164,14 @@ def _extract_tools(archive, destination):
                 continue
             if member.is_dir():
                 continue
+            relative_name = '/'.join(parts)
+            if relative_name not in required:
+                continue
             target = destination.joinpath(*parts)
             target.parent.mkdir(parents=True, exist_ok=True)
             with package.open(member) as source, target.open('wb') as output:
                 shutil.copyfileobj(source, output, 1024 * 1024)
-            if '/'.join(parts) in required:
-                found.add('/'.join(parts))
+            found.add(relative_name)
     missing = required - found
     if missing:
         raise ValueError('EFF 共享工具包缺少文件：' + ', '.join(sorted(missing)))
@@ -256,7 +185,7 @@ def _installed_tools(root):
         directory = (root / 'tools' / receipt['sha256']).resolve()
         if root.resolve() not in directory.parents:
             return None
-        required = ('eff_resource_pack.exe', 'eff_author_assets.dll', 'eff_source_index.exe', 'eff_author_core.dll', 'package-protocol.json', 'texconv.exe')
+        required = ('eff_author_assets.dll', 'eff_author_core.dll', 'texconv.exe')
         nativepack = directory / 'nativepack'
         vendor = directory / 'vendor'
         if (all((nativepack / name).is_file() for name in required)
@@ -272,10 +201,9 @@ def find_native_tools():
     override = os.environ.get('EFF_NATIVE_TOOLS_DIR')
     if override:
         path = Path(override).expanduser().resolve()
-        if (path / 'nativepack' / 'eff_resource_pack.exe').is_file():
+        if all((path / 'nativepack' / name).is_file()
+               for name in ('eff_author_assets.dll', 'eff_author_core.dll', 'texconv.exe')):
             return path
-        if (path / 'eff_resource_pack.exe').is_file():
-            return path.parent
         return None
     root = resource_root()
     return _installed_tools(root) if root is not None else None
@@ -325,11 +253,10 @@ def ensure_native_tools():
     override = os.environ.get('EFF_NATIVE_TOOLS_DIR')
     if override:
         path = Path(override).expanduser().resolve()
-        if (path / 'nativepack' / 'eff_resource_pack.exe').is_file():
+        if all((path / 'nativepack' / name).is_file()
+               for name in ('eff_author_assets.dll', 'eff_author_core.dll', 'texconv.exe')):
             return path
-        if (path / 'eff_resource_pack.exe').is_file():
-            return path.parent
-        raise ValueError('EFF_NATIVE_TOOLS_DIR 没有配套资源编译器')
+        raise ValueError('EFF_NATIVE_TOOLS_DIR lacks the Format 3 author tools')
     root = resource_root()
     if root is None:
         raise ValueError('请先在 EFF 三端中的任一应用设置工具存储目录。')
@@ -386,7 +313,7 @@ def _install_native_tools(root):
                 return installed
             raise
         if destination.exists():
-            required = ('eff_resource_pack.exe', 'eff_author_assets.dll', 'eff_source_index.exe', 'eff_author_core.dll', 'package-protocol.json', 'texconv.exe', 'THIRD_PARTY_NOTICES')
+            required = ('eff_author_assets.dll', 'eff_author_core.dll', 'texconv.exe', 'THIRD_PARTY_NOTICES')
             nativepack = destination / 'nativepack'
             vendor = destination / 'vendor'
             if (not all((nativepack / name).is_file() for name in required)
@@ -409,12 +336,14 @@ def _install_native_tools(root):
 
 
 def native_tool_file(name):
+    if name not in {'eff_author_assets.dll', 'eff_author_core.dll', 'texconv.exe'}:
+        raise ValueError('Blender requested an unsupported native tool: ' + str(name))
     tools = find_native_tools()
     if tools is None:
         root = resource_root()
         if root is None:
-            raise ValueError('请在 EFF 面板选择工具存储目录，并准备共享资源编译器。')
-        raise ValueError('EFF 共享工具尚未下载到所选目录，请在 EFF 面板点击“检查并准备工具”。')
+            raise ValueError('请在 EFF 面板选择共享工具存储目录。')
+        raise ValueError('EFF 共享作者工具尚未下载，请在 EFF 面板点击“检查并准备工具”。')
     path = tools / 'nativepack' / name
     if not path.is_file():
         raise ValueError('共享工具包缺少 ' + name)

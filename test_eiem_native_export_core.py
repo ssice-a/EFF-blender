@@ -2,6 +2,7 @@
 import ast
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import shutil
@@ -28,10 +29,6 @@ def load_module(name, path):
 
 exporter = load_module('eiem_native_export_core_test',
                        Path(__file__).with_name('eiem_native_export.py'))
-bundler = load_module('eiem_bundle_core_test',
-                     ROOT / 'tools/diagnostics/bundle_blender_native_export.py')
-
-
 class Material(dict):
     def __init__(self, name, values=None):
         super().__init__(values or {})
@@ -83,6 +80,117 @@ class NativeExportCoreTests(unittest.TestCase):
         self.texture_tool = patch.object(exporter.shared_resources, 'native_tool_file', return_value=Path('texconv.exe'))
         self.texture_tool.start()
         self.addCleanup(self.texture_tool.stop)
+
+    def test_exporter_has_one_complete_format3_entry(self):
+        self.assertFalse(hasattr(exporter, 'validate_format3_export_scope'))
+        self.assertNotIn('resource_scope', inspect.signature(exporter.export_native_package).parameters)
+
+    def test_typed_author_input_preserves_signed_unity_path_ids(self):
+        template = dict(kind='Mesh', path='assets/test.asset', asset='MeshTest',
+                        cab='CAB-test', pathId=-123456789012345,
+                        file='/source/CAB-test.bytes', sha256='A' * 64)
+        encoded = exporter._typed_author_input('Smoke', [template], [], [])
+        offset = 0
+
+        def text():
+            nonlocal offset
+            size = struct.unpack_from('<Q', encoded, offset)[0]
+            offset += 8
+            value = encoded[offset:offset + size].decode('utf-8')
+            offset += size
+            return value
+
+        self.assertEqual(text(), 'EFF_AUTHOR_TYPED_INPUT/1')
+        self.assertEqual(text(), 'Smoke')
+        self.assertEqual(struct.unpack_from('<Q', encoded, offset)[0], 1)
+        offset += 8
+        self.assertEqual([text() for _ in range(4)],
+                         ['Mesh', 'assets/test.asset', 'MeshTest', 'CAB-test'])
+        self.assertEqual(struct.unpack_from('<q', encoded, offset)[0], template['pathId'])
+
+    def test_typed_texture_input_does_not_copy_dds_payload_into_author_dll(self):
+        template = dict(kind='Texture2D', path='assets/body_d', asset='Body_D',
+                        cab='CAB-texture', pathId=-17,
+                        file='/source/CAB-texture.bytes', sha256='B' * 64)
+        pixels = b'large-dds-payload' * 200_000
+        texture = dict(id='TextureBody', path='textures/TextureBody.effres',
+                       dds='textures/TextureBody.dds', pixels=pixels,
+                       width=4096, height=4096, mipCount=13, formatId=25,
+                       colorSpace=1, filter=1, wrap=0, aniso=1, mipBias=0.0)
+        encoded = exporter._typed_author_input('Smoke', [template], [], [texture])
+        self.assertNotIn(pixels[:4096], encoded)
+        self.assertLess(len(encoded), 1024)
+
+    def test_typed_texture_record_ends_with_template_index(self):
+        template = dict(kind='Texture2D', path='assets/body_d', asset='Body_D',
+                        cab='CAB-texture', pathId=-17,
+                        file='/source/CAB-texture.bytes', sha256='B' * 64)
+        texture = dict(id='TextureBody', path='textures/TextureBody.effres',
+                       dds='textures/TextureBody.dds')
+        encoded = exporter._typed_author_input('Smoke', [template], [], [texture])
+        self.assertEqual(encoded[-8:], (0).to_bytes(8, 'little'))
+
+    def test_typed_writer_requires_a_matching_format3_candidate(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / 'candidate'
+            with self.assertRaisesRegex(ValueError, 'prepared candidate directory'):
+                exporter.write_format3_native_assets(
+                    Path(folder) / 'missing.dll', 'Smoke', [], [], [], output)
+            output.mkdir()
+            (output / 'mod.ini').write_text('[Mod]\nformat=2\nid=Smoke\n', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'candidate identity differs'):
+                exporter.write_format3_native_assets(
+                    Path(folder) / 'missing.dll', 'Smoke', [], [], [], output)
+
+            (output / 'mod.ini').write_text('[Mod]\nformat=3\nid=Other\n', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'candidate identity differs'):
+                exporter.write_format3_native_assets(
+                    Path(folder) / 'missing.dll', 'Smoke', [], [], [], output)
+
+    def test_typed_format3_records_reject_shared_part_with_different_mesh_schemas(self):
+        class Format3:
+            @staticmethod
+            def part_resource_id(value): return 'Part' + value.removeprefix('Mesh')
+            @staticmethod
+            def identifier(value): return value
+
+        class Source:
+            @staticmethod
+            def resolve(kind, path, asset):
+                return {'native': {'typeHash': 'TYPE-A' if asset == 'A' else 'TYPE-B'}}
+
+        part = dict(partId='MeshBody', material='MaterialBody', nativeTypeHash='TYPE-A',
+                    vertices=3, indices=3, bonePaths=[], shapeNames=[], fieldData={},
+                    authorData=b'editable mesh')
+        rules = [dict(hidden=False, parts=['MeshBody'], targets=[
+            dict(sourcePath='assets/a.mesh', sourceAsset='A'),
+            dict(sourcePath='assets/b.mesh', sourceAsset='B')])]
+        with self.assertRaisesRegex(ValueError, 'incompatible native templates'):
+            exporter.format3_native_records(Format3, Source(), [part], [], rules)
+
+    def test_typed_format3_records_match_format3_manifest_names(self):
+        class Format3:
+            @staticmethod
+            def part_resource_id(value): return 'Part' + value.removeprefix('Mesh')
+            @staticmethod
+            def identifier(value): return value
+
+        class Source:
+            @staticmethod
+            def resolve(kind, path, asset):
+                return {'native': {'typeHash': 'TYPE-A'}}
+
+        part = dict(partId='MeshBody', material='MaterialBody', nativeTypeHash='TYPE-A',
+                    vertices=3, indices=3, bonePaths=['Root'], shapeNames=['Smile'],
+                    fieldData={'m_Name': b'Mesh'}, authorData=b'editable mesh')
+        rules = [dict(hidden=False, parts=['MeshBody'], targets=[
+            dict(sourcePath='assets/body.mesh', sourceAsset='Body')])]
+        meshes, textures = exporter.format3_native_records(Format3, Source(), [part], [], rules)
+        self.assertEqual(textures, [])
+        self.assertEqual(meshes[0]['partId'], 'PartBody')
+        self.assertEqual(meshes[0]['meshId'], 'Mesh_PartBody')
+        self.assertEqual(meshes[0]['path'], 'meshes/PartBody.effres')
+        self.assertEqual(meshes[0]['targetAsset'], 'Body')
 
     def test_dds_author_image_is_not_compressed_and_is_registered_for_passthrough(self):
         payload = bytes(range(16))
@@ -138,14 +246,11 @@ class NativeExportCoreTests(unittest.TestCase):
 
             root = Path(folder) / 'published'
             root.mkdir()
-            relative = 'textures/' + texture_id + '.dds'
-            (root / 'mod.ini').write_text(
-                '[Mod]\nformat=3\n[' + texture_id + ']\ndds=' + relative + '\n',
-                encoding='utf-8')
-            published_dds = root / relative
-            published_dds.parent.mkdir(parents=True)
-            published_dds.write_bytes(dds_bc7(4, 4, bytes(16)))
-            exporter._copy_texture_dds_inputs(root, texture_inputs)
+            format3 = exporter.pack_modules()[0]['author_format3']
+            format3.write_format3_directory(
+                root, 'Smoke', [], {}, list(textures.values()), [], [], [], [])
+            texture_inputs[texture_id]['dds_relative'] = 'textures/' + texture_id + '.dds'
+            published_dds = root / 'textures' / (texture_id + '.dds')
             exporter._update_texture_image_paths(root, texture_inputs)
             self.assertEqual(exporter.texture_compression.parse_source_dds(
                 published_dds.read_bytes())['format'], 'BC7')
@@ -164,13 +269,20 @@ class NativeExportCoreTests(unittest.TestCase):
             source_dds.write_bytes(raw_dds)
             image = Material('Image', {})
             image.filepath = str(Path(folder) / 'source.png')
+            parsed_source = exporter.texture_compression.parse_source_dds(raw_dds)
+            texture = dict(parsed_source, id='TextureExample', colorSpace=1,
+                           filter=1, wrap=0, aniso=1, mipBias=0.0,
+                           ddsSourcePath=str(source_dds),
+                           ddsHash=hashlib.sha256(raw_dds).hexdigest().upper())
             texture_inputs = {'TextureExample': {
                 'dds_path': source_dds,
                 'dds_hash': hashlib.sha256(raw_dds).hexdigest().upper(),
                 'images': [image],
             }}
 
-            exporter._copy_texture_dds_inputs(root, texture_inputs)
+            exporter.pack_modules()[0]['author_format3'].write_format3_directory(
+                root, 'Smoke', [], {}, [texture], [], [], [], [])
+            texture_inputs['TextureExample']['dds_relative'] = 'textures/TextureExample.dds'
             exporter._update_texture_image_paths(root, texture_inputs)
 
             output_dds = root / 'textures/TextureExample.dds'
@@ -789,21 +901,6 @@ class NativeExportCoreTests(unittest.TestCase):
             exporter.collect_material(addon,source,mat,{'image':image},{},folder,None,texture_only=True)
             self.assertEqual(len(writes),1)
 
-    def test_partial_staging_hardlinks_are_detached_before_writes(self):
-        with tempfile.TemporaryDirectory() as folder:
-            source = Path(folder) / 'source'
-            staging = Path(folder) / 'staging'
-            source.mkdir()
-            original = source / 'textures' / 'body.tex'
-            original.parent.mkdir()
-            original.write_bytes(b'original')
-            exporter._clone_staging_tree(source, staging)
-            staged = staging / 'textures' / 'body.tex'
-            exporter._detach_staging_files([staged])
-            staged.write_bytes(b'updated')
-            self.assertEqual(original.read_bytes(), b'original')
-            self.assertEqual(staged.read_bytes(), b'updated')
-
     def test_export_staging_closes_frozen_resources_before_cleanup(self):
         class Stream:
             closed = False
@@ -831,39 +928,14 @@ class NativeExportCoreTests(unittest.TestCase):
         self.assertEqual(events, [('cleanup', True)])
         self.assertEqual(cache['__frozen_files__'], {})
 
-    @unittest.skipUnless(os.name == 'nt', 'Windows resource file handle semantics')
-    def test_export_staging_removes_directory_after_frozen_texture_read(self):
-        resource_file = exporter.pack_modules()[0]['ini_reader']
-        resource_file = __import__(resource_file.__package__ + '.resource_file', fromlist=['*'])
-        with tempfile.TemporaryDirectory() as parent:
-            cache = {'__frozen_files__': {}}
-            mods = Path(parent) / 'mods'
-            package = mods / 'chen'
-            package.mkdir(parents=True)
-            destination = package / 'mod.ini'
-            staging = None
-            with self.assertRaisesRegex(RuntimeError, 'export failed'):
-                with exporter._export_temporary_directory(
-                        cache, destination, prefix='eff-export-test-') as temporary:
-                    staging = Path(temporary)
-                    self.assertEqual(staging.parent.name, '.eff-export-staging')
-                    texture = staging / 'mod' / 'textures' / 'clothes_P.tex'
-                    texture.parent.mkdir(parents=True)
-                    texture.write_bytes(resource_file.encode_resource(
-                        resource_file.PIXELS, '00' * 16, {'pixels': b'pixels'}))
-                    resource_file.read_resource(texture, resource_file.PIXELS, cache)
-                    self.assertTrue(next(iter(cache['__frozen_files__'].values()))[0].closed is False)
-                    raise RuntimeError('export failed')
-
-            self.assertFalse(staging.exists())
-            self.assertFalse((mods / '.eff-export-staging').exists())
-            self.assertEqual(cache['__frozen_files__'], {})
-
     def test_source_checkout_imports_canonical_nativepack(self):
         modules, _ = exporter.pack_modules()
         self.assertEqual(Path(modules['author_source'].__file__).resolve().parent,
                          (ROOT / 'tools/nativepack').resolve())
+        self.assertIn('effect_native', modules)
+        self.assertNotIn('runtime_controls', modules)
 
+    @unittest.skip('Format 2 package publication belongs to Mod Manager')
     def test_parent_export_preserves_nested_mods(self):
         import nativepack.ini_package as writer
         import nativepack.ini_reader as reader
@@ -935,19 +1007,17 @@ class NativeExportCoreTests(unittest.TestCase):
                                   view_layer=SimpleNamespace(update=lambda: calls.append('update')))
         namespace = dict(bpy=SimpleNamespace(context=context), sys=sys,
                          __name__=__name__, _EXPORT_IN_PROGRESS=False, _EXPORT_SKELETON_TOKENS=None,
-                         export_game_directory=lambda root, configured: 'selected game')
+                         )
 
         def fail(*args, **kwargs):
             self.assertTrue(namespace['_EXPORT_IN_PROGRESS'])
             self.assertEqual(kwargs['source_baseline'], 'source')
-            self.assertEqual(kwargs['resource_scope'], 'TEXTURES')
-            self.assertEqual(kwargs['game_directory'], 'selected game')
             raise ValueError('bad author')
 
         namespace['native_export'] = SimpleNamespace(export_native_package=fail)
         export_package = addon_function('export_package', namespace)
         with self.assertRaisesRegex(ValueError, 'bad author'):
-            export_package('output', [object()], [], [], resource_scope='TEXTURES')
+            export_package('output', [object()], [], [])
         self.assertFalse(namespace['_EXPORT_IN_PROGRESS'])
         self.assertIsNone(namespace['_EXPORT_SKELETON_TOKENS'])
         self.assertEqual(calls, ['update', 'update'])
@@ -960,40 +1030,6 @@ class NativeExportCoreTests(unittest.TestCase):
             rig = {'eiem_author_package': str(package)}
             group = SimpleNamespace(eiem_physics=SimpleNamespace(rig=rig))
             self.assertEqual(exporter.baseline_for([], '', [group]), package.resolve())
-
-    def test_bundle_includes_hashing_and_rejects_label_unaware_layouts(self):
-        self.assertIn('hashing', bundler.MODULES)
-        with tempfile.TemporaryDirectory() as folder:
-            compiler = Path(folder) / 'eff_resource_pack.exe'
-            compiler.write_bytes(b'EFF_NATIVE_PACK_V35_1 EFF_NATIVE_PACK_V36_ASSEMBLY_1')
-            protocol = dict(format='EFF_OFFLINE_PACKAGE_PROTOCOL', compiler='EFF_NATIVE_PACK_V36_ASSEMBLY_1', abi=36)
-            with patch.object(bundler._protocol_module.subprocess,'run',return_value=SimpleNamespace(
-                    returncode=0,stdout=json.dumps(protocol),stderr='')):
-                with self.assertRaisesRegex(ValueError,'数据结构不兼容'):
-                    bundler._protocol(compiler)
-            with patch.object(bundler._protocol_module.subprocess,'run',return_value=SimpleNamespace(
-                    returncode=1,stdout='',stderr='query failed')):
-                with self.assertRaisesRegex(ValueError,'协议查询失败'):
-                    bundler._protocol(compiler)
-
-    def test_new_compiler_protocol_is_accepted(self):
-        protocol = dict(format='EFF_OFFLINE_PACKAGE_PROTOCOL', version=1, abi=35,
-                        compiler='EFF_NATIVE_PACK_V35_1', authorFormat=2, resourceVersion=2,
-                        structures=dict(bundler._protocol_module.STRUCTURES))
-        result = SimpleNamespace(returncode=0, stdout=json.dumps(protocol), stderr='')
-        with patch.object(bundler._protocol_module.subprocess, 'run', return_value=result):
-            self.assertEqual(bundler._protocol('compiler.exe'), protocol)
-
-    def test_same_abi_with_wrong_resource_structure_is_rejected(self):
-        protocol = dict(format='EFF_OFFLINE_PACKAGE_PROTOCOL', version=1, abi=35,
-                        compiler='EFF_NATIVE_PACK_V35_1', authorFormat=2, resourceVersion=2,
-                        structures=dict(bundler._protocol_module.STRUCTURES,
-                                        resource='different-block-encoding'))
-        result = SimpleNamespace(returncode=0, stdout=json.dumps(protocol), stderr='')
-        with patch.object(bundler._protocol_module.subprocess, 'run', return_value=result):
-            with self.assertRaisesRegex(ValueError, '结构'):
-                bundler._protocol('compiler.exe')
-
 
 if __name__ == '__main__':
     unittest.main()

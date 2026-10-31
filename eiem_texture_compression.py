@@ -26,6 +26,11 @@ def target_format(source_format, color_space):
     return result
 
 
+def rgba_pixels_top_down(image):
+    """Return RGBA pixels in standard image/DDS top-to-bottom row order."""
+    return image.convert('RGBA').tobytes()
+
+
 def texture_metadata(resource, _values=None):
     metadata = resource.get('blocks', {}).get('@texture')
     if metadata is None:
@@ -136,7 +141,10 @@ def compress_rgba(pixels, width, height, mipmaps, source_format, color_space,
         source = root / 'source.png'
         image.save(source, format='PNG', optimize=False)
         command = [str(Path(texconv)), '-nologo', '-y', '-dx10', '-f', target['dxgi'],
-                   '-m', str(mip_count), '-if', 'BOX', '-o', str(root), str(source)]
+                   '-m', str(mip_count), '-if', 'BOX']
+        if target['dxgi'].endswith('_SRGB'):
+            command.append('--srgb-in')
+        command.extend(('-o', str(root), str(source)))
         result = subprocess.run(command, capture_output=True, text=True, errors='replace', timeout=300)
         output = root / 'source.dds'
         if result.returncode or not output.is_file():

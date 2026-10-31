@@ -128,11 +128,17 @@ def verify_package(directory, revision=None):
     for name in ('__init__.py', 'eiem_blender_addon.py', 'eiem_release.py', 'eiem_update_worker.py',
                  'eiem_shared_resources.py', 'nativepack/author_source.py',
                  'nativepack/author_format3.py',
-                 'nativepack/compiled_store.py', 'nativepack/mesh.py',
+                 'nativepack/effect_native.py', 'nativepack/mesh.py',
                  'eiem_texture_compression.py',
                  'physics_presets/chen_soft_ribbon.json'):
         if name not in build['files']:
             raise ValueError('更新包缺少配套文件：' + name)
+    obsolete = {'nativepack/compiled_store.py', 'nativepack/ini_package.py',
+                'nativepack/ini_reader.py', 'nativepack/payload.py',
+                'nativepack/resource_file.py', 'nativepack/runtime_controls.py',
+                'nativepack/shape_animation.py', 'nativepack/texture_fields.py'}
+    if obsolete.intersection(build['files']):
+        raise ValueError('Blender Format 3 update package contains legacy Mod readers/writers')
     if any(name.endswith(('.exe', '.dll', '.pyd')) for name in build['files']):
         raise ValueError('Blender 更新包不能重复分发 EFF 共享原生工具')
     for name, expected in build['files'].items():

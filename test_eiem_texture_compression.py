@@ -2,9 +2,13 @@
 import hashlib
 import struct
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from eiem_texture_compression import (
-    parse_source_dds, target_format, texture_metadata, unpack_dds,
+    compress_rgba, parse_source_dds, rgba_pixels_top_down, target_format,
+    texture_metadata, unpack_dds,
 )
 
 
@@ -19,6 +23,16 @@ def dds_fixture(width, height, mip_count, fmt, payload, alpha_mode=0):
 
 
 class TextureCompressionTests(unittest.TestCase):
+    def test_png_pixels_keep_top_down_row_order_for_standard_dds(self):
+        from PIL import Image
+
+        image = Image.new('RGBA', (1, 2))
+        image.putdata([(255, 0, 0, 255), (0, 0, 255, 255)])
+        self.assertEqual(rgba_pixels_top_down(image), bytes((
+            255, 0, 0, 255,
+            0, 0, 255, 255,
+        )))
+
     def test_source_dds_returns_existing_mip_payload_without_reencoding(self):
         payload = bytes(range(80))
         parsed = parse_source_dds(dds_fixture(5, 7, 2, 99, payload))
@@ -33,6 +47,24 @@ class TextureCompressionTests(unittest.TestCase):
                          (25, 'BC7_UNORM_SRGB', 99))
         self.assertEqual((linear['unity'], linear['dxgi'], linear['dxgi_id']),
                          (25, 'BC7_UNORM', 98))
+
+    def test_compression_marks_srgb_png_input_only_for_srgb_output(self):
+        commands = []
+
+        def fake_texconv(command, **_kwargs):
+            commands.append(command)
+            output = Path(command[command.index('-o') + 1]) / 'source.dds'
+            dxgi = 99 if 'BC7_UNORM_SRGB' in command else 98
+            output.write_bytes(dds_fixture(2, 2, 1, dxgi, bytes(16)))
+            return SimpleNamespace(returncode=0, stderr='', stdout='')
+
+        with patch('eiem_texture_compression.subprocess.run', side_effect=fake_texconv):
+            for color_space in (1, 0):
+                compress_rgba(bytes((128, 64, 32, 255)) * 4, 2, 2, False,
+                              'RGBA32', color_space, 'texconv.exe')
+
+        self.assertIn('--srgb-in', commands[0])
+        self.assertNotIn('--srgb-in', commands[1])
 
     def test_bc5_source_format_is_preserved_for_linear_normal_maps(self):
         bc5 = target_format('BC5', 0)

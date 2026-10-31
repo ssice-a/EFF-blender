@@ -47,11 +47,19 @@ for cycle in range(3):
     assert bpy.ops.eiem.export_package.get_rna_type().properties['package_directory'].is_skip_save
     assert bpy.ops.eiem.export_update.get_rna_type() is not None
     assert hasattr(bpy.types.Scene,'eiem_export_last_directory')
-    resource_scope = bpy.ops.eiem.export_package.get_rna_type().properties['resource_scope']
-    assert resource_scope.default == 'ALL'
-    assert [item.identifier for item in resource_scope.enum_items] == ['ALL', 'MESH', 'MATERIALS', 'TEXTURES', 'PHYSICS']
-    assert bpy.ops.eiem.export_mesh_only.get_rna_type() is not None
-    assert bpy.ops.eiem.detect_game_directory.get_rna_type() is not None
+    try:
+        bpy.ops.eiem.export_mesh_only.get_rna_type()
+    except KeyError:
+        pass
+    else:
+        raise AssertionError('Selective export operator is still registered')
+    assert 'resource_scope' not in bpy.ops.eiem.export_package.get_rna_type().properties
+    try:
+        bpy.ops.eiem.detect_game_directory.get_rna_type()
+    except KeyError:
+        pass
+    else:
+        raise AssertionError('Game directory discovery operator is still registered')
     try:
         bpy.ops.eiem.choose_index_workspace.get_rna_type()
     except KeyError:
@@ -62,7 +70,7 @@ for cycle in range(3):
     assert bpy.ops.eiem.prepare_shared_tools.get_rna_type() is not None
     assert bpy.ops.eiem.install_update.get_rna_type() is not None
     assert 'update_channel' in module.eiem_blender_addon.EFF_AddonPreferences.bl_rna.properties
-    assert 'game_directory' in module.eiem_blender_addon.EFF_AddonPreferences.bl_rna.properties
+    assert 'game_directory' not in module.eiem_blender_addon.EFF_AddonPreferences.bl_rna.properties
     assert bpy.ops.eiem.import_material.get_rna_type() is not None
     assert bpy.ops.eiem.import_animation.get_rna_type() is not None
     assert bpy.ops.eiem.import_physics.get_rna_type() is not None

@@ -232,7 +232,6 @@ if __package__:
     from . import eiem_format as format_io
     from . import eiem_lod as lod
     from . import eiem_native_export as native_export
-    from . import eiem_offline_reload as offline_reload
     from . import eiem_physics_authoring as physics_authoring
     from . import eiem_material_editor as material_editor
     from . import eiem_effect_editor as effect_editor
@@ -257,10 +256,6 @@ else:
         "eiem_native_export", Path(__file__).with_name("eiem_native_export.py"))
     native_export = importlib.util.module_from_spec(_native_spec)
     _native_spec.loader.exec_module(native_export)
-    _offline_spec = importlib.util.spec_from_file_location(
-        "eiem_offline_reload", Path(__file__).with_name("eiem_offline_reload.py"))
-    offline_reload = importlib.util.module_from_spec(_offline_spec)
-    _offline_spec.loader.exec_module(offline_reload)
     _physics_spec = importlib.util.spec_from_file_location(
         "eiem_physics_authoring", Path(__file__).with_name("eiem_physics_authoring.py"))
     physics_authoring = importlib.util.module_from_spec(_physics_spec)
@@ -409,8 +404,6 @@ def unity_transform_matrix_to_blender(matrix):
 Reader = format_io.Reader
 Writer = format_io.Writer
 parse_ini = format_io.parse_ini
-parse_material_resources = format_io.parse_material_resources
-read_flat_properties = format_io.read_flat_properties
 safe_path = format_io.safe_path
 read_mesh = format_io.read_mesh
 read_skeleton = format_io.read_skeleton
@@ -475,66 +468,65 @@ def load_material(root, section, values, textures=None):
 
 
 def import_material_file(path, obj):
-    """Import an EFF material + package texture declarations into one slot."""
+    """Import one Format 3 Material resource into the active Mesh slot."""
     path = Path(path).resolve()
     if obj is None or obj.type != "MESH":
         raise ValueError('请先选择要指定材质的网格')
-    values = read_flat_properties(path)
-    if values.get("format") != "EFFMAT" or not values.get("source", "").strip():
-        raise ValueError("请选择 EFF 导出的 .mat（EFFMAT version=1，包含 source），不是 Unity YAML 或节点材质")
-    # Only use an enclosing package that actually declares this file.
-    resources, root = {}, path.parent
-    for parent in path.parents:
-        if not (parent / "mod.ini").is_file():
-            continue
-        sections = parse_material_resources(parent)
-        if any(s.lower().startswith("material") and v.get("path") and
-               safe_path(parent, v["path"]) == path for s, v in sections.items()):
-            resources, root = sections, parent
-            break
+    root = next((parent for parent in path.parents if (parent / "mod.ini").is_file()), None)
+    if root is None:
+        raise ValueError("所选资源不属于 Format 3 Mod")
+    parser = parse_ini(root)
+    if parser.get("Mod", "format", fallback="") != "3":
+        raise ValueError("Blender 只读取 Format 3 Mod；请先使用 Mod Manager 迁移旧格式。")
+    resources = {section: dict(parser.items(section)) for section in parser.sections()}
+    matches = [(section, values) for section, values in resources.items()
+               if section.lower().startswith("material") and values.get("path") and
+               safe_path(root, values["path"]) == path]
+    if len(matches) != 1:
+        raise ValueError("所选 .effres 必须由 mod.ini 中唯一一个 Material 声明")
+    section, declaration = matches[0]
+    values = format_io.read_format3_material_resource(path, section, declaration["path"])
+    values.pop("_source_asset", None)
+    values.pop("_author_hash", None)
+    values["target.path"] = declaration.get("source.path", values["source"])
+    values["target.asset"] = declaration.get("source.asset", values.get("name", section))
     textures = {}
-    for key, value in values.items():
-        if not key.startswith("texture.") or value.replace("\\", "/").lower().startswith("assets/"):
+    for key, texture_id in values.items():
+        if not key.startswith("texture."):
             continue
-        declaration = resources.get(value)
-        if not declaration or not value.lower().startswith("texture") or not declaration.get("path"):
-            raise ValueError("缺少贴图声明 %s：请保留材质所属资源包的 mod.ini 和 Texture 文件" % value)
-        disk = safe_path(root, declaration["path"])
-        if not disk.is_file():
-            raise ValueError("贴图文件不存在：" + str(disk))
-        textures[value] = (disk, declaration)
+        texture = resources.get(texture_id)
+        if not texture or not texture.get("dds"):
+            raise ValueError("Format 3 Material references an undeclared DDS Texture: " + texture_id)
+        dds = safe_path(root, texture["dds"])
+        if dds.suffix.lower() != ".dds" or not dds.is_file():
+            raise ValueError("Format 3 Texture DDS is missing or invalid: " + str(dds))
+        textures[texture_id] = (dds, texture)
     # Allocation happens only after reference validation. Failure leaves the
     # selected slot and every old Material/Image data block unchanged.
     created_images, material = [], None
     try:
         images = {}
         used = {str(i.get("eiem_section")): i for i in bpy.data.images if i.get("eiem_section")}
-        texture_remap = {}
-        for old_section, (disk, declaration) in textures.items():
+        for texture_id, (disk, texture_values) in textures.items():
             image = bpy.data.images.load(str(disk), check_existing=False)
             created_images.append(image)
             if image.size[0] <= 0 or image.size[1] <= 0:
                 raise ValueError("无法解码贴图：" + str(disk))
-            section = unique_texture_section(disk, used)
-            image["eiem_section"] = section
-            used[section] = image
-            texture_remap[old_section] = section
-            image["eiem_source"] = declaration.get("source", "")
-            image["eiem_name"] = declaration.get("name", disk.stem)
+            image_section = unique_texture_section(disk, used)
+            image["eiem_section"] = image_section
+            used[image_section] = image
+            image["eiem_source"] = texture_values.get("source", "")
+            image["eiem_name"] = texture_values.get("name", disk.stem)
             for key, default in (("linear", "false"), ("mipmaps", "true"), ("filter", "1"),
                                  ("wrap", "0"), ("aniso", "1"), ("mip_bias", "0")):
-                image["eiem_" + key] = declaration.get(key, default)
+                image["eiem_" + key] = texture_values.get(key, default)
             image.colorspace_settings.name = "Non-Color" if image["eiem_linear"].lower() == "true" else "sRGB"
-            images[section] = image
-        values = dict(values)
-        for key, value in list(values.items()):
-            if key.startswith("texture.") and value in texture_remap:
-                values[key] = texture_remap[value]
+            images[texture_id] = image
         used_sections = {str(m.get("eiem_section", m.name)).lower() for m in bpy.data.materials}
         used_sections.update(m.name.lower() for m in bpy.data.materials)
-        section = unique_export_section("Material" + path.stem, used_sections, "Material")
-        material = load_material(root, section, values, images)
-        material["eiem_material_file"] = str(path)
+        material_id = unique_export_section("Material" + path.stem, used_sections, "Material")
+        material = load_material(root, material_id, values, images)
+        material["eiem_material_file"] = declaration["path"]
         if obj.data.materials:
             obj.active_material = material
         else:
@@ -1146,17 +1138,17 @@ def mesh_resource_collection(root_collection, section, payload):
 
 def import_package(root, clean=False, include_physics=False, physics_file=""):
     parser = parse_ini(root)
-    format3 = parser.get("Mod", "format", fallback="") == "3"
+    if parser.get("Mod", "format", fallback="") != "3":
+        raise ValueError("Blender 只读取 Format 3 Mod；请先使用 Mod Manager 迁移旧格式。")
     resources = {section: dict(parser.items(section)) for section in parser.sections()}
     effect_attachments = []
-    if format3:
-        for section, values in resources.items():
-            if not section.startswith("EffectAttachment"):
-                continue
-            author_id = values.get("author", "")
-            if not author_id or author_id not in resources or resources[author_id].get("type") != "effect-author":
-                raise ValueError("Effect %s has no editable author resource; re-export it with the current Blender add-on" % section)
-            effect_attachments.append((section, values, author_id))
+    for section, values in resources.items():
+        if not section.startswith("EffectAttachment"):
+            continue
+        author_id = values.get("author", "")
+        if not author_id or author_id not in resources or resources[author_id].get("type") != "effect-author":
+            raise ValueError("Effect %s has no editable author resource; re-export it with the current Blender add-on" % section)
+        effect_attachments.append((section, values, author_id))
     collection = bpy.data.collections.get("EFF") or bpy.data.collections.new("EFF")
     if collection.name not in bpy.context.scene.collection.children:
         bpy.context.scene.collection.children.link(collection)
@@ -1170,24 +1162,23 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
     mesh_collection = import_child_collection(package_collection, "Meshes", "MESHES", import_id)
     skeleton_collection = import_child_collection(package_collection, "Skeletons", "SKELETONS", import_id)
     targets_by_part = {}
-    if format3:
-        for section, values in resources.items():
-            if not section.lower().startswith("replace") or values.get("handling") == "skip":
-                continue
-            targets = [(values.get("target.path", ""), values.get("target.asset", ""), 0)]
-            lods = {}
-            for key, value in values.items():
-                match = re.fullmatch(r"lod\.([1-9][0-9]*)\.(path|asset)", key)
-                if match:
-                    lods.setdefault(int(match[1]), {})[match[2]] = value
-            for level, target in sorted(lods.items()):
-                if set(target) != {"path", "asset"}:
-                    raise ValueError("Incomplete LOD target in " + section)
-                targets.append((target["path"], target["asset"], level))
-            for part in values.get("parts", "").split(","):
-                part = part.strip()
-                if part:
-                    targets_by_part.setdefault(part, []).extend(targets)
+    for section, values in resources.items():
+        if not section.lower().startswith("replace") or values.get("handling") == "skip":
+            continue
+        targets = [(values.get("target.path", ""), values.get("target.asset", ""), 0)]
+        lods = {}
+        for key, value in values.items():
+            match = re.fullmatch(r"lod\.([1-9][0-9]*)\.(path|asset)", key)
+            if match:
+                lods.setdefault(int(match[1]), {})[match[2]] = value
+        for level, target in sorted(lods.items()):
+            if set(target) != {"path", "asset"}:
+                raise ValueError("Incomplete LOD target in " + section)
+            targets.append((target["path"], target["asset"], level))
+        for part in values.get("parts", "").split(","):
+            part = part.strip()
+            if part:
+                targets_by_part.setdefault(part, []).extend(targets)
     render_owners = {}
     for section, values in resources.items():
         if not section.lower().startswith("prefab"):
@@ -1209,74 +1200,48 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
     for section, values in resources.items():
         if not section.lower().startswith("texture") or not values.get("path"):
             continue
-        try:
-            # Do not let Blender's global filepath cache alias two imported
-            # Mod packages. Their section/source metadata is package-local,
-            # even when both happen to point at the same disk PNG.
-            image_path = values.get("dds", values["path"]) if format3 else values["path"]
-            image = bpy.data.images.load(str(safe_path(root, image_path)), check_existing=False)
-            used = {str(item.get("eiem_section")): item for item in bpy.data.images
-                    if item.get("eiem_section") and item is not image}
-            image_section = section
-            if section in used:
-                image_section = unique_texture_section(safe_path(root, values["path"]), used)
-            image["eiem_section"] = image_section
-            image["eiem_source_section"] = section
-            image["eiem_author_package"] = str(Path(root).resolve())
-            image["eiem_relative_path"] = image_path
-            if format3:
-                image["eiem_native_resource_path"] = values["path"]
-            image["eiem_source"] = values.get("source", "")
-            image["eiem_name"] = values.get("name", image.name)
-            image["eiem_target_path"] = values.get("target.path", "")
-            image["eiem_target_asset"] = values.get("target.asset", "")
-            image["eiem_linear"] = values.get("linear", "false")
-            image["eiem_mipmaps"] = values.get("mipmaps", "true")
-            image["eiem_filter"] = values.get("filter", "1")
-            image["eiem_wrap"] = values.get("wrap", "0")
-            image["eiem_aniso"] = values.get("aniso", "1")
-            image["eiem_mip_bias"] = values.get("mip_bias", "0")
-            textures[section] = image
-        except Exception:
-            if format3:
-                raise
-            continue
+        # Do not let Blender's global filepath cache alias two imported
+        # Mod packages. Their section/source metadata is package-local,
+        # even when both happen to point at the same DDS.
+        image_path = values["dds"]
+        image = bpy.data.images.load(str(safe_path(root, image_path)), check_existing=False)
+        used = {str(item.get("eiem_section")): item for item in bpy.data.images
+                if item.get("eiem_section") and item is not image}
+        image_section = section
+        if section in used:
+            image_section = unique_texture_section(safe_path(root, values["path"]), used)
+        image["eiem_section"] = image_section
+        image["eiem_source_section"] = section
+        image["eiem_author_package"] = str(Path(root).resolve())
+        image["eiem_relative_path"] = image_path
+        image["eiem_native_resource_path"] = values["path"]
+        image["eiem_source"] = values.get("source", "")
+        image["eiem_name"] = values.get("name", image.name)
+        image["eiem_target_path"] = values.get("target.path", "")
+        image["eiem_target_asset"] = values.get("target.asset", "")
+        image["eiem_linear"] = values.get("linear", "false")
+        image["eiem_mipmaps"] = values.get("mipmaps", "true")
+        image["eiem_filter"] = values.get("filter", "1")
+        image["eiem_wrap"] = values.get("wrap", "0")
+        image["eiem_aniso"] = values.get("aniso", "1")
+        image["eiem_mip_bias"] = values.get("mip_bias", "0")
+        textures[section] = image
     materials = {}
     for section, values in resources.items():
         if section.lower().startswith("material") and values.get("path"):
-            if format3:
-                material_values = format_io.read_format3_material_resource(
-                    safe_path(root, values["path"]), section, values["path"])
-                material_values.pop("_source_asset", None)
-                material_values.pop("_author_hash", None)
-                material_values["target.path"] = values.get(
-                    "source.path", material_values["source"])
-                material_values["target.asset"] = values.get(
-                    "source.asset", material_values.get("name", section))
-                material = load_material(root, section, material_values, textures)
-                material["eiem_material_file"] = values["path"]
-                materials[section] = material
-                continue
-            material_values = read_flat_properties(safe_path(root, values["path"]))
-            # The Material file owns shader properties. The resource section
-            # owns package location and preserves original-game identity as
-            # authoring metadata; live replacement is always a Render action.
-            material_values["path"] = values["path"]
-            # Preserve offline identity as authoring metadata. A Material
-            # declaration never applies itself: exported Render material slots
-            # decide which consumers receive the edited clone.
+            material_values = format_io.read_format3_material_resource(
+                safe_path(root, values["path"]), section, values["path"])
+            material_values.pop("_source_asset", None)
+            material_values.pop("_author_hash", None)
             material_values["target.path"] = values.get(
-                "target.path", material_values.get("source", ""))
+                "source.path", material_values["source"])
             material_values["target.asset"] = values.get(
-                "target.asset", material_values.get("name", ""))
-            materials[section] = load_material(
-                root, section, material_values, textures)
-    # A package can contain many renderer-specific Skeleton sections exported
-    # by an older AnimeStudio.  Those sections repeat the same character
-    # hierarchy and differ only in the renderer's compact bone palette.  The
-    # hierarchy is the resource; a palette belongs to a Mesh binding.  Create
-    # exactly one Armature for each unique hierarchy and make every legacy
-    # section name an alias of it.
+                "source.asset", material_values.get("name", section))
+            material = load_material(root, section, material_values, textures)
+            material["eiem_material_file"] = values["path"]
+            materials[section] = material
+    # A Format 3 Mod stores Mesh bindings independently from the shared
+    # skeleton hierarchy. Create one Armature per unique hierarchy.
     skeletons = {}
     skeleton_payloads = {}
     armatures_by_hierarchy = {}
@@ -1300,12 +1265,11 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
     for section, values in resources.items():
         if not section.lower().startswith("mesh") or not values.get("path"):
             continue
-        payload = (format_io.read_format3_mesh_resource(safe_path(root, values["path"]))
-                   if format3 else read_mesh(safe_path(root, values["path"])))
+        payload = format_io.read_format3_mesh_resource(safe_path(root, values["path"]))
         mesh = make_mesh(section, payload)
         # Preserve offline identity for authoring and for the generated Render
         # selector. Resource declarations do not apply replacements themselves.
-        part_targets = targets_by_part.get(payload.get("part", ""), []) if format3 else []
+        part_targets = targets_by_part.get(payload.get("part", ""), [])
         mesh["eiem_target_path"] = values.get(
             "target.path", part_targets[0][0] if part_targets else payload.get("source", ""))
         mesh["eiem_target_asset"] = values.get(
@@ -1374,32 +1338,32 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
                     pass
         obj["eiem_original_material_sections_json"] = json.dumps(
             original_materials, sort_keys=True, separators=(",", ":"))
-    if format3:
-        for section, values in resources.items():
-            if not section.lower().startswith("part") or not values.get("mesh"):
-                continue
-            obj = meshes.get(values["mesh"])
-            material_section = values.get("material", "")
-            material = materials.get(material_section)
-            if obj is None or material is None:
-                raise ValueError("Format 3 Part references a missing Mesh or Material: " + section)
-            if len(obj.data.materials) == 0:
-                obj.data.materials.append(material)
-            else:
-                obj.data.materials[0] = material
-            obj["eiem_part_section"] = section
-            obj["eiem_render_section"] = section
-            obj["eiem_original_material_sections_json"] = json.dumps({"0": material_section})
-            obj["eiem_format3_import"] = True
+    for section, values in resources.items():
+        if not section.lower().startswith("part") or not values.get("mesh"):
+            continue
+        obj = meshes.get(values["mesh"])
+        material_section = values.get("material", "")
+        material = materials.get(material_section)
+        if obj is None or material is None:
+            raise ValueError("Format 3 Part references a missing Mesh or Material: " + section)
+        if len(obj.data.materials) == 0:
+            obj.data.materials.append(material)
+        else:
+            obj.data.materials[0] = material
+        obj["eiem_part_section"] = section
+        obj["eiem_render_section"] = section
+        obj["eiem_original_material_sections_json"] = json.dumps({"0": material_section})
+        obj["eiem_format3_import"] = True
     for armature in armatures_by_hierarchy.values():
         armature.data["eiem_source_bindings_json"] = json.dumps(shared_skin_bindings(armature), separators=(",", ":"))
-    if include_physics or (format3 and any(values.get("type") == "physics" for values in resources.values())):
+    has_physics = any(values.get("type") == "physics" for values in resources.values())
+    if include_physics or has_physics:
         physics_resources = [
             (section, safe_path(root, values["path"]))
             for section, values in resources.items()
             if section.lower().startswith(("physics", "resourcephysics")) and values.get("path")
         ]
-        if physics_file and not format3:
+        if physics_file and not has_physics:
             physics_resources = [("", Path(physics_file))]
         if not physics_resources:
             candidate = Path(root) / "physics" / "components.json"
@@ -1421,11 +1385,10 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
             physics_rigs[physics_section] = skeleton
         rigs = list(armatures_by_hierarchy.values())
         for section, file in physics_resources:
-            format3_physics = bool(
-                format3 and section and resources.get(section, {}).get("type") == "physics")
+            has_author_resource = bool(section and resources.get(section, {}).get("type") == "physics")
             snapshot = (format_io.read_format3_physics_resource(
-                file, section, resources[section]["path"]) if format3_physics else None)
-            if format3_physics:
+                file, section, resources[section]["path"]) if has_author_resource else None)
+            if has_author_resource:
                 declared_targets = set()
                 rule_ids = {value.strip() for value in
                             resources[section].get("targets", "").split(",") if value.strip()}
@@ -1470,7 +1433,7 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
                         "无法从 Render.physics 确定 %s 使用的 Skeleton" %
                         (section or Path(file).name))
                 rig = rigs[0]
-            if format3_physics:
+            if has_author_resource:
                 with tempfile.TemporaryDirectory(prefix="eiem-format3-physics-") as temporary:
                     package_root = Path(temporary)
                     skeleton_path = safe_path(package_root, physics_document["skeleton"])
@@ -1487,7 +1450,7 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
                 physics_authoring.import_physics(file, rig)
             else:
                 physics_authoring.native.import_source(file, rig)
-    if format3:
+    if effect_attachments or armatures_by_hierarchy:
         effect_editor = sys.modules[__package__ + ".eiem_effect_editor"] if __package__ else sys.modules["eiem_effect_editor"]
         cache_root = bpy.utils.user_resource("DATAFILES", path="eiem/effect-sources", create=True)
         part_meshes = {section: meshes.get(values.get("mesh", ""))
@@ -2881,11 +2844,6 @@ def visible_eiem_resources(context=None):
         str(obj.data.get("eiem_section", "")), obj.name))
 
 
-def export_meshes_for_scope(context, selected_meshes, resource_scope,
-                            effect_only=False, physics_only=False):
-    return list(selected_meshes)
-
-
 def selected_eiem_resources(context=None,allow_empty=False):
     context = context or bpy.context
     selected_objects = list(context.selected_objects)
@@ -2909,71 +2867,14 @@ def selected_export_resources(context=None):
     context=context or bpy.context
     meshes,rigs=selected_eiem_resources(context,allow_empty=True)
     effects=effect_editor.export_roots(context.selected_objects,meshes,sys.modules[__name__])
-    if not meshes and not effects and not selected_eiem_physics(context):
-        raise ValueError('请选择 EFF 网格或特效根 / 发射器')
-    return meshes,rigs,effects
-
-
-def export_scope_resources(context=None, resource_scope='ALL'):
-    context = context or bpy.context
-    selected_meshes, rigs = selected_eiem_resources(context, allow_empty=True)
     physics = selected_eiem_physics(context)
-    effects = effect_editor.export_roots(
-        context.selected_objects, selected_meshes, sys.modules[__name__])
-    if not selected_meshes and effects and physics:
-        raise ValueError('请分别导出特效和 Physics')
-    effect_only = not selected_meshes and bool(effects)
-    physics_only = not selected_meshes and not effects and bool(physics)
-    if effect_only:
-        resource_scope = 'ALL'
-    elif physics_only:
-        resource_scope = 'PHYSICS'
-    elif resource_scope == 'PHYSICS':
-        resource_scope = 'ALL'
-    meshes = export_meshes_for_scope(
-        context, selected_meshes, resource_scope, effect_only, physics_only)
-    if resource_scope == 'ALL' and not effect_only and not physics_only:
-        effects = effect_editor.export_roots(
-            context.selected_objects, meshes, sys.modules[__name__])
-    if not meshes and not effects and not physics:
-        raise ValueError('No selected EFF mesh objects or selected effects/physics')
-    return meshes, rigs, effects, physics, effect_only, physics_only, resource_scope
-
-
-def plan_mesh_only_export(mesh_objects):
-    """Build the smallest export graph for an explicit Mesh-only export.
-
-    Mesh-only validation must not inspect switch groups, shape controls, rigs or
-    physics. The selected Mesh still needs its source identity so sibling parts
-    can be merged onto the source Renderer exactly like a normal export.
-    """
-    selected = list(mesh_objects)
-    if not selected:
-        raise ValueError("No EFF mesh objects selected")
-    if any(obj.type != "MESH" or not obj.data.get("eiem_section")
-           for obj in selected):
-        raise ValueError("Selected objects contain a non-EFF Mesh")
-    sources = {obj: mesh_source_identity(obj) for obj in selected}
-    for obj in selected:
-        if not sources[obj][2]:
-            raise ValueError("Mesh %s is missing its source Mesh name" % obj.name)
-    grouped = {}
-    selectors = {}
-    for obj in sorted(selected, key=lambda item: (sources[item], item.name)):
-        identity = sources[obj]
-        if identity[2] in selectors and selectors[identity[2]] != identity:
-            raise ValueError(
-                "Same-name Meshes come from different source assets: "
-                + identity[2])
-        selectors[identity[2]] = identity
-        grouped.setdefault(identity, []).append(obj)
-    return {
-        "objects": [obj for objects in grouped.values() for obj in objects],
-        "sources": list(grouped.values()),
-        "groups": [],
-        "bindings": {},
-        "hidden": {obj for obj in selected if obj.hide_render},
-    }
+    if not meshes:
+        if effects:
+            raise ValueError('Format 3 完整导出需要选择目标 EFF Mesh；独立特效包尚未接通。')
+        if physics:
+            raise ValueError('Format 3 完整导出需要选择目标 EFF Mesh。')
+        raise ValueError('请选择要导出的 EFF Mesh。')
+    return meshes, rigs, effects, physics
 
 
 def selected_eiem_physics(context=None):
@@ -3098,56 +2999,23 @@ def unique_export_section(requested, used, prefix):
 
 
 def export_package(root, mesh_objects=None, armatures=None, physics_objects=None,
-                   mesh_only=False, lod_levels=None, include_switches=True,
-                   source_baseline='', resource_scope='ALL', game_directory='',effect_roots=None):
-    """Export through the single format-2 author pipeline used by the UI.
-
-    Selection and Blender dependency updates stay in this facade. Native
-    encoding, author publication and offline compilation live in their focused
-    modules; callers cannot accidentally select the removed format-1 runtime
-    replacement writer.
-    """
+                   lod_levels=None, include_switches=True,
+                   source_baseline='', effect_roots=None):
+    """Publish one complete Format 3 author directory."""
     if mesh_objects is None:
-        mesh_objects, selected_armatures,selected_effects = selected_export_resources()
-        if effect_roots is None:effect_roots=selected_effects
+        mesh_objects, selected_armatures, selected_effects, selected_physics = selected_export_resources()
+        if effect_roots is None:
+            effect_roots = selected_effects
         if armatures is None:
             armatures = selected_armatures
         if physics_objects is None:
-            physics_objects = selected_eiem_physics()
-    if mesh_only:
-        armatures, physics_objects = [], []
+            physics_objects = selected_physics
+    if not mesh_objects:
+        raise ValueError('Format 3 完整导出需要至少一个 EFF Mesh。')
     if not source_baseline:
         source_baseline = getattr(bpy.context.scene, 'eiem_source_baseline', '')
     if bpy.context.mode != 'OBJECT':
         raise ValueError('请回到物体模式后导出')
-    if resource_scope == 'PHYSICS':
-        physics_objects=list(physics_objects or selected_eiem_physics())
-        if not physics_objects:
-            raise ValueError('EFF Physics export requires a selected physics group')
-        packages={str(group.eiem_physics.rig.get('eiem_author_package','')).strip()
-                  for group in physics_objects if group.eiem_physics.rig}
-        packages.discard('')
-        if len(packages)>1:
-            raise ValueError('Selected Physics Rigs come from different unpacked source packages')
-        if packages:
-            rig_package=Path(next(iter(packages))).resolve()
-            if source_baseline and Path(source_baseline).resolve()!=rig_package:
-                raise ValueError('Source directory does not match the selected Physics Rig')
-            source_baseline=str(rig_package)
-        elif not source_baseline:
-            raise ValueError('Physics Rig must identify one unpacked source package')
-        game_directory=export_game_directory(root,game_directory)
-        bpy.context.view_layer.update()
-        return native_export.export_native_package(
-            sys.modules[__name__],root,[],armatures=[],physics_objects=physics_objects,
-            mesh_only=False,lod_levels=None,include_switches=include_switches,
-            source_baseline=source_baseline,resource_scope='PHYSICS',
-            game_directory=game_directory,effect_roots=[])
-    if not mesh_objects:
-        if resource_scope!='ALL':raise ValueError('仅选择特效时请使用全部资源导出')
-        prefs=_addon_preferences(bpy.context)
-        return effect_editor.ExportBatch(effect_roots or (),root,game_directory or (prefs.game_directory if prefs else '')).run()
-    game_directory = export_game_directory(root, game_directory)
     # Consume user edits before looking up the snapshot cache. Updates produced
     # by triangulation/tangent evaluation are consumed while suppressed so they
     # do not turn an unchanged second export into a false miss.
@@ -3163,26 +3031,20 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
         result = native_export.export_native_package(
             sys.modules[__name__], root, list(mesh_objects or []),
             armatures=list(armatures or []), physics_objects=list(physics_objects or []),
-            mesh_only=mesh_only, lod_levels=lod_levels,
+            lod_levels=lod_levels,
             include_switches=include_switches, source_baseline=source_baseline,
-            resource_scope=resource_scope, game_directory=game_directory,
             effect_roots=effect_roots)
         costs=result.get('exportCostsMs',{})
-        if result.get('format') == 3:
-            detail=result.get('exportDetailMs',{})
-            print('[EFF] Format 3 冷导出：总计 %.2fs / Blender 作者阶段 %.2fs / Format 3 生成与校验 %.2fs / 发布 %.2fs；网格缓存 %d 命中 / %d 重建'%(
-                result.get('exportSeconds',0),costs.get('author',0)/1000,
-                costs.get('format3',0)/1000,costs.get('publish',0)/1000,
-                result.get('meshSnapshotHits',0),result.get('meshSnapshotMisses',0)))
-            print('[EFF] Blender 阶段细分：网格快照 %.2fs / 材质与贴图收集 %.2fs / 网格编码 %.2fs / 特效收集 %.2fs / 写作者目录 %.2fs / 特效作者数据 %.2fs'%(
-                detail.get('meshSnapshot',0)/1000,detail.get('materialTexture',0)/1000,
-                detail.get('meshEncoding',0)/1000,detail.get('effect',0)/1000,
-                detail.get('writeAuthor',0)/1000,detail.get('effectAuthor',0)/1000))
-            print('[EFF] 原生 writer：%s' % result.get('format3Writer','未提供'))
-        else:
-            print('[EFF] 导出耗时：整理 %.2fs / 编译 %.2fs / 发布 %.2fs；网格缓存 %d 命中 / %d 重建'%(
-                costs.get('author',0)/1000,costs.get('compile',0)/1000,costs.get('publish',0)/1000,
-                result.get('meshSnapshotHits',0),result.get('meshSnapshotMisses',0)))
+        detail=result.get('exportDetailMs',{})
+        print('[EFF] Format 3 冷导出：总计 %.2fs / Blender 作者阶段 %.2fs / Format 3 生成与校验 %.2fs / 发布 %.2fs；网格缓存 %d 命中 / %d 重建'%(
+            result.get('exportSeconds',0),costs.get('author',0)/1000,
+            costs.get('format3',0)/1000,costs.get('publish',0)/1000,
+            result.get('meshSnapshotHits',0),result.get('meshSnapshotMisses',0)))
+        print('[EFF] Blender 阶段细分：网格快照 %.2fs / 材质与贴图收集 %.2fs / 网格编码 %.2fs / 特效收集 %.2fs / 写作者目录 %.2fs / 特效作者数据 %.2fs'%(
+            detail.get('meshSnapshot',0)/1000,detail.get('materialTexture',0)/1000,
+            detail.get('meshEncoding',0)/1000,detail.get('effect',0)/1000,
+            detail.get('writeAuthor',0)/1000,detail.get('effectAuthor',0)/1000))
+        print('[EFF] 原生 writer：%s' % result.get('format3Writer','未提供'))
         return result
     finally:
         try:
@@ -3193,11 +3055,11 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
 
 
 def export_visible_package(root, context=None):
-    """Export the current visible EFF mesh view using format 2."""
+    """Export the current visible EFF mesh view as one complete Format 3 Mod."""
     meshes = visible_eiem_resources(context)
     if not meshes:
         raise ValueError('No visible EFF mesh objects found')
-    return export_package(root, meshes, [], [], mesh_only=True)
+    return export_package(root, meshes, [], [], include_switches=False)
 
 
 EFF_INTERNAL_MATERIAL_PROPERTIES = {
@@ -3238,9 +3100,9 @@ def draw_eiem_rna_property(layout, owner, key, label, factor=0.24):
 
 class EFF_OT_import_material(ImportHelper, bpy.types.Operator):
     bl_idname = "eiem.import_material"
-    bl_label = '导入 EFF 材质'
+    bl_label = '导入 Format 3 材质'
     bl_options = {"REGISTER", "UNDO"}
-    filter_glob: StringProperty(default="*.mat", options={"HIDDEN"})
+    filter_glob: StringProperty(default="*.effres", options={"HIDDEN"})
 
     def execute(self, context):
         try:
@@ -4373,18 +4235,7 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
     filename_ext = ""
     directory: StringProperty(subtype="DIR_PATH")
     scope_message: StringProperty(options={"HIDDEN"})
-    effect_only: BoolProperty(options={'HIDDEN'})
-    physics_only: BoolProperty(options={'HIDDEN'})
     package_directory: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
-    _effect_job=None
-    _timer=None
-    resource_scope: EnumProperty(
-        name='导出资源', default='ALL',
-        items=(('ALL', '全部资源', '导出所选 EFF 网格，以及引用材质、贴图、挂载特效和物理依赖'),
-               ('MESH', '仅 Mesh', '更新已有 Mod 中所选网格的几何、骨骼、形态和形态动画'),
-               ('MATERIALS', '仅材质与贴图', '更新所选网格引用的材质、贴图及 INI 声明'),
-               ('TEXTURES', '仅贴图', '读取最新图片，更新贴图及绑定声明'),
-               ('PHYSICS', '仅物理', '只更新选中 Rig 的物理资源，保留 Mesh、材质和贴图')))
     include_switches: BoolProperty(
         name='导出按键切换', default=True,
         description="导出款式切换及快捷键；取消后只导出默认款式，保留形态键与滑块控制")
@@ -4403,111 +4254,57 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
         # A normal picker must also clear overrides remembered by older sessions.
         self.package_directory = ''
         try:
-            (meshes, _, effects, physics, self.effect_only, self.physics_only,
-             self.resource_scope) = export_scope_resources(context, self.resource_scope)
-            plan = plan_mesh_only_export(meshes) if meshes else dict(objects=[],hidden=[],sources=[])
-            levels = self._lod_levels(meshes) if meshes else []
-            scope_label = '所选'
-            self.scope_message = "%s %d 个网格 / %d 个物理组 / 隐藏 %d 个 / %d 个源资源 / %d 个切换组" % (
-                scope_label, len(plan["objects"]), len(physics), len(plan["hidden"]),
-                len(plan["sources"]), sum(
-                    bool(set(switch_members(group)) & set(meshes))
-                    for group in switch_groups(context.scene)))
+            meshes, _, effects, physics = selected_export_resources(context)
+            levels = self._lod_levels(meshes)
+            self.scope_message = "所选 %d 个网格 / %d 个物理组" % (len(meshes), len(physics))
             self.scope_message += " / LOD: " + (
                 ",".join(str(level) for level in levels) or "无")
             self.scope_message += ' / %d 个特效'%len(effects)
         except ValueError as error:
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
-        prefill_export_game_directory(context, self.directory or self.filepath)
         previous=getattr(context.scene,'eiem_export_last_directory','')
         if previous and not self.filepath:self.filepath=previous
         return ExportHelper.invoke(self, context, event)
 
     def draw(self, context):
         self.layout.label(text=self.scope_message)
-        draw_export_game_directory(self.layout, context)
         self.layout.prop(context.scene, "eiem_export_mod_name", text='Mod 文件夹名')
-        if self.effect_only:
-            self.layout.label(text='仅导出所选特效及其引用资源')
-            self.layout.label(text='已有角色包：追加 / 更新所选特效，保留角色与其他特效')
-        elif self.physics_only:
-            self.layout.label(text='仅更新选中 Rig 的全部新建物理组')
-            self.layout.label(text='保留目标 Mod 的其他资源')
-            self.layout.prop(context.scene, "eiem_source_baseline", text='原生来源目录')
-        else:
-            self.layout.prop(context.scene, "eiem_source_baseline", text='原生来源目录')
-            self.layout.prop(self, "resource_scope")
-        if not self.effect_only and self.resource_scope == 'ALL':
-            self.layout.prop(self, "include_switches")
-            draw_lod_options(self.layout, self)
+        self.layout.prop(context.scene, "eiem_source_baseline", text='原生来源目录')
+        self.layout.prop(self, "include_switches")
+        draw_lod_options(self.layout, self)
 
     def execute(self, context):
         try:
-            (meshes, rigs, effects, physics, self.effect_only, self.physics_only,
-             self.resource_scope) = export_scope_resources(context, self.resource_scope)
+            meshes, rigs, effects, physics = selected_export_resources(context)
             destination=(Path(self.package_directory).resolve() if self.package_directory else
                 mod_export_directory(self.directory or os.path.dirname(self.filepath),
                     self.filepath,context.scene.eiem_export_mod_name))
             self._destination=str(destination)
-            if self.effect_only:
-                prefs=_addon_preferences(context)
-                self._effect_job=effect_editor.ExportBatch(effects,destination,prefs.game_directory if prefs else '')
-                if bpy.app.background:
-                    stats=self._effect_job.run();self._finish(context,stats);return {'FINISHED'}
-                if self._effect_job.poll():
-                    self._finish(context,self._effect_job.stats);return {'FINISHED'}
-                self._timer=context.window_manager.event_timer_add(.1,window=context.window)
-                context.window_manager.modal_handler_add(self)
-                return {'RUNNING_MODAL'}
-            levels = self._lod_levels(meshes) if self.resource_scope == 'ALL' else None
+            levels = self._lod_levels(meshes)
             stats = export_package(
                 destination,
                 mesh_objects=meshes,
                 armatures=rigs,
-                physics_objects=physics if self.resource_scope in ('ALL','PHYSICS') else [],
+                physics_objects=physics,
                 lod_levels=levels, include_switches=self.include_switches,
                 source_baseline=context.scene.eiem_source_baseline,
-                resource_scope=self.resource_scope,effect_roots=effects)
+                effect_roots=effects)
             self._finish(context,stats)
             return {'FINISHED'}
         except Exception as error:
-            self._cleanup(context)
             self.report({'ERROR'}, str(error)); return {'CANCELLED'}
-
-    def modal(self,context,event):
-        if event.type=='ESC':self._cleanup(context);return {'CANCELLED'}
-        if event.type!='TIMER':return {'PASS_THROUGH'}
-        try:
-            if not self._effect_job.poll():return {'PASS_THROUGH'}
-            self._finish(context,self._effect_job.stats);return {'FINISHED'}
-        except Exception as error:
-            self._cleanup(context);self.report({'ERROR'},str(error));return {'CANCELLED'}
 
     def _finish(self,context,stats):
         context.scene.eiem_export_last_directory=self._destination
-        self._cleanup(context)
-        if stats.get('characterEffectUpdate'):
-            self.report({'INFO'},'已更新角色包中的 %d 个特效（%.2f 秒）'%(stats['effects'],stats['exportSeconds']))
-            return
-        if stats.get('resourceScope')=='PHYSICS':
-            self.report({'INFO'},'已更新 %d 个物理组 / %d 个骨架（%.2f 秒）'%(
-                stats.get('physics',0),stats.get('skeletons',0),stats['exportSeconds']))
-            return
         self.report({'INFO'},'已导出 %d 个 Mesh、%d 个材质、%d 张贴图、%d 个特效（%.2f 秒）'%(
             stats['meshes'],stats['materials'],stats['textures'],stats.get('effects',0),stats['exportSeconds']))
-
-    def _cleanup(self,context):
-        if self._timer:context.window_manager.event_timer_remove(self._timer);self._timer=None
-        if self._effect_job:self._effect_job.close();self._effect_job=None
-
-    def cancel(self,context):self._cleanup(context)
 
 
 class EFF_OT_export_update(bpy.types.Operator):
     bl_idname='eiem.export_update'
     bl_label='快速更新所选 Mod'
-    bl_description='按当前选择更新上次 Mod 目录；支持一个或多个特效，以及人物与特效一起导出'
+    bl_description='将当前选择完整导出并覆盖上次 Mod 目录'
 
     @classmethod
     def poll(cls,context):
@@ -4517,74 +4314,13 @@ class EFF_OT_export_update(bpy.types.Operator):
     def execute(self,context):
         destination=Path(bpy.path.abspath(context.scene.eiem_export_last_directory)).resolve()
         try:
-            meshes,_,effects=selected_export_resources(context)
-            physics=selected_eiem_physics(context)
+            selected_export_resources(context)
         except ValueError as error:
             self.report({'ERROR'},str(error))
             return {'CANCELLED'}
-        if not meshes and effects and physics:
-            self.report({'ERROR'},'请分别导出特效和 Physics')
-            return {'CANCELLED'}
-        scope='PHYSICS' if not meshes and not effects and physics else 'ALL'
         result=bpy.ops.eiem.export_package('EXEC_DEFAULT',directory=str(destination.parent),
-            filepath=str(destination),package_directory=str(destination),resource_scope=scope)
-        return {'FINISHED'} if result=={'RUNNING_MODAL'} else result
-
-
-class EFF_OT_export_mesh_only(ExportHelper, bpy.types.Operator):
-    """Update Mesh resources in an existing complete Mod."""
-    bl_idname = "eiem.export_mesh_only"
-    bl_label = "Export Mesh Only"
-    filename_ext = ""
-    directory: StringProperty(subtype="DIR_PATH")
-    scope_message: StringProperty(options={"HIDDEN"})
-    lod_all: BoolProperty(name='导出已发现的全部 LOD', default=True)
-    lod0: BoolProperty(name="LOD0", default=True)
-    lod1: BoolProperty(name="LOD1", default=False)
-    lod2: BoolProperty(name="LOD2", default=False)
-    lod3: BoolProperty(name="LOD3", default=False)
-    lod4: BoolProperty(name="LOD4", default=False)
-
-    def _lod_levels(self, meshes):
-        return operator_lod_levels(self, meshes)
-
-    def invoke(self, context, event):
-        try:
-            meshes, _ = selected_eiem_resources(context)
-            self.scope_message = "LOD: " + ",".join(
-                str(level) for level in self._lod_levels(meshes))
-        except ValueError as error:
-            self.report({'ERROR'}, str(error))
-            return {'CANCELLED'}
-        prefill_export_game_directory(context, self.directory or self.filepath)
-        return ExportHelper.invoke(self, context, event)
-
-    def execute(self, context):
-        try:
-            meshes, _ = selected_eiem_resources(context)
-            levels = self._lod_levels(meshes)
-            stats = export_package(
-                mod_export_directory(
-                    self.directory or os.path.dirname(self.filepath), self.filepath,
-                    context.scene.eiem_export_mod_name),
-                mesh_objects=meshes, armatures=[], physics_objects=[],
-                resource_scope='MESH', lod_levels=levels,
-                source_baseline=context.scene.eiem_source_baseline)
-            self.report(
-                {'INFO'},
-                "已导出 %(meshes)d 个 Mesh、%(materials)d 个材质、"
-                "%(textures)d 张贴图（%(exportSeconds).1f 秒）" % stats)
-            return {'FINISHED'}
-        except Exception as error:
-            self.report({'ERROR'}, str(error)); return {'CANCELLED'}
-
-    def draw(self, context):
-        if self.scope_message:
-            self.layout.label(text=self.scope_message)
-        draw_export_game_directory(self.layout, context)
-        self.layout.prop(context.scene, "eiem_export_mod_name", text='Mod 文件夹名')
-        self.layout.prop(context.scene, "eiem_source_baseline", text='原生来源目录')
-        draw_lod_options(self.layout, self)
+            filepath=str(destination),package_directory=str(destination))
+        return result
 
 
 _update_state = {"status": "idle", "tag": "", "url": "", "message": ""}
@@ -4597,90 +4333,6 @@ def _addon_preferences(context):
     name = (__package__ or __name__).split(".")[0]
     addon = context.preferences.addons.get(name)
     return addon.preferences if addon else None
-
-
-def game_directory_changed(self, context):
-    if not bpy.app.background:
-        # This is an installation preference, not part of the author's .blend.
-        # Keep it even when Blender's automatic preference saving is disabled.
-        try:
-            bpy.ops.wm.save_userpref()
-        except RuntimeError:
-            pass
-
-
-def export_game_directory(destination, configured=''):
-    prefs = _addon_preferences(bpy.context)
-    selected = configured or (prefs.game_directory if prefs else '')
-    game = offline_reload.resolve_game_directory(
-        destination, bpy.path.abspath(selected) if selected else '')
-    if prefs and prefs.game_directory != str(game):
-        prefs.game_directory = str(game)
-    return str(game)
-
-
-def prefill_export_game_directory(context, destination):
-    prefs = _addon_preferences(context)
-    if prefs and not prefs.game_directory:
-        try:
-            export_game_directory(destination or Path.cwd())
-        except (OSError, ValueError):
-            # Keep the picker available for missing or ambiguous installations.
-            pass
-
-
-def draw_export_game_directory(layout, context):
-    prefs = _addon_preferences(context)
-    if prefs is None:
-        return
-    box = layout.box()
-    row = box.row(align=True)
-    row.prop(prefs, 'game_directory', text='游戏目录')
-    row.operator('eiem.detect_game_directory', text='', icon='VIEWZOOM')
-    box.label(text='选择一次即可记住；Mod 可导出到任意文件夹')
-
-
-def game_installation_items(self, context):
-    return getattr(self, '_game_items', [])
-
-
-class EFF_OT_detect_game_directory(bpy.types.Operator):
-    bl_idname = 'eiem.detect_game_directory'
-    bl_label = '自动识别游戏目录'
-    bl_description = '从本机安装记录、修复工具设置和常见启动器目录查找终末地'
-    installation: EnumProperty(name='游戏安装', items=game_installation_items)
-
-    def invoke(self, context, event):
-        games = offline_reload.discover_game_directories()
-        if len(games) > 1:
-            self._game_items = [(str(index), str(game), '') for index, game in enumerate(games)]
-            self.installation = '0'
-            return context.window_manager.invoke_props_dialog(self, width=650)
-        return self.execute(context)
-
-    def draw(self, context):
-        self.layout.label(text='发现多份游戏安装，请选择用于本次导出的资源：')
-        self.layout.prop(self, 'installation', text='游戏目录')
-
-    def execute(self, context):
-        try:
-            items = getattr(self, '_game_items', [])
-            selected = items[int(self.installation)][1] if items else ''
-            game = offline_reload.resolve_game_directory(configured=selected) if selected else None
-            if game is None:
-                games = offline_reload.discover_game_directories()
-                if len(games) != 1:
-                    raise ValueError('未能唯一识别游戏目录，请点击路径旁的文件夹按钮选择安装目录')
-                game = games[0]
-            prefs = _addon_preferences(context)
-            if prefs is None:
-                raise ValueError('请先在偏好设置中启用 EFF 插件')
-            prefs.game_directory = str(game)
-            self.report({'INFO'}, '游戏目录：' + str(game))
-            return {'FINISHED'}
-        except (OSError, ValueError, IndexError) as error:
-            self.report({'ERROR'}, str(error))
-            return {'CANCELLED'}
 
 
 class EFF_OT_choose_resource_root(bpy.types.Operator):
@@ -4761,12 +4413,7 @@ class EFF_AddonPreferences(bpy.types.AddonPreferences):
     update_channel: EnumProperty(name='更新来源', items=(
         ('MAIN', '仓库更新（自动测试）', '跟踪 main 的已通过测试完整更新包，无需作者逐次发布版本'),
         ('RELEASE', '正式 Release', '只提示正式发布版本，手动下载安装')), default='MAIN')
-    game_directory: StringProperty(
-        name='游戏目录', subtype='DIR_PATH', default='', update=game_directory_changed,
-        description='终末地安装目录（包含 Endfield.exe）；独立于 Mod 导出位置，留空自动识别')
-
     def draw(self, context):
-        draw_export_game_directory(self.layout, context)
         draw_update_status(self.layout)
 
 
@@ -4887,14 +4534,12 @@ def menu_import(self, context):
 def menu_export(self, context):
     self.layout.operator(EFF_OT_export.bl_idname, text="EFF Mod 包")
     self.layout.operator(EFF_OT_export_update.bl_idname, text='EFF 快速更新所选 Mod')
-    self.layout.operator(EFF_OT_export_mesh_only.bl_idname, text='EFF 更新 Mesh')
 
 
 classes = (
     EFF_AddonPreferences,
     EFF_OT_choose_resource_root,
     EFF_OT_prepare_shared_tools,
-    EFF_OT_detect_game_directory,
     EFF_OT_check_update,
     EFF_OT_install_update,
     EFF_OT_open_update_release,
@@ -4926,7 +4571,6 @@ classes = (
     EFF_OT_import,
     EFF_OT_import_animation,
     EFF_OT_export,
-    EFF_OT_export_mesh_only,
     EFF_OT_export_update,
     EFF_PT_material_properties,
     EFF_PT_mesh_properties,

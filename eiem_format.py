@@ -159,34 +159,6 @@ def parse_ini(root):
     return parser
 
 
-def parse_material_resources(root):
-    """Read static declarations, not the Mod's executable Render/Key bodies."""
-    lines, include = [], False
-    with open(Path(root) / "mod.ini", "r", encoding="utf-8-sig") as stream:
-        for line in stream:
-            stripped = line.strip()
-            if stripped.startswith("[") and stripped.endswith("]"):
-                include = stripped[1:-1].lower().startswith(("material", "texture"))
-            if include:
-                lines.append(line)
-    parser = configparser.ConfigParser(interpolation=None)
-    parser.optionxform = str
-    parser.read_string("".join(lines))
-    return {s: dict(parser.items(s)) for s in parser.sections()}
-
-
-def read_flat_properties(path):
-    values = {}
-    with open(path, "r", encoding="utf-8-sig") as stream:
-        for line in stream:
-            line = line.strip()
-            if not line or line.startswith((";", "#")) or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            values[key.strip()] = value.strip()
-    return values
-
-
 def safe_path(root, relative):
     path = (Path(root) / relative).resolve()
     root = Path(root).resolve()
@@ -520,15 +492,13 @@ def read_format3_physics_resource(path, expected_id=None, expected_file=None):
             raise ValueError("format-3 Physics payload declarations differ")
         if expected_id is not None and resource_id != expected_id:
             raise ValueError("format-3 Physics resource ID differs from mod.ini")
-        if expected_file is not None and resource_file != expected_file:
-            raise ValueError("format-3 Physics resource path differs from mod.ini")
         native = stream.read(native_bytes)
         author = stream.read(author_bytes)
         if (len(native) != native_bytes or hashlib.sha256(native).hexdigest().upper() != native_hash or
                 len(author) != author_bytes or hashlib.sha256(author).hexdigest().upper() != author_hash):
             raise ValueError("format-3 Physics native/author checksum differs")
     document, skeleton = decode_format3_physics_snapshot(author)
-    return {"id": resource_id, "file": resource_file, "targets": targets,
+    return {"id": resource_id, "file": expected_file or resource_file, "targets": targets,
             "document": document, "skeleton": skeleton}
 
 
@@ -653,14 +623,12 @@ def read_format3_effect_author_resource(path, expected_id=None, expected_file=No
         resource_id, resource_file, author_bytes, author_hash = _author_effect_metadata(metadata)
         if expected_id is not None and resource_id != expected_id:
             raise ValueError("format-3 Effect author resource ID differs from mod.ini")
-        if expected_file is not None and resource_file != expected_file:
-            raise ValueError("format-3 Effect author resource path differs from mod.ini")
         author = stream.read(payload_bytes)
         if (len(author) != payload_bytes or payload_bytes != author_bytes or
                 hashlib.sha256(author).hexdigest().upper() != author_hash):
             raise ValueError("format-3 Effect author payload checksum/extent differs")
     result = decode_format3_effect_snapshot(author)
-    result.update(id=resource_id, file=resource_file)
+    result.update(id=resource_id, file=expected_file or resource_file)
     return result
 
 

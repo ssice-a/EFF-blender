@@ -23,46 +23,29 @@ spec.loader.exec_module(addon)
 addon.register()
 
 
-def hierarchy_key(payload):
-    return tuple(
-        (path, parent, tuple(position), tuple(rotation), tuple(scale))
-        for path, parent, position, rotation, scale in payload["nodes"]
-    )
-
-
 parser = configparser.ConfigParser(interpolation=None, strict=False)
 parser.optionxform = str
 with (package / "mod.ini").open("r", encoding="utf-8-sig") as stream:
     parser.read_file(stream)
 
 mesh_payloads = {}
-skeleton_keys = set()
 material_values = {}
 texture_values = {}
-prefab_values = {}
 for section in parser.sections():
     values = parser[section]
     if section.lower().startswith("mesh") and values.get("path"):
-        mesh_payloads[section] = addon.read_mesh(addon.safe_path(package, values["path"]))
-    elif section.lower().startswith("skeleton") and values.get("path"):
-        payload = addon.read_skeleton(addon.safe_path(package, values["path"]))
-        skeleton_keys.add(hierarchy_key(payload))
-    elif section.lower().startswith("material") and values.get("path"):
-        material_values[section] = addon.read_flat_properties(
+        mesh_payloads[section] = addon.format_io.read_format3_mesh_resource(
             addon.safe_path(package, values["path"]))
-    elif section.lower().startswith("texture") and values.get("path"):
+    elif section.lower().startswith("material") and values.get("path"):
+        material_values[section] = addon.format_io.read_format3_material_resource(
+            addon.safe_path(package, values["path"]), section, values["path"])
+    elif section.lower().startswith("texture") and values.get("dds"):
         texture_values[section] = dict(values)
-    elif section.lower().startswith("prefab") and values.get("path"):
-        prefab_values[section] = dict(values)
 
 addon.import_package(package, clean=True)
 collection = bpy.data.collections["EFF"]
 objects = list(collection.all_objects)
 armatures = [obj for obj in objects if obj.type == "ARMATURE"]
-assert len(armatures) == len(skeleton_keys), (
-    f"resource import created {len(armatures)} armatures for "
-    f"{len(skeleton_keys)} unique skeleton hierarchies"
-)
 assert len([item for item in bpy.data.materials if item.get("eiem_section")]) == len(material_values)
 assert len([item for item in bpy.data.images if item.get("eiem_section")]) == len(texture_values)
 for section, values in material_values.items():
@@ -72,7 +55,7 @@ for section, values in material_values.items():
         if key.startswith("texture."):
             image = next(
                 item for item in bpy.data.images
-                if item.get("eiem_section") == value
+            if item.get("eiem_section") == value
             )
             assert material.get("eiem_" + key) == addon.image_absolute_path(image), (
                 section, key
@@ -139,12 +122,10 @@ roundtrip.optionxform = str
 with (output / "mod.ini").open("r", encoding="utf-8-sig") as stream:
     roundtrip.read_file(stream)
 
-assert sum(name.lower().startswith("skeleton") for name in roundtrip.sections()) == len(skeleton_keys)
-assert sum(name.lower().startswith("prefab") for name in roundtrip.sections()) == 0
-# An untouched imported material inherits the game's original resource. The
-# incremental package therefore contains no redundant .mat or Texture copies.
-assert sum(name.lower().startswith("material") for name in roundtrip.sections()) == 0
-assert sum(name.lower().startswith("texture") for name in roundtrip.sections()) == 0
+assert roundtrip.get("Mod", "format") == "3"
+assert not list(output.rglob("*.mat"))
+assert not list(output.rglob("*.mesh"))
+assert not list(output.rglob("*.png"))
 
 
 def assert_close(actual, expected, section, channel, tolerance=2.0e-5):
@@ -154,8 +135,13 @@ def assert_close(actual, expected, section, channel, tolerance=2.0e-5):
         assert error <= tolerance, (section, channel, error)
 
 
+roundtrip_meshes = {}
+for section, values in roundtrip.items():
+    if section.lower().startswith("mesh") and values.get("path"):
+        payload = addon.format_io.read_format3_mesh_resource(addon.safe_path(output, values["path"]))
+        roundtrip_meshes[payload["part"]] = payload
 for section, source in mesh_payloads.items():
-    target = addon.read_mesh(addon.safe_path(output, roundtrip[section]["path"]))
+    target = roundtrip_meshes[source["part"]]
     assert_close(target["vertices"], source["vertices"], section, "vertices")
     assert_close(target["normals"], source["normals"], section, "normals")
     assert_close(target["tangents"], source["tangents"], section, "tangents")
@@ -266,6 +252,6 @@ bpy.data.objects.remove(probe_object, do_unlink=True)
 
 print(
     f"EFF round trip OK: meshes={len(mesh_payloads)} "
-    f"skeleton_resources={len(skeleton_keys)} materials={len(material_values)} "
+    f"armatures={len(armatures)} materials={len(material_values)} "
     f"textures={len(texture_values)}"
 )

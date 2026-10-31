@@ -1,17 +1,24 @@
 """Neutral, factory-startup authoring/material test. No user scene or files."""
 import importlib.util
+import hashlib
 import json
 import re
+import struct
 import sys
 from pathlib import Path
 import bpy
 
 addon_path, output = map(Path, sys.argv[sys.argv.index("--") + 1:])
-spec = importlib.util.spec_from_file_location("eiem_author_test", addon_path)
-addon = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = addon
-spec.loader.exec_module(addon)
-addon.register()
+output.mkdir(parents=True, exist_ok=True)
+sys.path.insert(0, str(addon_path.resolve().parent))
+spec = importlib.util.spec_from_file_location(
+    "eiem_author_test", addon_path.resolve().parent / "__init__.py",
+    submodule_search_locations=[str(addon_path.resolve().parent)])
+addon_package = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = addon_package
+spec.loader.exec_module(addon_package)
+addon = addon_package.eiem_blender_addon
+addon_package.register()
 mesh = bpy.data.meshes.new("TestMesh")
 mesh.from_pydata([(0,0,0),(1,0,0),(0,1,0)], [], [(0,1,2)])
 mesh["eiem_section"] = "MeshBody"
@@ -33,9 +40,6 @@ declarations, bindings, hotkeys = addon.plan_shape_controls([obj])
 assert len(declarations)==1 and "shape.Inflate=" in bindings[obj][0]
 assert not any("Blink" in x for x in bindings[obj])
 variable = declarations[0][0]
-addon.export_package(output/"no-ui",[obj],[])
-ini = (output/"no-ui/mod.ini").read_text(encoding="utf-8")
-assert "persist " + variable in ini and "[UIMod]" not in ini
 added.value=.6
 assert abs(addon.plan_shape_controls([obj])[0][0][2]-.6)<1e-6
 # An unrelated key/resource cannot shift existing variable identities.
@@ -65,59 +69,79 @@ assert first["eiem_state_value"] == old_values[0]
 new=addon.add_switch_state(group,"Extra")
 assert max(addon.switch_state_values(group))>max(old_values)
 
-def package(name):
-    root=output/name;(root/"materials").mkdir(parents=True);(root/"textures").mkdir()
-    image=bpy.data.images.new("Fixture",width=2,height=2)
-    # Distinct resources need distinct pixels. Byte-identical imports are
-    # intentionally inherited from the native material by the exporter.
-    color=(1.0,0.0,0.0,1.0) if name=="role-a" else (0.0,0.0,1.0,1.0)
-    image.pixels[:]=list(color)*4
-    image.filepath_raw=str(root/"textures/shared.png");image.file_format="PNG";image.save()
-    bpy.data.images.remove(image)
-    (root/"mod.ini").write_text("[MaterialSame]\npath=materials/shared.mat\n[TextureSame]\npath=textures/shared.png\nlinear=true\n",encoding="utf-8")
-    (root/"materials/shared.mat").write_text("format=EFFMAT\nversion=1\nsource=assets/test/"+name+".mat\nshader=TestShader\nfloat._Gloss=.4\ntexture._BaseMap=TextureSame\n",encoding="utf-8")
-    return root/"materials/shared.mat"
+def _dds_rgba():
+    header = struct.pack('<7I', 124, 0x100F, 2, 2, 8, 0, 0)
+    header += bytes(44)
+    header += struct.pack('<8I', 32, 0x41, 0, 32,
+                          0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000)
+    header += struct.pack('<5I', 0x1000, 0, 0, 0, 0)
+    return b'DDS ' + header + bytes((255, 0, 0, 255)) * 4
 
-a=package("role-a");b=package("role-b")
+
+def _string(value):
+    encoded = value.encode('utf-8')
+    return struct.pack('<Q', len(encoded)) + encoded
+
+
+def _effres(kind, metadata, payload):
+    header = struct.pack('<16sIIQQ32s', b'EFF_AUTHOR_FILE3', 3, kind,
+                         len(metadata), len(payload), hashlib.sha256(metadata).digest())
+    return header + metadata + payload
+
+
+def make_package(name, texture_id="TextureSame"):
+    root=output/name;(root/"materials").mkdir(parents=True);(root/"textures").mkdir()
+    material_path = "materials/shared.effres"
+    texture_path = "textures/TextureSame.effres"
+    dds_path = "textures/shared.dds"
+    source = "assets/test/" + name + ".mat"
+    author = ("format=EFFMAT\nversion=1\noverrides=true\nsource=" + source +
+              "\nshader=TestShader\nfloat._Gloss=.4\ntexture._BaseMap=" +
+              texture_id + "\n").encode("utf-8")
+    metadata = b''.join((_string("EFF_AUTHOR_MATERIAL_EDITS/1"), _string("MaterialSame"),
+                         _string(material_path), _string(source), _string("MaterialSource"),
+                         struct.pack('<Q', len(author)), _string(hashlib.sha256(author).hexdigest().upper())))
+    (root/material_path).write_bytes(_effres(2, metadata, author))
+    (root/texture_path).write_bytes(_effres(3, b"", b"native Texture2D scaffold"))
+    (root/dds_path).write_bytes(_dds_rgba())
+    ini = ("[Mod]\nformat=3\nid=" + name + "\n\n[MaterialSame]\npath=" + material_path +
+           "\nsource.path=" + source + "\nsource.asset=MaterialSource\ntexture._BaseMap=" +
+           texture_id + "\n\n[TextureSame]\npath=" + texture_path + "\ndds=" +
+           dds_path + "\nlinear=true\n")
+    (root/"mod.ini").write_text(ini, encoding="utf-8")
+    return root/material_path
+
+a=make_package("role-a");b=make_package("role-b")
 ma=addon.import_material_file(a,obj);old=dict(ma.items())
 mb=addon.import_material_file(b,obj)
 assert ma!=mb and obj.active_material==mb and dict(ma.items())==old
 assert ma["eiem_source"]!=mb["eiem_source"] and ma["eiem_texture._BaseMap"]!=mb["eiem_texture._BaseMap"]
 assert mb["eiem_shader"]=="TestShader" and mb["eiem_float._Gloss"]==".4"
 # Unknown formats and missing references leave existing slot and data untouched.
-before=(len(bpy.data.materials),len(bpy.data.images));broken=output/"broken.mat"
-for text in ("%YAML 1.1\n", "format=EFFMAT\nversion=1\nsource=assets/test/a.mat\ntexture._BaseMap=TextureMissing\n"):
-    broken.write_text(text,encoding="utf-8")
-    try: addon.import_material_file(broken,obj);raise AssertionError("bad import accepted")
-    except ValueError: pass
-    assert obj.active_material==mb and before==(len(bpy.data.materials),len(bpy.data.images))
+before=(len(bpy.data.materials),len(bpy.data.images));broken=output/"broken.effres"
+broken.write_bytes(b"not a Format 3 resource")
+try: addon.import_material_file(broken,obj);raise AssertionError("old/unknown resource accepted")
+except ValueError: pass
+assert obj.active_material==mb and before==(len(bpy.data.materials),len(bpy.data.images))
+missing_texture=make_package("missing-texture", "TextureMissing")
+try: addon.import_material_file(missing_texture,obj);raise AssertionError("missing DDS reference accepted")
+except ValueError: pass
+assert obj.active_material==mb and before==(len(bpy.data.materials),len(bpy.data.images))
 mb["eiem_float._Gloss"]=".7"
-addon.export_package(output/"material-mod",[obj],[])
-mat_path=next((output/"material-mod/materials").glob("*.mat"))
-text=mat_path.read_text(encoding="utf-8")
-assert "source=assets/test/role-b.mat" in text and "float._Gloss=.7" in text
-assert "texture._BaseMap=" not in text  # unchanged game texture inherited, not redundantly packaged
-# Reimport an authored delta: its existing overrides must not become a native baseline.
-delta=addon.import_material_file(mat_path,obj)
-payload, images=addon.material_override_payload(delta,{},True)
+payload, images=addon.material_override_payload(mb,{},True)
 assert "float._Gloss=.7" in payload
-# An explicitly changed texture is packaged once and remains an override when
-# reimporting the authored .mat, even if its new baseline has no texture key.
+# An explicitly changed texture remains an author override.
 mb["eiem_texture._BaseMap"] = ma["eiem_texture._BaseMap"]
 obj.active_material=mb
-addon.export_package(output/"texture-mod",[obj],[])
-mat_path=next((output/"texture-mod/materials").glob("*.mat"))
-assert len(list((output/"texture-mod/textures").glob("*.png")))==1
-delta=addon.import_material_file(mat_path,obj)
 by_section={str(i.get("eiem_section")):i for i in bpy.data.images if i.get("eiem_section")}
-payload,images=addon.material_override_payload(delta,by_section,True)
+payload,images=addon.material_override_payload(mb,by_section,True)
 assert any(v.startswith("texture._BaseMap=") for v in payload) and len(images)==1
 # A valid reference whose image decoding fails must also roll back allocation.
-bad_package=package("bad-image")
-(bad_package.parent.parent/"textures/shared.png").write_bytes(b"not a PNG")
+bad_package=make_package("bad-image")
+(bad_package.parent.parent/"textures/shared.dds").write_bytes(b"not a DDS")
 before=(len(bpy.data.materials),len(bpy.data.images));previous=obj.active_material
 try: addon.import_material_file(bad_package,obj);raise AssertionError("bad image accepted")
 except (RuntimeError,ValueError): pass
 assert obj.active_material==previous and before==(len(bpy.data.materials),len(bpy.data.images))
-addon.unregister()
+addon_package.unregister()
 print("EFF_AUTHOR_STATE_OK")

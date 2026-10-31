@@ -1,7 +1,6 @@
 """Blender author export through the shared nativepack writer.
 
-Full exports publish self-describing format-3 resources. Legacy partial exports
-remain isolated until format-3 import/readback is available.
+Exports publish the single supported self-describing Format 3 directory.
 """
 import configparser
 import base64
@@ -16,6 +15,7 @@ import re
 import shutil
 import stat
 import sys
+import struct
 import tempfile
 import time
 import types
@@ -42,64 +42,165 @@ _NATIVE_IMAGE_CACHE_BYTES = 128 * 1024 * 1024
 _FORMAT3_WRITER_LIBRARIES = {}
 
 
-class _AuthorTemplateView(ctypes.Structure):
-    _fields_ = [('kind', ctypes.c_wchar_p), ('path', ctypes.c_wchar_p),
-                ('asset', ctypes.c_wchar_p), ('cab', ctypes.c_wchar_p),
-                ('path_id', ctypes.c_int64), ('file', ctypes.c_wchar_p),
-                ('sha256', ctypes.c_wchar_p)]
+class _TypedAuthorWriter:
+    def __init__(self):
+        self.data = bytearray()
+
+    def integer(self, value):
+        self.data.extend(int(value).to_bytes(8, 'little', signed=False))
+
+    def signed_integer(self, value):
+        self.data.extend(int(value).to_bytes(8, 'little', signed=True))
+
+    def number(self, value):
+        self.data.extend(struct.pack('<d', float(value)))
+
+    def string(self, value):
+        encoded = str(value).encode('utf-8', 'strict')
+        self.integer(len(encoded))
+        self.data.extend(encoded)
+
+    def blob(self, value):
+        value = bytes(value)
+        self.integer(len(value))
+        self.data.extend(value)
+
+    def strings(self, values):
+        values = list(values)
+        self.integer(len(values))
+        for value in values:
+            self.string(value)
 
 
-class _AuthorInputFileView(ctypes.Structure):
-    _fields_ = [('path', ctypes.c_wchar_p), ('data', ctypes.c_void_p),
-                ('size', ctypes.c_size_t)]
+def _typed_author_input(mod_id, templates, meshes, textures):
+    writer = _TypedAuthorWriter()
+    writer.string('EFF_AUTHOR_TYPED_INPUT/1')
+    writer.string(mod_id)
+    template_indices = {}
+    writer.integer(len(templates))
+    for index, row in enumerate(templates):
+        key = (row['kind'], row['path'], row['asset'])
+        template_indices[key] = index
+        for value in (row['kind'], row['path'], row['asset'], row['cab']):
+            writer.string(value)
+        writer.signed_integer(row['pathId'])
+        writer.string(row['file'])
+        writer.string(row['sha256'])
+    writer.integer(len(meshes))
+    for row in meshes:
+        for value in (row['partId'], row['meshId'], row['path'], row['material'],
+                      row['targetPath'], row['targetAsset']):
+            writer.string(value)
+        index = template_indices.get(('Mesh', row['targetPath'], row['targetAsset']))
+        if index is None:
+            raise ValueError('Format 3 Mesh template is not declared: ' + row['targetPath'] + ' / ' + row['targetAsset'])
+        writer.integer(index)
+        writer.integer(row['vertices'])
+        writer.integer(row['indices'])
+        writer.strings(row['bonePaths'])
+        writer.strings(row['shapeNames'])
+        fields = row['fieldData']
+        writer.integer(len(fields))
+        for name in sorted(fields):
+            writer.string(name)
+            writer.blob(fields[name])
+        writer.blob(row['authorData'])
+    texture_templates = [index for index, row in enumerate(templates)
+                         if row['kind'] == 'Texture2D']
+    writer.integer(len(textures))
+    for row in textures:
+        writer.string(row['id'])
+        writer.string(row['path'])
+        if not texture_templates:
+            raise ValueError('Format 3 Texture2D template is absent')
+        writer.integer(texture_templates[0])
+    return bytes(writer.data)
 
 
-def write_format3_native_assets(library_path, ini_bytes, templates, resources,
-                                author_files, output_path):
+def write_format3_native_assets(library_path, mod_id, templates, meshes,
+                                textures, output_path):
+    output_path = Path(output_path).resolve()
+    if not output_path.is_dir() or not (output_path / 'mod.ini').is_file():
+        raise ValueError('Format 3 typed writer requires a prepared candidate directory')
+    manifest = configparser.ConfigParser(interpolation=None, delimiters=('=',), strict=True)
+    manifest.optionxform = str
+    with (output_path / 'mod.ini').open(encoding='utf-8-sig') as stream:
+        manifest.read_file(stream)
+    if (manifest.get('Mod', 'format', fallback='') != '3' or
+            manifest.get('Mod', 'id', fallback='') != mod_id):
+        raise ValueError('Format 3 typed writer candidate identity differs')
     path = str(Path(library_path).resolve())
     library = _FORMAT3_WRITER_LIBRARIES.get(path)
     if library is None:
         library = ctypes.CDLL(path)
         library.EFF_AuthorAssetsAbi.argtypes = []
         library.EFF_AuthorAssetsAbi.restype = ctypes.c_uint
-        library.EFF_AuthorAssets_ExportMemoryW.argtypes = [
+        library.EFF_AuthorAssets_ExportTypedW.argtypes = [
             ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t,
-            ctypes.POINTER(_AuthorTemplateView), ctypes.c_size_t,
-            ctypes.POINTER(_AuthorInputFileView), ctypes.c_size_t,
-            ctypes.POINTER(_AuthorInputFileView), ctypes.c_size_t,
             ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_size_t]
-        library.EFF_AuthorAssets_ExportMemoryW.restype = ctypes.c_int
+        library.EFF_AuthorAssets_ExportTypedW.restype = ctypes.c_int
         _FORMAT3_WRITER_LIBRARIES[path] = library
-    if library.EFF_AuthorAssetsAbi() != 2:
-        raise ValueError('Format 3 native author writer ABI is unsupported')
-    template_array = ((_AuthorTemplateView * len(templates))(
-        *(_AuthorTemplateView(row['kind'], row['path'], row['asset'], row['cab'],
-                              row['pathId'], row['file'], row['sha256'])
-          for row in templates)) if templates else None)
-
-    def file_array(files):
-        names = sorted(files)
-        buffers = [ctypes.c_char_p(files[name]) for name in names]
-        records = ((_AuthorInputFileView * len(names))(
-            *(_AuthorInputFileView(name, ctypes.cast(buffer, ctypes.c_void_p),
-                                   len(files[name]))
-              for name, buffer in zip(names, buffers))) if names else None)
-        return records, buffers
-
-    resource_array, resource_buffers = file_array(resources)
-    author_array, author_buffers = file_array(author_files)
-    ini_buffer = ctypes.c_char_p(ini_bytes)
+    if library.EFF_AuthorAssetsAbi() != 3:
+        raise ValueError('Format 3 typed author writer ABI is unsupported')
+    input_bytes = _typed_author_input(mod_id, templates, meshes, textures)
+    input_buffer = ctypes.c_char_p(input_bytes)
     response = ctypes.create_string_buffer(65536)
-    status = library.EFF_AuthorAssets_ExportMemoryW(
-        ctypes.cast(ini_buffer, ctypes.POINTER(ctypes.c_ubyte)), len(ini_bytes),
-        template_array, len(templates), resource_array, len(resources),
-        author_array, len(author_files), str(Path(output_path).resolve()),
-        response, len(response))
+    status = library.EFF_AuthorAssets_ExportTypedW(
+        ctypes.cast(input_buffer, ctypes.POINTER(ctypes.c_ubyte)), len(input_bytes),
+        str(output_path), response, len(response))
     message = response.value.decode('utf-8', 'replace')
-    _ = (resource_buffers, author_buffers)
     if status:
         raise ValueError(message or 'Format 3 native author DLL failed')
     return message
+
+
+def format3_native_records(format3, source, parts, textures, rules):
+    targets_by_part = {}
+    for rule in rules:
+        if rule['hidden']:
+            continue
+        for part_id in rule['parts']:
+            targets_by_part.setdefault(part_id, set()).update(
+                (target['sourcePath'], target['sourceAsset'])
+                for target in rule['targets'])
+
+    meshes = []
+    for part in parts:
+        part_id = part['partId']
+        targets = sorted(targets_by_part.get(part_id, ()))
+        if not targets:
+            raise ValueError('Format 3 Mesh Part has no declared target: ' + part_id)
+        typed_targets = []
+        for path, asset in targets:
+            template = source.resolve('Mesh', path, asset)
+            typed_targets.append((path, asset, template['native']['typeHash']))
+        expected_type = part['nativeTypeHash']
+        if any(type_hash != expected_type for _, _, type_hash in typed_targets):
+            raise ValueError('Format 3 Mesh Part is shared by incompatible native templates: ' + part_id)
+        target_path, target_asset, _ = typed_targets[0]
+        section = format3.part_resource_id(part_id)
+        meshes.append(dict(
+            partId=section,
+            meshId=format3.identifier('Mesh_' + section),
+            path='meshes/' + section + '.effres',
+            material=format3.identifier(part['material']),
+            targetPath=target_path,
+            targetAsset=target_asset,
+            vertices=part['vertices'],
+            indices=part['indices'],
+            bonePaths=part['bonePaths'],
+            shapeNames=part['shapeNames'],
+            fieldData=part['fieldData'],
+            authorData=part['authorData']))
+
+    textures_out = []
+    for texture in textures:
+        identity = format3.identifier(texture['id'])
+        textures_out.append(dict(
+            id=identity,
+            path='textures/' + identity + '.effres',
+        ))
+    return meshes, textures_out
 
 
 class _MeshSnapshot(dict):
@@ -183,7 +284,7 @@ def pack_modules():
         sys.modules[name] = module
     from importlib import import_module
     modules = {n: import_module(name+'.'+n) for n in
-               ('author_source', 'mesh', 'delta_apply', 'type_tree', 'ini_package', 'ini_reader', 'author_format3')}
+               ('author_source', 'mesh', 'delta_apply', 'type_tree', 'author_format3', 'effect_native')}
     dll = shared_resources.native_tool_file('eff_author_core.dll')
     return modules, dll
 
@@ -230,6 +331,7 @@ def material_source(primary, material, cache):
     if package not in cache:
         cache[package] = type(primary)(package, primary.core)
     return cache[package]
+
 
 def split_material(author):
     # The snapshot already has one consistent corner/skin/shape vertex map.
@@ -548,10 +650,9 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
                 png = disk if direct else Path(temporary)/(hashlib.sha256(section.encode()).hexdigest()+'.png')
                 if not direct:
                     addon.write_texture(png, image)
-                from PIL import Image
                 with texture_bitmap(png, direct) as mip:
                     width, height = mip.size
-                    base_pixels = mip.transpose(Image.Transpose.FLIP_TOP_BOTTOM).tobytes()
+                    base_pixels = texture_compression.rgba_pixels_top_down(mip)
                 source_pixels_hash = hashlib.sha256(base_pixels).hexdigest().upper()
                 target = texture_compression.target_format(source_format, color_space)
                 converted = texture_compression.compress_rgba(
@@ -600,30 +701,6 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
                            if include_native_fields and not texture_only else {}))
 
 
-def _copy_texture_dds_inputs(root, texture_inputs):
-    root = Path(root).resolve()
-    parser = configparser.ConfigParser(interpolation=None, delimiters=('=',), strict=True)
-    parser.optionxform = str
-    with (root / 'mod.ini').open(encoding='utf-8-sig') as stream:
-        parser.read_file(stream)
-    for texture_id, inputs in texture_inputs.items():
-        if not parser.has_section(texture_id) or not parser[texture_id].get('dds'):
-            raise ValueError('Format 3 Texture DDS 路径缺失：' + texture_id)
-        relative = parser[texture_id]['dds']
-        destination = (root / relative).resolve()
-        if root not in destination.parents:
-            raise ValueError('Format 3 Texture DDS 路径超出 Mod 目录：' + relative)
-        inputs['dds_relative'] = relative
-        if not inputs.get('dds_path'):
-            continue
-        source = Path(inputs['dds_path'])
-        data = source.read_bytes()
-        if hashlib.sha256(data).hexdigest().upper() != inputs['dds_hash']:
-            raise ValueError('DDS 文件在导出期间发生变化：' + str(source))
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(data)
-
-
 def _update_texture_image_paths(root, texture_inputs):
     root = Path(root).resolve()
     for texture_id, inputs in texture_inputs.items():
@@ -666,18 +743,6 @@ def package_changes(staging, destination, previous, candidate):
         # staging hardlink names the same file, so rereading both adds no proof.
         if os.path.samefile(a, b):
             return True
-        if a == staging / 'compiled.bin':
-            try:
-                from .eiem_offline_reload import compiled_snapshot
-            except ImportError:
-                from eiem_offline_reload import compiled_snapshot
-            first, second = compiled_snapshot(staging), compiled_snapshot(destination)
-            if first is not None or second is not None:
-                # The compiler owns immutable blocks; the checked directory
-                # names their content hashes. Uncommitted/obsolete tail bytes
-                # are not part of the published snapshot's identity.
-                return (first is not None and second is not None and first['store'] == second['store'] and
-                        first['revision'][2:] == second['revision'][2:])
         if a.stat().st_size != b.stat().st_size:
             return False
         with a.open('rb') as first, b.open('rb') as second:
@@ -689,50 +754,17 @@ def package_changes(staging, destination, previous, candidate):
                     return True
 
     changed = [name for name in sorted(new_files) if not same_bytes(staging/name, destination/name)]
-    # Retired content blocks can still belong to a pinned runtime snapshot.
-    # Keep them until explicit package compaction, including on rollback.
-    removed = sorted(name for name in old_files - new_files if not name.startswith('compiled.blocks/'))
+    removed = sorted(old_files - new_files)
     return changed, removed
 
 
-def _prepare_publication_file(source, destination, name, verify_block=False):
-    """Retain immutable compiled snapshots without copying their payloads."""
+def _prepare_publication_file(source, destination):
+    """Stage an immutable resource by hardlink where the filesystem allows."""
     source, destination = Path(source), Path(destination)
-    block = re.fullmatch(r'compiled\.blocks/([0-9A-F]{64})\.bin', name)
-    if block is not None and verify_block:
-        digest = hashlib.sha256()
-        with source.open('rb') as stream:
-            for data in iter(lambda: stream.read(1024 * 1024), b''):
-                digest.update(data)
-        if digest.hexdigest().upper() != block[1]:
-            raise ValueError('Mod 内容块校验失败，上一发布保留：' + name)
-    if (name == 'compiled.bin' or block is not None) and source.stat().st_mode & stat.S_IWRITE:
-        try:
-            os.link(source, destination)
-            return
-        except OSError:
-            # Different volumes and filesystems without hardlinks still use
-            # complete private copies, with the same rollback semantics.
-            pass
-    shutil.copy2(source, destination)
-
-
-def _retire_compiled_blocks(destination, package):
-    """Collect unreferenced history only after a complete validated commit."""
-    root=Path(destination)/'compiled.blocks'
     try:
-        paths=list(root.iterdir()) if root.is_dir() else []
+        os.link(source, destination)
     except OSError:
-        return
-    for path in paths:
-        name='compiled.blocks/'+path.name
-        if re.fullmatch(r'compiled\.blocks/[0-9A-F]{64}\.bin',name) and name not in package['_files']:
-            try:
-                path.unlink()
-            except OSError:
-                # An active reader or filesystem can defer collection. It must
-                # never turn a successful commit into an unsafe late rollback.
-                pass
+        shutil.copy2(source, destination)
 
 
 def publish(staging, destination, reader, previous=None, candidate=None):
@@ -746,9 +778,7 @@ def publish(staging, destination, reader, previous=None, candidate=None):
     if candidate is None:candidate = reader(staging)
     changed, removed = package_changes(staging, destination, previous, candidate)
     if not changed and not removed:
-        package=previous if previous is not None else candidate
-        _retire_compiled_blocks(destination,package)
-        return package
+        return previous if previous is not None else candidate
     release = getattr(reader, 'release_files', None)
     if release:
         release([root/name for root in (destination,staging) for name in changed + removed])
@@ -767,33 +797,31 @@ def publish(staging, destination, reader, previous=None, candidate=None):
         for name in changed:
             output = pending/'new'/name
             output.parent.mkdir(parents=True, exist_ok=True)
-            _prepare_publication_file(staging/name, output, name, verify_block=True)
+            _prepare_publication_file(staging/name, output)
         for name in changed:
             original = destination/name
             if original.is_file():
                 saved = backup/name
                 saved.parent.mkdir(parents=True, exist_ok=True)
-                _prepare_publication_file(original, saved, name)
+                _prepare_publication_file(original, saved)
         for name in removed:
             saved = backup/name
             saved.parent.mkdir(parents=True, exist_ok=True)
             os.replace(destination/name, saved)
             applied.append(name)
-        for name in sorted(changed, key=lambda value: (value == 'mod.ini', value == 'compiled.bin', value)):
+        for name in sorted(changed, key=lambda value: value == 'mod.ini'):
             output = destination/name
             output.parent.mkdir(parents=True, exist_ok=True)
             _replace_published_file(pending/'new'/name, output)
             applied.append(name)
-        package=reader(destination)
-        _retire_compiled_blocks(destination,package)
-        return package
+        return reader(destination)
     except Exception as error:
         try:
             for name in reversed(applied):
                 saved = backup/name
                 if saved.is_file():
                     _replace_published_file(saved, destination/name)
-                elif not name.startswith('compiled.blocks/'):
+                else:
                     (destination/name).unlink()
         except Exception as rollback:
             cleanup = False
@@ -805,99 +833,9 @@ def publish(staging, destination, reader, previous=None, candidate=None):
             shutil.rmtree(pending, ignore_errors=True)
 
 
-def _clone_staging_tree(source, destination, copy_paths=()):
-    """Clone a partial input, privately copying paths that will be replaced."""
-    source, destination = Path(source), Path(destination)
-    copy_paths = set(copy_paths)
-    destination.mkdir(parents=True, exist_ok=False)
-    modules,_=pack_modules()
-    package_files=importlib.import_module(modules['ini_reader'].__package__+'.mod_directory').package_files
-    store=importlib.import_module(modules['ini_reader'].__package__+'.compiled_store')
-    committed=store.snapshot(source)
-    blobs=committed['blobs'] if committed is not None else {}
-    for path in package_files(source):
-        relative = path.relative_to(source)
-        if store.TRANSIENT_PATH.fullmatch(relative.as_posix()):
-            continue
-        if store.BLOCK_PATH.fullmatch(relative.as_posix()) and relative.as_posix() not in blobs:
-            continue
-        target = destination / relative
-        if path.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-            continue
-        if not path.is_file():
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if (relative.as_posix() in copy_paths or
-                not path.stat().st_mode & stat.S_IWRITE):
-            # Windows read-only attributes belong to the shared file, not one
-            # link. Private writable copies also avoid replacing a hardlink
-            # whose source is currently open without FILE_SHARE_DELETE.
-            shutil.copy2(path, target)
-            os.chmod(target, target.stat().st_mode | stat.S_IWRITE)
-            continue
-        try:
-            os.link(path, target)
-        except OSError:
-            # A workspace and destination on different volumes cannot share
-            # hardlinks; retain the old copy behavior for that case.
-            shutil.copy2(path, target)
-
-
-def _detach_staging_files(paths):
-    """Break hardlinks before update_directory writes a staged resource."""
-    for path in {Path(value) for value in paths}:
-        if not path.is_file():
-            continue
-        if path.stat().st_nlink <= 1:
-            continue
-        fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '.',
-                                          suffix='.detach', dir=str(path.parent))
-        os.close(fd)
-        try:
-            shutil.copy2(path, temporary)
-            os.chmod(temporary, os.stat(temporary).st_mode | stat.S_IWRITE)
-            _replace_published_file(temporary, path)
-        finally:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-
-
-def _partial_output_paths(staging, resource_scope, existing_ini, materials,
-                          textures, parts, identifier, texture_paths=None):
-    """Return every staged file that update_directory may write in place."""
-    paths = [Path(staging) / 'mod.ini']
-    if resource_scope in ('MATERIALS', 'TEXTURES'):
-        for material in materials:
-            if resource_scope == 'MATERIALS':
-                section = identifier(material['id'])
-                if section in existing_ini:
-                    paths.append(Path(staging) / existing_ini[section]['path'])
-        for texture in textures:
-            relative = (texture_paths[texture['id']] if texture_paths is not None else
-                        'textures/' + identifier(texture['pixelLabel']) + '.tex')
-            path = Path(staging) / relative
-            if texture.get('retained') and path.is_file():
-                modules = pack_modules()[0]
-                data = modules['ini_package'].encode_resource(
-                    modules['ini_package'].PIXELS, '00' * 16,
-                    modules['ini_package'].texture_blocks(texture))
-                if path.read_bytes() == data:
-                    continue
-            paths.append(path)
-    elif resource_scope == 'MESH':
-        for part in parts:
-            section = identifier(part['object'])
-            if section in existing_ini:
-                paths.append(Path(staging) / existing_ini[section]['path'])
-    return paths
-
-
 @contextlib.contextmanager
 def _export_temporary_directory(resource_cache, destination, **options):
-    """Keep staging invisible to recursive Mod discovery and release file handles."""
+    """Keep complete Format 3 staging separate from installed Mods."""
     package_parent = Path(destination).resolve().parent
     staging_parent = package_parent / '.eff-export-staging'
     cleanup_parent = False
@@ -922,131 +860,97 @@ def _export_temporary_directory(resource_cache, destination, **options):
                 pass
 
 
-def export_native_package(*args, **kwargs):
+def export_native_package(addon, destination, mesh_objects, *, armatures=None,
+                          physics_objects=None, lod_levels=None,
+                          include_switches=True, source_baseline='', effect_roots=None):
     cache = {'__frozen_files__': {}}
     try:
-        objects = list(kwargs.get('mesh_objects', args[2] if len(args) > 2 else []))
-        if len(args) > 2:
-            args = (*args[:2], objects, *args[3:])
-        else:
-            kwargs['mesh_objects'] = objects
-        configured = kwargs.get('source_baseline', args[8] if len(args) > 8 else '')
-        primary = baseline_for(objects, configured, kwargs.get('physics_objects') or ())
+        objects = list(mesh_objects)
+        primary = baseline_for(objects, source_baseline, physics_objects or ())
         packages = {primary}
         packages.update(Path(slot.material.get('eiem_author_package')).resolve()
                         for obj in objects for slot in obj.material_slots
                         if slot.material and slot.material.get('eiem_author_package'))
-        modules, _ = pack_modules()
-        addon = args[0] if args else kwargs.get('addon')
-        effect_roots = kwargs.get('effect_roots', args[12] if len(args) > 12 else None)
         if effect_roots is None and addon is not None:
             effect_roots = addon.effect_editor.export_roots((), objects, addon)
-            if len(args) > 12:
-                args = (*args[:12], effect_roots, *args[13:])
-            else:
-                kwargs['effect_roots'] = effect_roots
+        modules, _ = pack_modules()
         for root in effect_roots or ():
             state = addon.effect_editor.synchronize(root).state
             packages.add(Path(state['source']).resolve())
         with contextlib.ExitStack() as locks:
             for package in sorted(packages, key=lambda p: str(p).casefold()):
                 locks.enter_context(modules['author_source'].source_read_lock(package))
-            return _export_native_package(*args, resource_cache=cache, **kwargs)
+            return _export_native_package(
+                addon, destination, objects, armatures=armatures,
+                physics_objects=physics_objects, lod_levels=lod_levels,
+                include_switches=include_switches, source_baseline=source_baseline,
+                resource_cache=cache, effect_roots=effect_roots)
     finally:
         for stream, _signature, _result in cache['__frozen_files__'].values():
             stream.close()
 
 
 def _export_native_package(addon, destination, mesh_objects, armatures=None,
-                          physics_objects=None, mesh_only=False, lod_levels=None,
-                          include_switches=True, source_baseline='', resource_scope='ALL', resource_cache=None,
-                          game_directory='',effect_roots=None):
+                          physics_objects=None, lod_levels=None,
+                          include_switches=True, source_baseline='', resource_cache=None,
+                          effect_roots=None):
     import bpy
     started = time.perf_counter()
     detail = dict(meshSnapshot=0., materialTexture=0., meshEncoding=0., effect=0., effectAuthor=0., writeAuthor=0.)
     snapshot_hits = snapshot_misses = 0
     exported_physics = exported_skeletons = 0
-    physics_author_snapshots = {}
+    physics_resources = []
     # pack_modules() resolves the ABI-matched shared-tools vendor directory.
     # Do not prepend this add-on's bundled vendor: it may target another Python ABI.
-    if resource_scope not in ('ALL', 'MESH', 'MATERIALS', 'TEXTURES', 'PHYSICS'):
-        raise ValueError('未知导出资源范围：' + resource_scope)
     if bpy.context.mode != 'OBJECT': raise ValueError('请回到物体模式后导出')
     objects = list(mesh_objects)
     physics_objects = list(physics_objects or [])
-    if not objects and resource_scope != 'PHYSICS': raise ValueError('No EFF Mesh selected')
-    if physics_objects and resource_scope not in ('ALL', 'PHYSICS'):
-        raise ValueError('Physics can only be updated by full or physics-only export')
-    if resource_scope == 'PHYSICS' and not physics_objects:
-        raise ValueError('Physics-only export requires at least one selected group')
+    if not objects: raise ValueError('Format 3 导出需要至少一个 EFF Mesh')
     modules, dll = pack_modules()
     source = modules['author_source'].AuthorSource(baseline_for(objects, source_baseline, physics_objects),
                 modules['author_source'].AuthorCore(dll))
     destination = Path(destination).resolve()
     resource_cache = resource_cache if resource_cache is not None else {}
-    def read_package(path):
-        return modules['ini_reader'].read_package(path, resource_cache)
-    def release_files(paths):
-        identities = {(p.stat().st_dev,p.stat().st_ino) for p in paths if p.is_file()}
-        for identity,(stream,_stamp,_result) in resource_cache.get('__frozen_files__',{}).items():
-            if identity[:2] in identities:
-                stream.close()
-    read_package.release_files = release_files
-    existing_ini = None
-    existing_package = None
     if (destination/'mod.ini').is_file():
         header = configparser.ConfigParser(interpolation=None, delimiters=('=',), strict=True)
         header.optionxform = str
         with (destination/'mod.ini').open(encoding='utf-8-sig') as stream:
             header.read_file(stream)
-        if header.get('Mod', 'format', fallback='') == '3':
-            if resource_scope != 'ALL':
-                raise ValueError('Format 3 partial export/import readback is not connected yet; this Mod was left unchanged.')
-            raise ValueError('Format 3 Blender import/readback is not connected yet; export to a new Mod directory.')
-        existing_package = read_package(destination)
-        existing_ini = modules['ini_package'].ini_document(destination)
-        if existing_ini['Mod'].get('type','')=='effect':
-            raise ValueError('该目录是独立特效 Mod，请为人物与特效选择另一个 Mod 文件夹')
-    if resource_scope != 'ALL' and existing_ini is None:
-        raise ValueError('部分导出需要已有的完整 Mod；首次请选择全部资源')
+        if header.get('Mod', 'format', fallback='') != '3':
+            raise ValueError('Blender 只读取或覆盖 Format 3 Mod；请先使用 Mod Manager 迁移旧格式。')
     if destination == source.package or source.package in destination.parents:
         raise ValueError('不能覆盖原生来源目录')
     bpy.context.view_layer.update()
-    plan = ({'objects': [], 'sources': [], 'groups': [], 'bindings': {}, 'hidden': set()}
-            if not objects else
-            addon.plan_mesh_only_export(objects) if mesh_only or resource_scope != 'ALL' else
-            addon.plan_switch_export(objects, include_switches=include_switches))
-    if resource_scope == 'ALL':
-        if lod_levels is None:
-            lod_levels = addon.lod_levels_for_export(objects, all_levels=True)
-        if lod_levels:
-            plan = addon.expand_lod_plan(plan, lod_levels)
+    plan = addon.plan_switch_export(objects, include_switches=include_switches)
+    if lod_levels is None:
+        lod_levels = addon.lod_levels_for_export(objects, all_levels=True)
+    if lod_levels:
+        plan = addon.expand_lod_plan(plan, lod_levels)
     material_switch_by_object_slot = {}
     material_switch_definitions = []
-    if resource_scope == 'ALL':
-        seen_material_switches = set()
-        for family in plan['sources']:
-            if not family:
-                continue
-            canonical = min(family, key=lambda obj: addon.mesh_lod_level(obj))
-            original = addon.mesh_export_template(canonical)
-            claimed_slots = set()
-            for group in original.eiem_material_switches:
-                definition = addon.material_switch_definition(group)
-                if definition['identity'] in seen_material_switches:
-                    raise ValueError('材质切换组 ID 重复，请重新创建该组')
-                if definition['slot'] in claimed_slots:
-                    raise ValueError(original.name + ' 的同一材质槽不能配置多个切换组')
-                seen_material_switches.add(definition['identity'])
-                claimed_slots.add(definition['slot'])
-                definition['variable'] = '$material_' + definition['identity']
-                definition['mesh'] = original
-                material_switch_definitions.append(definition)
-                for view in family:
-                    target_mesh = addon.mesh_export_template(view)
-                    if definition['slot'] >= len(target_mesh.material_slots):
-                        raise ValueError(target_mesh.name + ' 缺少材质切换目标槽')
-                    material_switch_by_object_slot[(target_mesh.as_pointer(), definition['slot'])] = definition
+    seen_material_switches = set()
+    for family in plan['sources']:
+        if not family:
+            continue
+        canonical = min(family, key=lambda obj: addon.mesh_lod_level(obj))
+        original = addon.mesh_export_template(canonical)
+        claimed_slots = set()
+        for group in original.eiem_material_switches:
+            definition = addon.material_switch_definition(group)
+            if definition['identity'] in seen_material_switches:
+                raise ValueError('材质切换组 ID 重复，请重新创建该组')
+            if definition['slot'] in claimed_slots:
+                raise ValueError(original.name + ' 的同一材质槽不能配置多个切换组')
+            seen_material_switches.add(definition['identity'])
+            claimed_slots.add(definition['slot'])
+            definition['variable'] = '$material_' + definition['identity']
+            definition['mesh'] = original
+            material_switch_definitions.append(definition)
+            for view in family:
+                target_mesh = addon.mesh_export_template(view)
+                if definition['slot'] >= len(target_mesh.material_slots):
+                    raise ValueError(target_mesh.name + ' 缺少材质切换目标槽')
+                material_switch_by_object_slot[(target_mesh.as_pointer(), definition['slot'])] = definition
     encode = modules['type_tree'].encode
     # Image sections are package-local.  Restrict lookup to the source package
     # being exported so a second imported Mod with the same section/path
@@ -1099,70 +1003,21 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                              default=row['default']) for row in material_switch_definitions)
     controls_by_object = {}
     clips_by_object = {}
-    if resource_scope in {'ALL', 'MESH'}:
-        originals = {addon.mesh_export_template(view) for view in plan['objects']
-                     if view not in plan['hidden']}
-        # This is the same author-side validator the controls panels use. It
-        # validates shared channels and ranges before any
-        # resource files are written.
-        addon.shape_animation.validate_export_members(originals)
-        clips_by_object = {original.as_pointer(): addon.shape_animation.export_clips(original, addon, include_switches) for original in originals}
-        _, _, hotkeys = addon.plan_shape_controls(list(originals),
-                                                 include_hotkeys=include_switches)
-        controls_by_object = {original.as_pointer(): shape_controls(addon, original, include_switches)
-                              for original in originals}
+    originals = {addon.mesh_export_template(view) for view in plan['objects']
+                 if view not in plan['hidden']}
+    addon.shape_animation.validate_export_members(originals)
+    clips_by_object = {original.as_pointer(): addon.shape_animation.export_clips(
+        original, addon, include_switches) for original in originals}
+    _, _, hotkeys = addon.plan_shape_controls(list(originals),
+                                             include_hotkeys=include_switches)
+    controls_by_object = {original.as_pointer(): shape_controls(addon, original, include_switches)
+                          for original in originals}
     with _export_temporary_directory(resource_cache, destination,
                                       prefix='eff-native-export-') as temporary:
         staging = Path(temporary)/'mod'
-        if resource_scope in ('MATERIALS', 'TEXTURES'):
-            for view in objects:
-                original = addon.mesh_export_template(view)
-                slots = {polygon.material_index for polygon in original.data.polygons}
-                for slot in sorted(slots):
-                    mat = original.data.materials[slot] if slot < len(original.data.materials) else None
-                    if mat is None:
-                        raise ValueError(original.name+' 缂哄皯鏉愯川妲?'+str(slot))
-                    mid = material_sections[mat.as_pointer()]
-                    if mid not in materials:
-                        materials[mid] = collect_material(
-                            addon, material_source(source, mat, material_sources), mat,
-                            images, textures, temporary, encode, existing_ini,
-                            resource_scope == 'TEXTURES', mid, texture_cache,
-                            texture_inputs=texture_inputs)
-            texture_paths = modules['ini_package'].texture_output_paths(
-                destination, existing_ini, list(textures.values()),
-                list(materials.values()))
-            output_paths = _partial_output_paths(
-                destination, resource_scope, existing_ini,
-                list(materials.values()), list(textures.values()), parts,
-                modules['ini_package'].identifier, texture_paths)
-            copy_paths = {path.relative_to(destination).as_posix()
-                          for path in output_paths}
-            _clone_staging_tree(destination, staging, copy_paths=copy_paths)
-        elif resource_scope != 'ALL':
-            _clone_staging_tree(destination, staging)
-        else:
-            staging.mkdir()
-        # Partial staging may share files with the live author through links.
-        # It must hash current bytes even if a foreign writer preserves mtime.
-        resource_cache['__trusted_roots__'] = (staging.resolve(),) if resource_scope == 'ALL' else ()
-        if resource_scope in ('MATERIALS', 'TEXTURES') and not materials:
-            for view in objects:
-                original = addon.mesh_export_template(view)
-                slots = {polygon.material_index for polygon in original.data.polygons}
-                for slot in sorted(slots):
-                    mat = original.data.materials[slot] if slot < len(original.data.materials) else None
-                    if mat is None:
-                        raise ValueError(original.name+' 缺少材质槽 '+str(slot))
-                    mid = material_sections[mat.as_pointer()]
-                    if mid not in materials:
-                        materials[mid] = collect_material(addon, material_source(source, mat, material_sources), mat, images, textures, temporary,
-                                                         encode, existing_ini, resource_scope == 'TEXTURES', mid,
-                                                         texture_cache,
-                                                         texture_inputs=texture_inputs)
+        staging.mkdir()
+        resource_cache['__trusted_roots__'] = (staging.resolve(),)
         for group in plan['sources']:
-            if resource_scope in ('MATERIALS', 'TEXTURES'):
-                break
             obj = group[0]
             path, asset, level = addon.lod.mesh_export_target(obj)
             target = source.resolve('Mesh', path, asset)
@@ -1189,7 +1044,7 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                                     if switch else [mat])
                         for variant in variants:
                             mid = material_sections[variant.as_pointer()]
-                            if resource_scope == 'ALL' and mid not in materials:
+                            if mid not in materials:
                                 phase = time.perf_counter()
                                 materials[mid] = collect_material(
                                     addon, material_source(source, variant, material_sources), variant,
@@ -1235,287 +1090,157 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                                   targets=[dict(level=level,sourcePath=path,sourceAsset=asset)]))
         # Hide rules across LODs group by the exact original author's family.
         material_clips=None
-        if resource_scope in {'ALL','MATERIALS'}:
-            material_clips=[];seen_materials=set()
-            for view in objects:
-                for mat in sorted(selected_materials,
-                                  key=lambda material:material_sections[material.as_pointer()]):
-                    if mat and mat.as_pointer() not in seen_materials and mat.as_pointer() in material_sections:
-                        seen_materials.add(mat.as_pointer());material_clips.extend(addon.material_animation.export_clips(mat,material_sections[mat.as_pointer()],addon,include_switches))
+        material_clips=[];seen_materials=set()
+        for view in objects:
+            for mat in sorted(selected_materials,
+                              key=lambda material:material_sections[material.as_pointer()]):
+                if mat and mat.as_pointer() not in seen_materials and mat.as_pointer() in material_sections:
+                    seen_materials.add(mat.as_pointer());material_clips.extend(addon.material_animation.export_clips(mat,material_sections[mat.as_pointer()],addon,include_switches))
         phase = time.perf_counter()
-        effects=addon.effect_editor.export_attachments(objects,parts,addon,effect_roots or ()) if resource_scope=='ALL' else None
+        effects=addon.effect_editor.export_attachments(objects,parts,addon,effect_roots or ())
         detail['effect'] = (time.perf_counter()-phase)*1000
         for rule in rules:
             base=min(rule['targets'],key=lambda t:t['level'])
             rule['sourcePath'],rule['sourceAsset']=base['sourcePath'],base['sourceAsset']
             base['level']=0
-        if resource_scope == 'ALL':
-            phase = time.perf_counter()
-            published_package = modules['ini_package'].export_directory(staging,mod_id=token(destination.name),parts=parts,
-                        materials=list(materials.values()),textures=list(textures.values()),rules=rules,
-                        switches=switches,resource_cache=resource_cache,
-                        material_clips=material_clips,effects=effects,key_switch_enabled=modules['ini_reader'].key_switch_enabled(
-                            existing_ini['Mod'].get('key_switch_enabled', '1')) if existing_ini else True,
-                        memory_only=True)
-            ini = published_package['_ini']
-            memory_resources = published_package['_memory_resources']
-            detail['writeAuthor'] = (time.perf_counter()-phase)*1000
-            # A selected Mesh that actually weights a new chain needs that
-            # chain's Skeleton/Physics resource in every matching prefab.
-            # Selection of the visual Mesh already requests this dependency.
-            used_by_rig = {}
-            for identity, snapshot in snapshots.items():
-                rig = snapshot_rigs[identity]
-                if rig is not None:
-                    used_by_rig.setdefault(rig, set()).update(
-                        snapshot['bone_paths'][slot]
-                        for weights, slots in snapshot['skin']
-                        for weight, slot in zip(weights, slots) if weight > 0)
-            bone_tables = {}
-            for group in bpy.data.objects:
-                if group.eiem_physics.kind != 'GROUP' or group in physics_objects:
-                    continue
-                rig = group.eiem_physics.rig
-                if rig not in used_by_rig:
-                    continue
-                if rig not in bone_tables:
-                    author = sys.modules[addon.__package__ + '.eiem_physics_authoring']
-                    bone_tables[rig] = author.bones(rig)
-                table = bone_tables[rig]
-                paths = {table[node.bone_id][1][0] for node in group.eiem_physics.nodes
-                         if node.role == 'MOVE' and node.bone_id in table}
-                if paths & used_by_rig[rig]:
-                    physics_objects.append(group)
-            if physics_objects:
-                from importlib import import_module
-                physics = import_module(modules['author_source'].__package__ + '.physics')
+        # Mesh weights determine which authored Physics chains belong in the
+        # package; exporting them with the full author directory keeps the
+        # dependency graph in one transaction.
+        used_by_rig = {}
+        for identity, snapshot in snapshots.items():
+            rig = snapshot_rigs[identity]
+            if rig is not None:
+                used_by_rig.setdefault(rig, set()).update(
+                    snapshot['bone_paths'][slot]
+                    for weights, slots in snapshot['skin']
+                    for weight, slot in zip(weights, slots) if weight > 0)
+        bone_tables = {}
+        for group in bpy.data.objects:
+            if group.eiem_physics.kind != 'GROUP' or group in physics_objects:
+                continue
+            rig = group.eiem_physics.rig
+            if rig not in used_by_rig:
+                continue
+            if rig not in bone_tables:
                 author = sys.modules[addon.__package__ + '.eiem_physics_authoring']
-                physics_document = sys.modules[addon.__package__ + '.eiem_physics_document']
-                native_source = sys.modules[addon.__package__ + '.eiem_physics_source']
-                evidence = native_source.read_evidence(source.package / 'physics/components.json')
-                rigs = {obj.eiem_physics.rig for obj in physics_objects}
-                for rig in rigs:
-                    groups = [obj for obj in physics_objects if obj.eiem_physics.rig == rig]
-                    document = author.author_document(groups, 'shared.skeleton')
-                    exported_physics += len(groups); exported_skeletons += 1
-                    skeleton = addon.skeleton_author_nodes(rig)
-                    mesh_bones = {identity: {snapshot['bone_paths'][slot]
-                                  for weights, slots in snapshot['skin']
-                                  for weight, slot in zip(weights, slots) if weight > 0}
-                                  for identity, snapshot in snapshots.items() if snapshot_rigs[identity] == rig}
-                    published_parts = {
-                        identity: [modules['ini_package'].part_resource_id(part_id)
-                                   for part_id in part_ids]
-                        for identity, part_ids in part_cache.items()}
-                    targets = {group['id']: physics.group_mesh_targets(
-                                   group, mesh_bones, published_package['rules'], published_parts)
-                               for group in document['groups']}
-                    data = physics.build_resource(source, evidence, document, skeleton, targets)
-                    relative = 'resources/physics_' + document['id'] + '.bin'
-                    memory_resources[relative] = data
-                    resource_id = 'ResourcePhysics' + document['id']
-                    ini[resource_id] = {'path': relative}
-                    skeleton_bytes = addon.encode_skeleton(rig)
-                    document['skeleton'] = 'skeletons/physics_' + document['id'] + '.skeleton'
-                    author_data = addon.format_io.encode_format3_physics_snapshot(
-                        physics_document.encode(document), skeleton_bytes)
-                    physics_author_snapshots[resource_id] = author_data
-        elif resource_scope == 'PHYSICS':
+                bone_tables[rig] = author.bones(rig)
+            table = bone_tables[rig]
+            paths = {table[node.bone_id][1][0] for node in group.eiem_physics.nodes
+                     if node.role == 'MOVE' and node.bone_id in table}
+            if paths & used_by_rig[rig]:
+                physics_objects.append(group)
+        if physics_objects:
             from importlib import import_module
             physics = import_module(modules['author_source'].__package__ + '.physics')
             author = sys.modules[addon.__package__ + '.eiem_physics_authoring']
+            physics_document = sys.modules[addon.__package__ + '.eiem_physics_document']
             native_source = sys.modules[addon.__package__ + '.eiem_physics_source']
             evidence = native_source.read_evidence(source.package / 'physics/components.json')
-            ini = modules['ini_package'].ini_document(staging)
-            rigs = {group.eiem_physics.rig for group in physics_objects}
-            if not rigs or None in rigs:
-                raise ValueError('Physics groups must reference valid author Rigs')
+            rigs = {obj.eiem_physics.rig for obj in physics_objects}
             for rig in rigs:
-                groups = [obj for obj in bpy.data.objects
-                          if obj.eiem_physics.kind == 'GROUP' and obj.eiem_physics.rig == rig]
-                if not groups:
-                    raise ValueError('Selected Rig has no authored Physics groups')
+                groups = [obj for obj in physics_objects if obj.eiem_physics.rig == rig]
                 document = author.author_document(groups, 'shared.skeleton')
-                section = 'ResourcePhysics' + document['id']
-                if section not in ini:
-                    raise ValueError('Physics-only export requires an existing Physics resource; use full export for new groups')
-                old_relative = ini[section]['path']
-                old_resource = existing_package['_resources'].get(old_relative)
-                if not old_resource or '@physics' not in old_resource['blocks']:
-                    raise ValueError('Existing Physics resource layout is unavailable; use full export')
-                previous = physics.read_resource_layout(old_resource['blocks']['@physics'])
-                group_ids = {group['id'] for group in document['groups']}
-                if previous['identity'] != document['id'] or group_ids != set(previous['groups']):
-                    raise ValueError('Physics group membership changed; use full export')
-                for group in document['groups']:
-                    nodes = [(node['bone'], node['role'] == 'MOVE') for node in group['nodes']]
-                    if nodes != previous['groups'][group['id']]['nodes']:
-                        raise ValueError('Physics chain topology changed; use full export')
-                skeleton = addon.skeleton_author_nodes(rig)
-                current_skeleton = []
-                for bone, record, is_source in skeleton:
-                    path, parent, position, rotation, scale = record
-                    parent_path = skeleton[parent][1][0] if parent >= 0 else ''
-                    current_skeleton.append((path, parent_path, bool(is_source), parent >= 0,
-                                             tuple(float(value) for value in (*position, *rotation, *scale))))
-                same_skeleton = len(current_skeleton) == len(previous['skeleton'])
-                if same_skeleton:
-                    for current, saved in zip(current_skeleton, previous['skeleton']):
-                        if current[:4] != saved[:4] or any(abs(a-b) > 1e-7 for a, b in zip(current[4], saved[4])):
-                            same_skeleton = False; break
-                if not same_skeleton:
-                    raise ValueError('Rig skeleton changed; use full export')
                 exported_physics += len(groups); exported_skeletons += 1
-                targets = {group['id']: previous['groups'][group['id']]['targets']
+                skeleton = addon.skeleton_author_nodes(rig)
+                mesh_bones = {identity: {snapshot['bone_paths'][slot]
+                              for weights, slots in snapshot['skin']
+                              for weight, slot in zip(weights, slots) if weight > 0}
+                              for identity, snapshot in snapshots.items() if snapshot_rigs[identity] == rig}
+                published_parts = {
+                    identity: [modules['author_format3'].part_resource_id(part_id)
+                               for part_id in part_ids]
+                    for identity, part_ids in part_cache.items()}
+                published_rules = [dict(rule, parts=[
+                    modules['author_format3'].part_resource_id(part_id)
+                    for part_id in rule['parts']]) for rule in rules]
+                targets = {group['id']: physics.group_mesh_targets(
+                               group, mesh_bones, published_rules, published_parts)
                            for group in document['groups']}
                 data = physics.build_resource(source, evidence, document, skeleton, targets)
-                relative = 'resources/physics_' + document['id'] + '.bin'
-                path = staging / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                _detach_staging_files([staging / 'mod.ini', path])
-                if old_relative and old_relative != relative:
-                    if not any(name != section and values.get('path') == old_relative
-                               for name, values in ini.items()):
-                        safe_resource_path = import_module(
-                            modules['ini_package'].__package__ + '.resource_file').resource_path
-                        old_path = safe_resource_path(staging, old_relative)
-                        if old_path.is_file():
-                            old_path.unlink()
-                ini[section] = {'path': relative}
-                path.write_bytes(data)
-            modules['ini_package'].save_ini(staging, ini)
-            read_package(staging)
-        else:
-            texture_paths = modules['ini_package'].texture_output_paths(
-                staging, existing_ini, list(textures.values()), list(materials.values()))
-            _detach_staging_files(_partial_output_paths(
-                staging, resource_scope, existing_ini, list(materials.values()),
-                list(textures.values()), parts, modules['ini_package'].identifier,
-                texture_paths))
-            modules['ini_package'].update_directory(staging,parts=parts,materials=list(materials.values()),
-                        textures=list(textures.values()),texture_only=resource_scope == 'TEXTURES',
-                        resource_cache=resource_cache,material_clips=material_clips,effects=effects)
+                resource_id = 'ResourcePhysics' + document['id']
+                skeleton_bytes = addon.encode_skeleton(rig)
+                document['skeleton'] = 'skeletons/physics_' + document['id'] + '.skeleton'
+                author_data = addon.format_io.encode_format3_physics_snapshot(
+                    physics_document.encode(document), skeleton_bytes)
+                physics_resources.append(dict(
+                    id=resource_id,
+                    native=data,
+                    author=author_data,
+                    targets=sorted({target for rows in targets.values() for target in rows})))
         author_done = time.perf_counter()
-        if resource_scope == 'ALL':
-            started_format3 = time.perf_counter()
-            author_files = {}
-            for part in parts:
-                author_part = modules['ini_package'].part_resource_id(part['partId'])
-                relative = author_part + '.mesh'
-                payload = bytes(part['authorData'])
-                if relative in author_files and author_files[relative] != payload:
-                    raise ValueError('One format 3 Part ID maps to different editable Mesh snapshots: ' + author_part)
-                author_files[relative] = payload
-            for material in materials.values():
-                author_material = modules['ini_package'].identifier(material['id'])
-                relative = author_material + '.effmat'
-                payload = material['authorData']
-                if relative in author_files and author_files[relative] != payload:
-                    raise ValueError('One format 3 Material ID maps to different editable snapshots: ' + author_material)
-                author_files[relative] = payload
-            for resource_id, payload in physics_author_snapshots.items():
-                relative = modules['ini_package'].identifier(resource_id) + '.effphys'
-                if relative in author_files and author_files[relative] != payload:
-                    raise ValueError('One format 3 Physics resource ID maps to different editable snapshots: ' + resource_id)
-                author_files[relative] = bytes(payload)
-            phase = time.perf_counter()
-            roots_by_id = {root.get('eff_effect_id'): root for root in (effect_roots or ())}
-            for attachment in effects or ():
-                root = roots_by_id.get(attachment['id'])
-                if root is None:
-                    raise ValueError('Format 3 Effect author root is missing: ' + attachment['id'])
-                edit = addon.effect_editor.synchronize(root)
-                relative = modules['ini_package'].identifier(attachment['id']) + '.effeffect'
-                attachment_author = dict(attachment)
-                owner = root.eff_effect.owner
-                rig = addon.effect_editor.preview.mount_rig(owner) if owner else None
-                if rig is not None:
-                    attachment_author['mountSkeleton'] = base64.b64encode(
-                        addon.encode_skeleton(rig)).decode('ascii')
-                author_files[relative] = addon.format_io.encode_format3_effect_source(
-                    edit.state['source'], edit.state, attachment_author)
-            detail['effectAuthor'] = (time.perf_counter() - phase) * 1000
-            source_packages = {source.package}
-            source_packages.update(material_sources)
-            ini_bytes = modules['ini_package'].serialize_ini(ini)
-            templates = modules['author_format3'].resolve_templates(
-                None, source_packages, ini_bytes=ini_bytes)
-            format3_staging = Path(temporary) / 'format3'
-            tool = shared_resources.native_tool_file('eff_author_assets.dll')
-            try:
-                writer_report = write_format3_native_assets(
-                    tool, ini_bytes, templates, memory_resources, author_files, format3_staging)
-            except (OSError, ValueError) as error:
-                raise ValueError('Format 3 native author writer could not complete: ' + str(error)) from error
-            _copy_texture_dds_inputs(format3_staging, texture_inputs)
-            manifest = modules['author_format3'].read_format3_directory(format3_staging)
-            conversion_done = time.perf_counter()
-            source.assert_current()
-            for material_baseline in material_sources.values():
-                material_baseline.assert_current()
-
-            def publication_reader(path):
-                path = Path(path)
-                if (path / 'mod.ini').is_file():
-                    header = configparser.ConfigParser(interpolation=None, delimiters=('=',), strict=True)
-                    header.optionxform = str
-                    with (path / 'mod.ini').open(encoding='utf-8-sig') as stream:
-                        header.read_file(stream)
-                    if header.get('Mod', 'format', fallback='') == '3':
-                        return modules['author_format3'].read_format3_directory(path)
-                return read_package(path)
-
-            package = publish(format3_staging, destination, publication_reader,
-                              candidate=manifest)
-            _update_texture_image_paths(destination, texture_inputs)
-            publish_done = time.perf_counter()
-            written_texture_files = {ini[section]['path'] for section in ini.sections()
-                                     if section in textures and textures[section].get('_written', True)}
-            return dict(meshes=len(parts), materials=len(materials),
-                        textures=len(written_texture_files), textureBindings=len(textures),
-                        skeletons=exported_skeletons, physics=exported_physics, format=3,
-                        rules=len(rules), resourceScope=resource_scope,
-                        nativeSubmission=True, exportSeconds=time.perf_counter()-started,
-                        effects=len(effects or []), exportDetailMs=detail,
-                        meshSnapshotHits=snapshot_hits, meshSnapshotMisses=snapshot_misses,
-                        exportCostsMs=dict(author=(author_done-started)*1000,
-                            format3=(conversion_done-started_format3)*1000,
-                            publish=(publish_done-conversion_done)*1000),
-                        format3Writer=writer_report,
-                        format3Files=len(package['_files']))
-        # Format 2's offline compiler is only needed by the legacy partial
-        # export path. Full export publishes the format-3 author directory
-        # above and must not spend time preparing consumer-PFB state.
-        if __package__:
-            from .eiem_offline_reload import reload_context, compile_reload, prepare_static_sources, publish_reload
-        else:
-            from eiem_offline_reload import reload_context, compile_reload, prepare_static_sources, publish_reload
-        offline_context = reload_context(destination, game_directory=game_directory)
-        _detach_staging_files([staging / 'source-inputs.bin'])
-        source_index = prepare_static_sources(staging, source.package, offline_context, previous=destination)
-        # --previous-mod supplies the old snapshot. Do not detach/copy tens of
-        # MB only to have the compiler atomically replace them with a candidate.
-        (staging / 'compiled.bin').unlink(missing_ok=True)
-        offline = compile_reload(
-            staging, offline_context, previous=destination, source_index=source_index,
-            resource_only=resource_scope != 'ALL')
-        compile_done = time.perf_counter()
+        started_format3 = time.perf_counter()
+        author_files = {}
+        phase = time.perf_counter()
+        roots_by_id = {root.get('eff_effect_id'): root for root in (effect_roots or ())}
+        for attachment in effects or ():
+            root = roots_by_id.get(attachment['id'])
+            if root is None:
+                raise ValueError('Format 3 Effect author root is missing: ' + attachment['id'])
+            edit = addon.effect_editor.synchronize(root)
+            relative = modules['author_format3'].identifier(attachment['id']) + '.effeffect'
+            attachment_author = dict(attachment)
+            owner = root.eff_effect.owner
+            rig = addon.effect_editor.preview.mount_rig(owner) if owner else None
+            if rig is not None:
+                attachment_author['mountSkeleton'] = base64.b64encode(
+                    addon.encode_skeleton(rig)).decode('ascii')
+            author_files[relative] = addon.format_io.encode_format3_effect_source(
+                edit.state['source'], edit.state, attachment_author)
+        detail['effectAuthor'] = (time.perf_counter() - phase) * 1000
+        source_packages = {source.package}
+        source_packages.update(material_sources)
+        templates = modules['author_format3'].resolve_templates(
+            source_packages, rules, include_texture=bool(textures))
+        native_meshes, native_textures = format3_native_records(
+            modules['author_format3'], source, parts, textures.values(), rules)
+        format3_staging = Path(temporary) / 'format3'
+        format3_staging.mkdir()
+        phase = time.perf_counter()
+        modules['author_format3'].write_format3_directory(
+            format3_staging, token(destination.name), parts, materials,
+            list(textures.values()), rules, switches, material_clips, effects,
+            physics=physics_resources, author_files=author_files)
+        detail['writeAuthor'] = (time.perf_counter() - phase) * 1000
+        tool = shared_resources.native_tool_file('eff_author_assets.dll')
+        try:
+            writer_report = write_format3_native_assets(
+                tool, token(destination.name), templates, native_meshes,
+                native_textures, format3_staging)
+        except (OSError, ValueError) as error:
+            raise ValueError('Format 3 native author writer could not complete: ' + str(error)) from error
+        manifest = modules['author_format3'].read_format3_directory(format3_staging)
+        format3_done = time.perf_counter()
+        for texture_id in texture_inputs:
+            texture_inputs[texture_id]['dds_relative'] = (
+                'textures/' + modules['author_format3'].identifier(texture_id) + '.dds')
         source.assert_current()
         for material_baseline in material_sources.values():
             material_baseline.assert_current()
-        package, offline = publish_reload(staging, destination,
-            lambda: publish(staging,destination,read_package), offline_context,
-            source_index, offline, resource_only=resource_scope != 'ALL')
-        texture_paths = modules['ini_package'].ini_document(destination)
-        written_texture_files = {texture_paths[section]['path'] for section in texture_paths
-                                 if section in textures and textures[section].get('_written', True)}
-        return dict(meshes=len(parts),materials=0 if resource_scope == 'TEXTURES' else len(materials),
-                    textures=len(written_texture_files),textureBindings=len(textures),
-                    skeletons=exported_skeletons,physics=exported_physics,format=2,
-                    rules=len(rules) if resource_scope == 'ALL' else 0,
-                    resourceScope=resource_scope,nativeSubmission=False,
-                    exportSeconds=time.perf_counter()-started,effects=len(effects or []),
-                    exportDetailMs=detail,meshSnapshotHits=snapshot_hits,meshSnapshotMisses=snapshot_misses,
+
+        def publication_reader(path):
+            path = Path(path)
+            if (path / 'mod.ini').is_file():
+                header = configparser.ConfigParser(interpolation=None, delimiters=('=',), strict=True)
+                header.optionxform = str
+                with (path / 'mod.ini').open(encoding='utf-8-sig') as stream:
+                    header.read_file(stream)
+                if header.get('Mod', 'format', fallback='') != '3':
+                    raise ValueError('Format 3 发布目标包含其他格式 Mod')
+            return modules['author_format3'].read_format3_directory(path)
+
+        package = publish(format3_staging, destination, publication_reader,
+                          candidate=manifest)
+        _update_texture_image_paths(destination, texture_inputs)
+        publish_done = time.perf_counter()
+        return dict(meshes=len(parts), materials=len(materials),
+                    textures=len(native_textures), textureBindings=len(textures),
+                    skeletons=exported_skeletons, physics=exported_physics, format=3,
+                    rules=len(rules), nativeSubmission=True,
+                    exportSeconds=time.perf_counter()-started,
+                    effects=len(effects or []), exportDetailMs=detail,
+                    meshSnapshotHits=snapshot_hits, meshSnapshotMisses=snapshot_misses,
                     exportCostsMs=dict(author=(author_done-started)*1000,
-                                       compile=(compile_done-author_done)*1000,
-                                       publish=(time.perf_counter()-compile_done)*1000), **offline)
+                        format3=(format3_done-started_format3)*1000,
+                        publish=(publish_done-format3_done)*1000),
+                    format3Writer=writer_report,
+                    format3Files=len(package['_files']))

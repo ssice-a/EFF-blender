@@ -1,11 +1,37 @@
 import io
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import eiem_release
 
 
 class ReleaseCheckTests(unittest.TestCase):
+    def test_format3_update_rejects_legacy_mod_io_modules(self):
+        required = (
+            '__init__.py', 'eiem_blender_addon.py', 'eiem_release.py',
+            'eiem_update_worker.py', 'eiem_shared_resources.py',
+            'nativepack/author_source.py', 'nativepack/author_format3.py',
+            'nativepack/effect_native.py', 'nativepack/mesh.py',
+            'eiem_texture_compression.py', 'physics_presets/chen_soft_ribbon.json',
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            files = {}
+            for name in (*required, 'nativepack/ini_reader.py'):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b'fixture')
+                files[name] = eiem_release.digest(path)
+            (root / eiem_release.BUILD_FILE).write_text(json.dumps({
+                'format': 'EFF_BLENDER_BUILD/1',
+                'revision': 'a' * 40,
+                'files': files,
+            }), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'legacy Mod'):
+                eiem_release.verify_package(root)
+
     def test_new_latest_and_ignored(self):
         payload = {"tag_name": "v0.35.0", "html_url":
                    "https://github.com/ssice-a/EFF-blender/releases/tag/v0.35.0"}
