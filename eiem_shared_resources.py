@@ -170,9 +170,11 @@ def _validate_tools_manifest(value):
         raise ValueError('EFF 共享工具包 SHA256 无效')
     expected = {
         'compiler': 'nativepack/eff_resource_pack.exe',
+        'authorAssets': 'nativepack/eff_author_assets.dll',
         'indexUpdater': 'nativepack/eff_source_index.exe',
         'authorCore': 'nativepack/eff_author_core.dll',
         'protocol': 'nativepack/package-protocol.json',
+        'textureCompressor': 'nativepack/texconv.exe',
         'archiveRoot': 'EFF_Native_Tools',
     }
     if any(value.get(key) != item for key, item in expected.items()):
@@ -211,9 +213,12 @@ def _digest(path):
 def _extract_tools(archive, destination):
     required = {
         'nativepack/eff_resource_pack.exe',
+        'nativepack/eff_author_assets.dll',
         'nativepack/eff_source_index.exe',
         'nativepack/eff_author_core.dll',
         'nativepack/package-protocol.json',
+        'nativepack/texconv.exe',
+        'nativepack/THIRD_PARTY_NOTICES',
         *('vendor/' + name for name in PIL_REQUIRED_FILES),
     }
     found = set()
@@ -251,7 +256,7 @@ def _installed_tools(root):
         directory = (root / 'tools' / receipt['sha256']).resolve()
         if root.resolve() not in directory.parents:
             return None
-        required = ('eff_resource_pack.exe', 'eff_source_index.exe', 'eff_author_core.dll', 'package-protocol.json')
+        required = ('eff_resource_pack.exe', 'eff_author_assets.dll', 'eff_source_index.exe', 'eff_author_core.dll', 'package-protocol.json', 'texconv.exe')
         nativepack = directory / 'nativepack'
         vendor = directory / 'vendor'
         if (all((nativepack / name).is_file() for name in required)
@@ -339,7 +344,7 @@ def _install_native_tools(root):
     tools = root / 'tools'
     try:
         manifest = _latest_tools_manifest()
-    except OSError:
+    except (OSError, ValueError):
         if installed is not None:
             return installed
         raise
@@ -381,7 +386,7 @@ def _install_native_tools(root):
                 return installed
             raise
         if destination.exists():
-            required = ('eff_resource_pack.exe', 'eff_source_index.exe', 'eff_author_core.dll', 'package-protocol.json')
+            required = ('eff_resource_pack.exe', 'eff_author_assets.dll', 'eff_source_index.exe', 'eff_author_core.dll', 'package-protocol.json', 'texconv.exe', 'THIRD_PARTY_NOTICES')
             nativepack = destination / 'nativepack'
             vendor = destination / 'vendor'
             if (not all((nativepack / name).is_file() for name in required)

@@ -86,6 +86,7 @@ class RuntimeControlsTests(unittest.TestCase):
             update_directory(root,parts=data['parts']);self.assertEqual(file.read_bytes(),before)
             update_directory(root,materials=data['materials'],textures=data['textures'],material_clips=[])
             self.assertFalse(file.exists());self.assertFalse(read_package(root)['materialAnimations'])
+
     def test_duplicate_channels_and_missing_material_rejected(self):
         for mutation in ('duplicate','missing'):
             with tempfile.TemporaryDirectory() as folder:

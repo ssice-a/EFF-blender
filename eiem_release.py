@@ -127,7 +127,9 @@ def verify_package(directory, revision=None):
         raise ValueError('更新包构建身份不匹配')
     for name in ('__init__.py', 'eiem_blender_addon.py', 'eiem_release.py', 'eiem_update_worker.py',
                  'eiem_shared_resources.py', 'nativepack/author_source.py',
+                 'nativepack/author_format3.py',
                  'nativepack/compiled_store.py', 'nativepack/mesh.py',
+                 'eiem_texture_compression.py',
                  'physics_presets/chen_soft_ribbon.json'):
         if name not in build['files']:
             raise ValueError('更新包缺少配套文件：' + name)

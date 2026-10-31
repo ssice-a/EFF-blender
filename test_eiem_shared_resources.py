@@ -58,8 +58,8 @@ class SharedResourceTests(unittest.TestCase):
                 'sha256': 'a' * 64,
                 'release': 'v-test',
             }), encoding='utf-8')
-            for name in ('eff_resource_pack.exe', 'eff_source_index.exe',
-                         'eff_author_core.dll', 'package-protocol.json'):
+            for name in ('eff_resource_pack.exe', 'eff_author_assets.dll', 'eff_source_index.exe',
+                         'eff_author_core.dll', 'package-protocol.json', 'texconv.exe', 'THIRD_PARTY_NOTICES'):
                 (native / name).touch()
             vendor = install / 'vendor' / 'PIL'
             vendor.mkdir(parents=True)
@@ -77,8 +77,8 @@ class SharedResourceTests(unittest.TestCase):
             install = root / 'tools' / ('b' * 64)
             native = install / 'nativepack'
             native.mkdir(parents=True)
-            for name in ('eff_resource_pack.exe', 'eff_source_index.exe',
-                         'eff_author_core.dll', 'package-protocol.json'):
+            for name in ('eff_resource_pack.exe', 'eff_author_assets.dll', 'eff_source_index.exe',
+                         'eff_author_core.dll', 'package-protocol.json', 'texconv.exe', 'THIRD_PARTY_NOTICES'):
                 (native / name).touch()
             pil = install / 'vendor' / 'PIL'
             pil.mkdir(parents=True)
@@ -109,8 +109,8 @@ class SharedResourceTests(unittest.TestCase):
             install = root / 'tools' / digest
             native = install / 'nativepack'
             native.mkdir(parents=True)
-            for name in ('eff_resource_pack.exe', 'eff_source_index.exe',
-                         'eff_author_core.dll', 'package-protocol.json'):
+            for name in ('eff_resource_pack.exe', 'eff_author_assets.dll', 'eff_source_index.exe',
+                         'eff_author_core.dll', 'package-protocol.json', 'texconv.exe', 'THIRD_PARTY_NOTICES'):
                 (native / name).touch()
             vendor = install / 'vendor' / 'PIL'
             vendor.mkdir(parents=True)
@@ -128,6 +128,31 @@ class SharedResourceTests(unittest.TestCase):
                         patch.object(shared, 'urlopen', side_effect=AssertionError('unexpected archive download')):
                     self.assertEqual(shared.ensure_native_tools(), install.resolve())
 
+    def test_prepare_reuses_complete_cache_when_latest_release_has_no_tools_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            digest = 'd' * 64
+            install = root / 'tools' / digest
+            native = install / 'nativepack'
+            native.mkdir(parents=True)
+            for name in ('eff_resource_pack.exe', 'eff_author_assets.dll', 'eff_source_index.exe',
+                         'eff_author_core.dll', 'package-protocol.json', 'texconv.exe', 'THIRD_PARTY_NOTICES'):
+                (native / name).touch()
+            vendor = install / 'vendor' / 'PIL'
+            vendor.mkdir(parents=True)
+            for name in shared.PIL_REQUIRED_FILES:
+                (install / 'vendor' / name).touch()
+            (root / 'tools' / 'current.json').write_text(json.dumps({
+                'format': shared.TOOLS_INSTALL_FORMAT,
+                'sha256': digest,
+                'release': 'v-local',
+            }), encoding='utf-8')
+            with patch.dict(os.environ, {'LOCALAPPDATA': str(root / 'local')}, clear=True):
+                shared.set_resource_root(root)
+                with patch.object(shared, '_latest_tools_manifest',
+                                  side_effect=ValueError('EFF 最新 Release 尚未提供共享工具清单')):
+                    self.assertEqual(shared.ensure_native_tools(), install.resolve())
+
     def test_prepare_updates_shared_cache_when_release_digest_changes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -135,8 +160,8 @@ class SharedResourceTests(unittest.TestCase):
             old_install = root / 'tools' / old_digest
             old_native = old_install / 'nativepack'
             old_native.mkdir(parents=True)
-            for name in ('eff_resource_pack.exe', 'eff_source_index.exe',
-                         'eff_author_core.dll', 'package-protocol.json'):
+            for name in ('eff_resource_pack.exe', 'eff_author_assets.dll', 'eff_source_index.exe',
+                         'eff_author_core.dll', 'package-protocol.json', 'texconv.exe', 'THIRD_PARTY_NOTICES'):
                 (old_native / name).touch()
             old_vendor = old_install / 'vendor' / 'PIL'
             old_vendor.mkdir(parents=True)
@@ -150,8 +175,8 @@ class SharedResourceTests(unittest.TestCase):
 
             archive = io.BytesIO()
             with zipfile.ZipFile(archive, 'w') as package:
-                for name in ('eff_resource_pack.exe', 'eff_source_index.exe',
-                             'eff_author_core.dll', 'package-protocol.json'):
+                for name in ('eff_resource_pack.exe', 'eff_author_assets.dll', 'eff_source_index.exe',
+                             'eff_author_core.dll', 'package-protocol.json', 'texconv.exe', 'THIRD_PARTY_NOTICES'):
                     package.writestr('EFF_Native_Tools/nativepack/' + name, name.encode('ascii'))
                 package.writestr('EFF_Native_Tools/vendor/PIL/__init__.py', b'')
                 for name in shared.PIL_REQUIRED_FILES[1:]:
@@ -187,6 +212,7 @@ class SharedResourceTests(unittest.TestCase):
             self.assertEqual(installed, (root / 'tools' / new_digest).resolve())
             receipt = json.loads((root / 'tools' / 'current.json').read_text(encoding='utf-8'))
             self.assertEqual(receipt['sha256'], new_digest)
+            self.assertTrue((installed / 'nativepack' / 'THIRD_PARTY_NOTICES').is_file())
             self.assertTrue(old_install.is_dir())
 
     def test_prepare_keeps_compatible_cache_when_release_lacks_blender_52_extension(self):
@@ -196,8 +222,8 @@ class SharedResourceTests(unittest.TestCase):
             install = root / 'tools' / digest
             native = install / 'nativepack'
             native.mkdir(parents=True)
-            for name in ('eff_resource_pack.exe', 'eff_source_index.exe',
-                         'eff_author_core.dll', 'package-protocol.json'):
+            for name in ('eff_resource_pack.exe', 'eff_author_assets.dll', 'eff_source_index.exe',
+                         'eff_author_core.dll', 'package-protocol.json', 'texconv.exe', 'THIRD_PARTY_NOTICES'):
                 (native / name).touch()
             pil = install / 'vendor' / 'PIL'
             pil.mkdir(parents=True)
@@ -211,8 +237,8 @@ class SharedResourceTests(unittest.TestCase):
 
             archive = io.BytesIO()
             with zipfile.ZipFile(archive, 'w') as package:
-                for name in ('eff_resource_pack.exe', 'eff_source_index.exe',
-                             'eff_author_core.dll', 'package-protocol.json'):
+                for name in ('eff_resource_pack.exe', 'eff_author_assets.dll', 'eff_source_index.exe',
+                             'eff_author_core.dll', 'package-protocol.json', 'texconv.exe', 'THIRD_PARTY_NOTICES'):
                     package.writestr('EFF_Native_Tools/nativepack/' + name, name.encode('ascii'))
                 package.writestr('EFF_Native_Tools/vendor/PIL/__init__.py', b'')
                 package.writestr('EFF_Native_Tools/vendor/PIL/_imaging.cp311-win_amd64.pyd', b'cp311')

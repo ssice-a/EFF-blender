@@ -1,5 +1,6 @@
 """Pure export contracts; these tests never start Blender or export a scene."""
 import ast
+import hashlib
 import importlib.util
 import json
 import os
@@ -47,6 +48,15 @@ class MaterialCollection(list):
         return result
 
 
+def dds_bc7(width, height, payload, mip_count=1, dxgi=98):
+    data = bytearray(148)
+    data[:4] = b'DDS '
+    struct.pack_into('<7I', data, 4, 124, 0x2100F, height, width, 0, 0, mip_count)
+    struct.pack_into('<3I', data, 76, 32, 4, int.from_bytes(b'DX10', 'little'))
+    struct.pack_into('<5I', data, 128, dxgi, 3, 0, 1, 0)
+    return bytes(data) + payload
+
+
 def addon_function(name, namespace, path=ADDON):
     """Execute the real function with tiny Blender-shaped dependencies."""
     tree = ast.parse(path.read_text('utf-8'))
@@ -58,6 +68,117 @@ def addon_function(name, namespace, path=ADDON):
 
 
 class NativeExportCoreTests(unittest.TestCase):
+    def setUp(self):
+        def compress(pixels, width, height, mipmaps, source_format, color_space, texconv, flip_y=False):
+            target = exporter.texture_compression.target_format(source_format, color_space)
+            mips = max(width, height).bit_length() if mipmaps else 1
+            size = exporter.texture_compression._mip_extent(width, height, mips, target['block_bytes'])
+            seed = hashlib.sha256(bytes(pixels) + target['name'].encode()).digest()
+            payload = (seed * ((size + len(seed) - 1) // len(seed)))[:size]
+            return dict(pixels=payload, format=target['name'], formatId=target['unity'],
+                        width=width, height=height, mipCount=mips)
+        self.texture_compressor = patch.object(exporter.texture_compression, 'compress_rgba', side_effect=compress)
+        self.texture_compressor_mock = self.texture_compressor.start()
+        self.addCleanup(self.texture_compressor.stop)
+        self.texture_tool = patch.object(exporter.shared_resources, 'native_tool_file', return_value=Path('texconv.exe'))
+        self.texture_tool.start()
+        self.addCleanup(self.texture_tool.stop)
+
+    def test_dds_author_image_is_not_compressed_and_is_registered_for_passthrough(self):
+        payload = bytes(range(16))
+        raw_dds = dds_bc7(4, 4, payload)
+        native = dict(details=dict(textures=[dict(property='_BaseMap', pointer=dict(
+            isNull=False, identity='native-texture'))]), native=dict(typeHash='12' * 16))
+        source = SimpleNamespace(resolve=lambda *args: native, manifest=dict(resources=[dict(
+            identity='native-texture', logicalPath='assets/body_d', name='Body_D',
+            details=dict(colorSpace=1))]))
+        addon = SimpleNamespace(image_absolute_path=lambda image: image.filepath,
+            material_override_payload=lambda *args, **kwargs:
+                (['texture._BaseMap=slot'], None))
+        with tempfile.TemporaryDirectory() as folder:
+            dds_path = Path(folder) / 'replacement.dds'
+            dds_path.write_bytes(raw_dds)
+            image = Material('Replacement', {'eiem_section': 'TextureReplacement'})
+            image.filepath = str(dds_path)
+            textures, texture_inputs = {}, {}
+            material = Material('Body', {'eiem_source': 'assets/body', 'eiem_name': 'Body'})
+            record = exporter.collect_material(addon, source, material, {'slot': image},
+                textures, folder, None, texture_only=True, texture_inputs=texture_inputs)
+
+        self.texture_compressor_mock.assert_not_called()
+        texture_id = record['textureEdits'][0]['texture']
+        self.assertEqual(textures[texture_id]['pixels'], payload)
+        self.assertEqual(textures[texture_id]['format'], 'BC7')
+        self.assertEqual(texture_inputs[texture_id]['dds_path'], dds_path)
+        self.assertEqual(texture_inputs[texture_id]['dds_hash'], hashlib.sha256(raw_dds).hexdigest().upper())
+
+    def test_png_author_image_is_compressed_and_published_as_dds(self):
+        from PIL import Image
+        native = dict(details=dict(textures=[dict(property='_BaseMap', pointer=dict(
+            isNull=False, identity='native-texture'))]), native=dict(typeHash='12' * 16))
+        source = SimpleNamespace(resolve=lambda *args: native, manifest=dict(resources=[dict(
+            identity='native-texture', logicalPath='assets/body_d', name='Body_D',
+            details=dict(format='BC7', colorSpace=1))]))
+        addon = SimpleNamespace(image_absolute_path=lambda image: image.filepath,
+            material_override_payload=lambda *args, **kwargs:
+                (['texture._BaseMap=slot'], None))
+        with tempfile.TemporaryDirectory() as folder:
+            png_path = Path(folder) / 'replacement.png'
+            Image.new('RGBA', (4, 4), (80, 120, 160, 255)).save(png_path)
+            image = Material('Replacement', {'eiem_section': 'TextureReplacement'})
+            image.filepath = str(png_path)
+            textures, texture_inputs = {}, {}
+            material = Material('Body', {'eiem_source': 'assets/body', 'eiem_name': 'Body'})
+            record = exporter.collect_material(addon, source, material, {'slot': image},
+                textures, folder, None, texture_only=True, texture_inputs=texture_inputs)
+            self.texture_compressor_mock.assert_called_once()
+            texture_id = record['textureEdits'][0]['texture']
+            self.assertEqual(texture_inputs[texture_id]['images'], [image])
+            self.assertNotIn('dds_path', texture_inputs[texture_id])
+
+            root = Path(folder) / 'published'
+            root.mkdir()
+            relative = 'textures/' + texture_id + '.dds'
+            (root / 'mod.ini').write_text(
+                '[Mod]\nformat=3\n[' + texture_id + ']\ndds=' + relative + '\n',
+                encoding='utf-8')
+            published_dds = root / relative
+            published_dds.parent.mkdir(parents=True)
+            published_dds.write_bytes(dds_bc7(4, 4, bytes(16)))
+            exporter._copy_texture_dds_inputs(root, texture_inputs)
+            exporter._update_texture_image_paths(root, texture_inputs)
+            self.assertEqual(exporter.texture_compression.parse_source_dds(
+                published_dds.read_bytes())['format'], 'BC7')
+            self.assertEqual(Path(image.filepath), published_dds)
+
+    def test_format3_passthrough_copies_exact_dds_and_updates_image_path(self):
+        payload = bytes(range(16))
+        raw_dds = dds_bc7(4, 4, payload, dxgi=99)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / 'published'
+            root.mkdir()
+            (root / 'mod.ini').write_text(
+                '[Mod]\nformat=3\n[TextureExample]\ndds=textures/TextureExample.dds\n',
+                encoding='utf-8')
+            source_dds = Path(folder) / 'source.dds'
+            source_dds.write_bytes(raw_dds)
+            image = Material('Image', {})
+            image.filepath = str(Path(folder) / 'source.png')
+            texture_inputs = {'TextureExample': {
+                'dds_path': source_dds,
+                'dds_hash': hashlib.sha256(raw_dds).hexdigest().upper(),
+                'images': [image],
+            }}
+
+            exporter._copy_texture_dds_inputs(root, texture_inputs)
+            exporter._update_texture_image_paths(root, texture_inputs)
+
+            output_dds = root / 'textures/TextureExample.dds'
+            self.assertEqual(output_dds.read_bytes(), raw_dds)
+            parsed = exporter.texture_compression.parse_source_dds(output_dds.read_bytes())
+            self.assertEqual(parsed['pixels'], payload)
+            self.assertEqual(Path(image.filepath), output_dds)
+
     def test_material_switch_definition_validates_user_selected_materials(self):
         validate = addon_function('material_switch_definition', {
             're': __import__('re'), 'validate_switch_key': lambda key: key},
@@ -327,7 +448,8 @@ class NativeExportCoreTests(unittest.TestCase):
                           pointer=dict(isNull=False, identity='native-tex'))]),
                           native=dict(typeHash='12' * 16))
             source = SimpleNamespace(resolve=lambda *args: native, manifest=dict(resources=[
-                dict(identity='native-tex', logicalPath='assets/shared_d', name='Shared_D')]))
+                dict(identity='native-tex', logicalPath='assets/shared_d', name='Shared_D',
+                     details=dict(format='BC7', colorSpace=1))]))
             addon = SimpleNamespace(image_absolute_path=lambda image: image.filepath,
                 write_texture=lambda path, image: shutil.copyfile(image.filepath, path),
                 material_override_payload=lambda mat, *args, **kwargs:
@@ -351,6 +473,100 @@ class NativeExportCoreTests(unittest.TestCase):
             updated = exporter.collect_material(addon, source, mat, images, {},
                 folder, None, texture_only=True, texture_cache={})
             self.assertEqual(updated['textureEdits'][0]['texture'], first)
+
+    def test_shared_author_image_uses_one_texture_resource_across_materials(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'shared.png'
+            Image.new('RGBA', (2, 2), (40, 80, 120, 255)).save(path)
+            image = Material('SharedImage', {'eiem_section': 'TextureShared'})
+            image.filepath = str(path)
+            native = dict(details=dict(textures=[dict(property='_BaseMap',
+                          pointer=dict(isNull=False, identity='native-tex'))]),
+                          native=dict(typeHash='12' * 16))
+            source = SimpleNamespace(resolve=lambda *args: native, manifest=dict(resources=[
+                dict(identity='native-tex', logicalPath='assets/shared_d', name='Shared_D',
+                     details=dict(format='BC7', colorSpace=1))]))
+            addon = SimpleNamespace(image_absolute_path=lambda owner: owner.filepath,
+                write_texture=lambda output, owner: shutil.copyfile(owner.filepath, output),
+                material_override_payload=lambda *args, **kwargs:
+                    (['texture._BaseMap=shared'], None))
+            textures, cache, records = {}, {}, []
+            for mid in ('MaterialVariantA', 'MaterialVariantB'):
+                material = Material(mid, dict(eiem_source='assets/shared_mat', eiem_name='SharedMaterial'))
+                records.append(exporter.collect_material(
+                    addon, source, material, {'shared': image}, textures, folder, None,
+                    texture_only=True, mid=mid, texture_cache=cache))
+            first, second = (row['textureEdits'][0]['texture'] for row in records)
+            self.assertEqual(first, second)
+            self.assertEqual(len(textures), 1)
+
+    def test_source_texture_png_is_compressed_when_exported(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            texture_path = root / 'textures' / 'source.png'
+            texture_path.parent.mkdir()
+            Image.new('RGBA', (2, 2), (40, 80, 120, 255)).save(texture_path)
+            image = Material('SourceTexture', {'eiem_section': 'TextureSource'})
+            image.filepath = str(texture_path)
+            native = dict(details=dict(textures=[dict(property='_BaseMap',
+                          pointer=dict(isNull=False, identity='native-tex'))]),
+                          native=dict(typeHash='12' * 16))
+            source = SimpleNamespace(package=root,
+                resolve=lambda *args: native,
+                manifest=dict(resources=[dict(identity='native-tex',
+                    logicalPath='assets/game/source', name='Source',
+                    authorFile='textures/source.png',
+                    details=dict(format='BC7', colorSpace=1))]))
+            addon = SimpleNamespace(
+                image_absolute_path=lambda owner: owner.filepath,
+                material_override_payload=lambda *args, **kwargs: (
+                    ['format=EFFMAT', 'version=1', 'overrides=true',
+                     'source=assets/game/material', 'name=Material',
+                     'texture._BaseMap=TextureSource'], None))
+            textures = {}
+            record = exporter.collect_material(addon, source,
+                Material('Material', {'eiem_source': 'assets/game/material'}),
+                {'TextureSource': image}, textures, folder, None,
+                texture_only=True, include_native_fields=False)
+            self.texture_compressor_mock.assert_called_once()
+            self.assertEqual(len(textures), 1)
+            self.assertEqual(len(record['textureEdits']), 1)
+            self.assertIn('texture._BaseMap', record['authorData'].decode())
+
+    def test_collect_material_preserves_complete_effmat_author_snapshot(self):
+        values = ["format=EFFMAT", "version=1", "overrides=true",
+                  "source=assets/game/body.mat", "name=Body",
+                  "float._Gloss=.4"]
+        addon = SimpleNamespace(material_override_payload=lambda *args, **kwargs: (values, None))
+        source = SimpleNamespace(resolve=lambda *args: dict(
+            native=dict(typeHash="12" * 16), details=dict(textures=[])))
+        material = Material("MaterialBody", dict(eiem_source="assets/game/body.mat"))
+        with tempfile.TemporaryDirectory() as folder:
+            record = exporter.collect_material(addon, source, material, {}, {}, folder,
+                                               None, texture_only=True)
+        self.assertEqual(record["authorData"], ("\n".join(values) + "\n").encode("utf-8"))
+
+    def test_format3_collect_material_skips_native_material_snapshot(self):
+        values = ["format=EFFMAT", "version=1", "overrides=true",
+                  "source=assets/game/body.mat", "name=Body", "float._Gloss=.4"]
+        addon = SimpleNamespace(material_override_payload=lambda *args, **kwargs: (values, None))
+        def unexpected_source_lookup(*args):
+            raise AssertionError("scalar-only Format 3 export should not read source Material bytes")
+        source = SimpleNamespace(resolve=unexpected_source_lookup)
+        material = Material("MaterialBody", dict(eiem_source="assets/game/body.mat",
+                                                   eiem_name="Body"))
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+                exporter, "native_material_fields",
+                side_effect=AssertionError("full native Material snapshot was requested")):
+            record = exporter.collect_material(addon, source, material, {}, {}, folder,
+                                               None, include_native_fields=False)
+        self.assertEqual(record["fieldData"], {})
+        self.assertEqual(record["nativeTypeHash"], "00" * 16)
+        self.assertEqual(record["sourcePath"], "assets/game/body.mat")
+        self.assertEqual(record["sourceAsset"], "Body")
+        self.assertEqual(record["authorData"], ("\n".join(values) + "\n").encode("utf-8"))
 
     def test_mesh_snapshots_share_only_the_current_exports_skin_context(self):
         calls=[]
@@ -500,7 +716,8 @@ class NativeExportCoreTests(unittest.TestCase):
                 _owner_revision=lambda owner: owner.get('revision', 0), write_texture=write_texture,
                 material_override_payload=lambda *args, **kwargs: (
                     ['texture._BaseMap=slot', 'texture._DetailMap=slot'], None))
-            tex = dict(identity='native-tex', logicalPath='assets/body_d', name='Body_D')
+            tex = dict(identity='native-tex', logicalPath='assets/body_d', name='Body_D',
+                       details=dict(format='BC7', colorSpace=1))
             native = dict(details=dict(textures=[dict(property=prop, pointer=dict(
                 isNull=False, identity='native-tex')) for prop in ('_BaseMap', '_DetailMap')]),
                 native=dict(typeHash='12' * 16))
@@ -517,17 +734,23 @@ class NativeExportCoreTests(unittest.TestCase):
             # Different native templates can share one Blender image. Pixels
             # are converted once, but each target keeps its own source identity.
             source.manifest['resources'].append(dict(identity='native-detail',
-                logicalPath='assets/detail_d', name='Detail_D'))
+                logicalPath='assets/detail_d', name='Detail_D', details=dict(format='BC5', colorSpace=0)))
             native['details']['textures'][1]['pointer']['identity'] = 'native-detail'
             detail_record = collect()
             detail = detail_record['textureEdits'][1]['texture']
             self.assertEqual(len(calls), 0)
             self.assertEqual(textures[detail]['sourceAsset'], 'Detail_D')
             self.assertEqual(textures[detail]['sourcePath'], 'assets/detail_d')
-            self.assertIs(textures[detail]['pixels'], textures[first]['pixels'])
+            self.assertEqual(textures[first]['colorSpace'], 1)
+            self.assertEqual(textures[detail]['colorSpace'], 0)
+            self.assertEqual(textures[first]['format'], 'BC7')
+            self.assertEqual(textures[detail]['format'], 'BC5')
+            self.assertEqual(textures[detail]['sourcePixelsHash'], textures[first]['sourcePixelsHash'])
+            self.assertNotEqual(textures[detail]['pixels'], textures[first]['pixels'])
             image['eiem_filter'] = 2
-            with self.assertRaisesRegex(ValueError, '冲突'):
-                collect()
+            reconfigured = collect()
+            self.assertNotEqual(reconfigured['textureEdits'][0]['texture'], first)
+            self.assertNotEqual(reconfigured['textureEdits'][1]['texture'], detail)
             self.assertEqual(len(calls), 0)
             image.pop('eiem_filter')
             stamp = path.stat()
@@ -537,15 +760,15 @@ class NativeExportCoreTests(unittest.TestCase):
                 collect()
             self.assertEqual(len(calls), 0)
 
-    def test_empty_native_texture_slot_uses_an_existing_schema(self):
+    def test_empty_native_texture_slot_uses_schema_and_png_is_always_compressed(self):
         from PIL import Image
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'emission.png'
             Image.new('RGBA',(2,2),(255,0,0,255)).save(path)
-            image=Material('Emission'); image.filepath=str(path)
+            image=Material('Emission',{'eiem_linear':'true'}); image.filepath=str(path)
             native=dict(details=dict(textures=[dict(property='_EmissionMap',pointer=dict(isNull=True)),
                          dict(property='_BaseMap',pointer=dict(isNull=False,identity='base'))]),native=dict(typeHash='12'*16))
-            source=SimpleNamespace(resolve=lambda *args:native,manifest=dict(resources=[dict(identity='base',name='Base_D',logicalPath='assets/base')]))
+            source=SimpleNamespace(resolve=lambda *args:native,manifest=dict(resources=[dict(identity='base',name='Base_D',logicalPath='assets/base',details=dict(format='BC7',colorSpace=1))]))
             addon=SimpleNamespace(material_override_payload=lambda *args,**kwargs:(['texture._EmissionMap=image'],None))
             mat=Material('MaterialNew',dict(eiem_source='assets/mat',eiem_name='Template'))
             textures={}
@@ -553,13 +776,13 @@ class NativeExportCoreTests(unittest.TestCase):
             self.assertEqual(record['textureEdits'][0]['property'],'_EmissionMap')
             texture=textures[record['textureEdits'][0]['texture']]
             self.assertEqual(texture['sourceAsset'],'Base_D')
-            prior=dict(texture,file='textures/emission.tex')
-            existing=dict(textures=[prior],_resources={'textures/emission.tex':dict(blocks=dict(pixels=texture['pixels']))})
-            with patch.object(Image.Image,'resize',side_effect=AssertionError('unchanged texture regenerated mipmaps')):
-                reused={}
-                exporter.collect_material(addon,source,mat,{'image':image},reused,folder,None,
-                                          texture_only=True,existing_package=existing)
-            self.assertTrue(next(iter(reused.values()))['retained'])
+            self.assertEqual(texture['colorSpace'],1)
+            self.texture_compressor_mock.reset_mock()
+            reused={}
+            exporter.collect_material(addon,source,mat,{'image':image},reused,folder,None,
+                                      texture_only=True)
+            self.texture_compressor_mock.assert_called_once()
+            self.assertFalse(next(iter(reused.values())).get('retained', False))
             image.is_dirty=True
             writes=[]
             addon.write_texture=lambda output,owner:(writes.append(owner),shutil.copyfile(owner.filepath,output))

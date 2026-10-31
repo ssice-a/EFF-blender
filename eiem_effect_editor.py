@@ -248,7 +248,10 @@ def refresh_fields(root):
         ids=json.loads(obj.get('eff_effect_components','[]'))
         if ids:populate(obj,edit,ids)
 def import_source(context,source):
-    state=document.load_source(source);edit=document.Editor(state)
+    return import_workspace(context, document.load_source(source))
+
+def import_workspace(context,state):
+    edit=document.Editor(state)
     # The visible particle module is authoritative for a newly authored effect.
     # The original source and other components are preserved. Advanced users
     # may explicitly re-enable this one known automatic scaling rule.

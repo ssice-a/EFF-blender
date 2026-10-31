@@ -8,6 +8,7 @@ bl_info = {
 }
 
 import configparser
+import base64
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import re
 import shutil
 import struct
 import sys
+import tempfile
 import zlib
 import math
 import uuid
@@ -1144,6 +1146,17 @@ def mesh_resource_collection(root_collection, section, payload):
 
 def import_package(root, clean=False, include_physics=False, physics_file=""):
     parser = parse_ini(root)
+    format3 = parser.get("Mod", "format", fallback="") == "3"
+    resources = {section: dict(parser.items(section)) for section in parser.sections()}
+    effect_attachments = []
+    if format3:
+        for section, values in resources.items():
+            if not section.startswith("EffectAttachment"):
+                continue
+            author_id = values.get("author", "")
+            if not author_id or author_id not in resources or resources[author_id].get("type") != "effect-author":
+                raise ValueError("Effect %s has no editable author resource; re-export it with the current Blender add-on" % section)
+            effect_attachments.append((section, values, author_id))
     collection = bpy.data.collections.get("EFF") or bpy.data.collections.new("EFF")
     if collection.name not in bpy.context.scene.collection.children:
         bpy.context.scene.collection.children.link(collection)
@@ -1156,7 +1169,25 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
     package_collection, import_id = package_import_collection(collection, root)
     mesh_collection = import_child_collection(package_collection, "Meshes", "MESHES", import_id)
     skeleton_collection = import_child_collection(package_collection, "Skeletons", "SKELETONS", import_id)
-    resources = {section: dict(parser.items(section)) for section in parser.sections()}
+    targets_by_part = {}
+    if format3:
+        for section, values in resources.items():
+            if not section.lower().startswith("replace") or values.get("handling") == "skip":
+                continue
+            targets = [(values.get("target.path", ""), values.get("target.asset", ""), 0)]
+            lods = {}
+            for key, value in values.items():
+                match = re.fullmatch(r"lod\.([1-9][0-9]*)\.(path|asset)", key)
+                if match:
+                    lods.setdefault(int(match[1]), {})[match[2]] = value
+            for level, target in sorted(lods.items()):
+                if set(target) != {"path", "asset"}:
+                    raise ValueError("Incomplete LOD target in " + section)
+                targets.append((target["path"], target["asset"], level))
+            for part in values.get("parts", "").split(","):
+                part = part.strip()
+                if part:
+                    targets_by_part.setdefault(part, []).extend(targets)
     render_owners = {}
     for section, values in resources.items():
         if not section.lower().startswith("prefab"):
@@ -1182,7 +1213,8 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
             # Do not let Blender's global filepath cache alias two imported
             # Mod packages. Their section/source metadata is package-local,
             # even when both happen to point at the same disk PNG.
-            image = bpy.data.images.load(str(safe_path(root, values["path"])), check_existing=False)
+            image_path = values.get("dds", values["path"]) if format3 else values["path"]
+            image = bpy.data.images.load(str(safe_path(root, image_path)), check_existing=False)
             used = {str(item.get("eiem_section")): item for item in bpy.data.images
                     if item.get("eiem_section") and item is not image}
             image_section = section
@@ -1191,7 +1223,9 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
             image["eiem_section"] = image_section
             image["eiem_source_section"] = section
             image["eiem_author_package"] = str(Path(root).resolve())
-            image["eiem_relative_path"] = values["path"]
+            image["eiem_relative_path"] = image_path
+            if format3:
+                image["eiem_native_resource_path"] = values["path"]
             image["eiem_source"] = values.get("source", "")
             image["eiem_name"] = values.get("name", image.name)
             image["eiem_target_path"] = values.get("target.path", "")
@@ -1204,10 +1238,25 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
             image["eiem_mip_bias"] = values.get("mip_bias", "0")
             textures[section] = image
         except Exception:
+            if format3:
+                raise
             continue
     materials = {}
     for section, values in resources.items():
         if section.lower().startswith("material") and values.get("path"):
+            if format3:
+                material_values = format_io.read_format3_material_resource(
+                    safe_path(root, values["path"]), section, values["path"])
+                material_values.pop("_source_asset", None)
+                material_values.pop("_author_hash", None)
+                material_values["target.path"] = values.get(
+                    "source.path", material_values["source"])
+                material_values["target.asset"] = values.get(
+                    "source.asset", material_values.get("name", section))
+                material = load_material(root, section, material_values, textures)
+                material["eiem_material_file"] = values["path"]
+                materials[section] = material
+                continue
             material_values = read_flat_properties(safe_path(root, values["path"]))
             # The Material file owns shader properties. The resource section
             # owns package location and preserves original-game identity as
@@ -1251,14 +1300,20 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
     for section, values in resources.items():
         if not section.lower().startswith("mesh") or not values.get("path"):
             continue
-        payload = read_mesh(safe_path(root, values["path"]))
+        payload = (format_io.read_format3_mesh_resource(safe_path(root, values["path"]))
+                   if format3 else read_mesh(safe_path(root, values["path"])))
         mesh = make_mesh(section, payload)
         # Preserve offline identity for authoring and for the generated Render
         # selector. Resource declarations do not apply replacements themselves.
+        part_targets = targets_by_part.get(payload.get("part", ""), []) if format3 else []
         mesh["eiem_target_path"] = values.get(
-            "target.path", payload.get("source", ""))
+            "target.path", part_targets[0][0] if part_targets else payload.get("source", ""))
         mesh["eiem_target_asset"] = values.get(
-            "target.asset", payload.get("name", ""))
+            "target.asset", part_targets[0][1] if part_targets else payload.get("name", ""))
+        if part_targets:
+            mesh["eiem_target_lods_json"] = json.dumps(
+                [{"path": path, "asset": asset, "level": level}
+                 for path, asset, level in part_targets], separators=(",", ":"))
         obj = bpy.data.objects.new(section, mesh)
         obj["eiem_author_package"] = str(Path(root).resolve())
         obj["eiem_import_id"] = import_id
@@ -1319,15 +1374,32 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
                     pass
         obj["eiem_original_material_sections_json"] = json.dumps(
             original_materials, sort_keys=True, separators=(",", ":"))
+    if format3:
+        for section, values in resources.items():
+            if not section.lower().startswith("part") or not values.get("mesh"):
+                continue
+            obj = meshes.get(values["mesh"])
+            material_section = values.get("material", "")
+            material = materials.get(material_section)
+            if obj is None or material is None:
+                raise ValueError("Format 3 Part references a missing Mesh or Material: " + section)
+            if len(obj.data.materials) == 0:
+                obj.data.materials.append(material)
+            else:
+                obj.data.materials[0] = material
+            obj["eiem_part_section"] = section
+            obj["eiem_render_section"] = section
+            obj["eiem_original_material_sections_json"] = json.dumps({"0": material_section})
+            obj["eiem_format3_import"] = True
     for armature in armatures_by_hierarchy.values():
         armature.data["eiem_source_bindings_json"] = json.dumps(shared_skin_bindings(armature), separators=(",", ":"))
-    if include_physics:
+    if include_physics or (format3 and any(values.get("type") == "physics" for values in resources.values())):
         physics_resources = [
             (section, safe_path(root, values["path"]))
             for section, values in resources.items()
-            if section.lower().startswith("physics") and values.get("path")
+            if section.lower().startswith(("physics", "resourcephysics")) and values.get("path")
         ]
-        if physics_file:
+        if physics_file and not format3:
             physics_resources = [("", Path(physics_file))]
         if not physics_resources:
             candidate = Path(root) / "physics" / "components.json"
@@ -1349,17 +1421,151 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
             physics_rigs[physics_section] = skeleton
         rigs = list(armatures_by_hierarchy.values())
         for section, file in physics_resources:
-            rig = physics_rigs.get(section)
+            format3_physics = bool(
+                format3 and section and resources.get(section, {}).get("type") == "physics")
+            snapshot = (format_io.read_format3_physics_resource(
+                file, section, resources[section]["path"]) if format3_physics else None)
+            if format3_physics:
+                declared_targets = set()
+                rule_ids = {value.strip() for value in
+                            resources[section].get("targets", "").split(",") if value.strip()}
+                for rule_id in rule_ids:
+                    rule = resources.get(rule_id)
+                    if rule is None or not rule_id.lower().startswith("replace"):
+                        raise ValueError("Physics %s references a missing Replace rule %s" %
+                                         (section, rule_id))
+                    declared_targets.add((rule.get("target.path", ""),
+                                          rule.get("target.asset", "")))
+                    lods = {}
+                    for key, value in rule.items():
+                        match = re.fullmatch(r"lod\.([1-9][0-9]*)\.(path|asset)", key)
+                        if match:
+                            lods.setdefault(int(match[1]), {})[match[2]] = value
+                    for level, target in lods.items():
+                        if set(target) != {"path", "asset"}:
+                            raise ValueError("Incomplete LOD target in " + rule_id)
+                        declared_targets.add((target["path"], target["asset"]))
+                if set(snapshot["targets"]) != declared_targets:
+                    raise ValueError("Physics %s Mesh targets differ from mod.ini" % section)
+                physics_document = physics_authoring.document.decode(snapshot["document"])
+                with tempfile.TemporaryDirectory(prefix="eiem-format3-physics-skeleton-") as temporary:
+                    skeleton_file = Path(temporary) / "physics.skeleton"
+                    skeleton_file.write_bytes(snapshot["skeleton"])
+                    skeleton_payload = read_skeleton(skeleton_file)
+                hierarchy = skeleton_hierarchy_key(skeleton_payload)
+                rig = armatures_by_hierarchy.get(hierarchy)
+                if rig is None:
+                    rig = make_armature("Skeleton_" + section, skeleton_payload, skeleton_collection)
+                    rig["eiem_author_package"] = str(Path(root).resolve())
+                    rig["eiem_import_id"] = import_id
+                    armatures_by_hierarchy[hierarchy] = rig
+                    skeletons[section] = rig
+                    skeleton_payloads[section] = skeleton_payload
+                    rigs.append(rig)
+            else:
+                rig = physics_rigs.get(section)
             if rig is None:
                 if len(rigs) != 1:
                     raise ValueError(
                         "无法从 Render.physics 确定 %s 使用的 Skeleton" %
                         (section or Path(file).name))
                 rig = rigs[0]
-            if file.suffix.lower() == ".physics":
+            if format3_physics:
+                with tempfile.TemporaryDirectory(prefix="eiem-format3-physics-") as temporary:
+                    package_root = Path(temporary)
+                    skeleton_path = safe_path(package_root, physics_document["skeleton"])
+                    skeleton_path.parent.mkdir(parents=True, exist_ok=True)
+                    skeleton_path.write_bytes(snapshot["skeleton"])
+                    physics_path = package_root / "author.physics"
+                    physics_path.write_bytes(snapshot["document"])
+                    before = set(bpy.data.objects)
+                    physics_authoring.import_physics(physics_path, rig)
+                    for obj in set(bpy.data.objects) - before:
+                        if getattr(obj, "eiem_physics", None) and obj.eiem_physics.rig == rig:
+                            obj["eiem_physics_source_file"] = str(file)
+            elif file.suffix.lower() == ".physics":
                 physics_authoring.import_physics(file, rig)
             else:
                 physics_authoring.native.import_source(file, rig)
+    if format3:
+        effect_editor = sys.modules[__package__ + ".eiem_effect_editor"] if __package__ else sys.modules["eiem_effect_editor"]
+        cache_root = bpy.utils.user_resource("DATAFILES", path="eiem/effect-sources", create=True)
+        part_meshes = {section: meshes.get(values.get("mesh", ""))
+                       for section, values in resources.items() if section.startswith("Part")}
+        for section, values, author_id in effect_attachments:
+            author_values = resources[author_id]
+            workspace, attachment, _source = format_io.materialize_format3_effect_author_resource(
+                safe_path(root, author_values["path"]), author_id, author_values["path"], cache_root)
+            effect_root = effect_editor.import_workspace(bpy.context, workspace)
+            effect_root.name = attachment.get("label") or section
+            effect_root.eff_effect.enabled = True
+            effect_root.eff_effect.build_path = ""
+            owner = part_meshes.get(attachment.get("part", ""))
+            if owner is None:
+                owner = next((obj for obj in meshes.values()
+                              if obj.get("eiem_target_path") == attachment.get("targetPath") and
+                              obj.get("eiem_target_asset") == attachment.get("targetAsset")), None)
+            if owner is not None:
+                effect_root.eff_effect.owner = owner
+                owner["eiem_source_owner_path"] = attachment.get("rendererPath", "")
+                rig = effect_editor.preview.mount_rig(owner)
+                skeleton_payload = None
+                if attachment.get("mountSkeleton"):
+                    skeleton_bytes = base64.b64decode(attachment["mountSkeleton"], validate=True)
+                    with tempfile.TemporaryDirectory(prefix="eiem-format3-effect-skeleton-") as temporary:
+                        skeleton_path = Path(temporary) / "mount.skeleton"
+                        skeleton_path.write_bytes(skeleton_bytes)
+                        skeleton_payload = read_skeleton(skeleton_path)
+                    hierarchy = skeleton_hierarchy_key(skeleton_payload)
+                    current_hierarchy = next(
+                        (key for key, candidate in armatures_by_hierarchy.items() if candidate is rig), None)
+                    if current_hierarchy != hierarchy:
+                        rig = armatures_by_hierarchy.get(hierarchy)
+                        if rig is None:
+                            rig = make_armature("Skeleton_Effect_" + section, skeleton_payload, skeleton_collection)
+                            rig["eiem_author_package"] = str(Path(root).resolve())
+                            rig["eiem_import_id"] = import_id
+                            armatures_by_hierarchy[hierarchy] = rig
+                            rigs.append(rig)
+                    mesh_section = next((name for name, obj in meshes.items() if obj is owner), None)
+                    mesh_payload = mesh_payloads.get(mesh_section, {})
+                    palette = resolve_mesh_bone_palette(
+                        mesh_payload, rig, skeleton_payload.get("bones") or None)
+                    owner["eiem_skeleton"] = rig["eiem_section"]
+                    owner["eiem_bone_palette_json"] = json.dumps(palette, separators=(",", ":"))
+                    owner["eiem_bone_paths_json"] = json.dumps([
+                        str(rig.data.bones[index].get("eiem_path", rig.data.bones[index].name))
+                        for index in palette], separators=(",", ":"))
+                    modifier = owner.modifiers.get("EFF Armature") or owner.modifiers.new("EFF Armature", "ARMATURE")
+                    modifier.object = rig
+                    if mesh_payload:
+                        bind_mesh_weights(owner, mesh_payload, rig, palette)
+                bone_path = attachment.get("bone", "")
+                if rig and bone_path:
+                    bone = next((item for item in rig.data.bones
+                                 if item.get("eiem_path", item.name) == bone_path), None)
+                    if bone:
+                        effect_root.eff_effect.bone = bone.name
+            effect_root.eff_effect.toggle_keys.clear()
+            for key in attachment.get("keys", []):
+                effect_root.eff_effect.toggle_keys.add().key = str(key)
+            position = Vector(attachment.get("position", (0, 0, 0)))
+            rotation_values = attachment.get("rotation", (0, 0, 0, 1))
+            rotation = Quaternion((rotation_values[3], rotation_values[0], rotation_values[1], rotation_values[2]))
+            scale = Vector(attachment.get("scale", (1, 1, 1)))
+            effect_root.matrix_basis = (effect_editor.BASIS @ Matrix.LocRotScale(position, rotation, scale) @
+                                        effect_editor.BASIS.inverted())
+            effect_collection = bpy.data.collections.get(effect_root.get("eff_effect_collection", ""))
+            if effect_collection is not None:
+                if effect_collection.name in bpy.context.scene.collection.children:
+                    bpy.context.scene.collection.children.unlink(effect_collection)
+                if effect_collection.name not in package_collection.children:
+                    package_collection.children.link(effect_collection)
+                effect_collection["eiem_collection_role"] = "EFFECTS"
+                effect_collection["eiem_import_id"] = import_id
+        for armature in armatures_by_hierarchy.values():
+            armature.data["eiem_source_bindings_json"] = json.dumps(
+                shared_skin_bindings(armature), separators=(",", ":"))
     return len(meshes)
 
 
@@ -2323,7 +2529,10 @@ def write_mesh(path, obj, return_snapshot=False, skin_cache=None):
     if return_snapshot:
         # Same corner/skin/shape mapping as the editable writer, without an
         # intermediate author file or merged-submesh runtime workaround.
-        return dict(vertex_count=len(source_vertices), vertices=vertices,
+        return dict(version=6, coordinate=coordinate,
+                    source=obj.data.get("eiem_source", ""),
+                    name=obj.data.get("eiem_asset", obj.name),
+                    vertex_count=len(source_vertices), vertices=vertices,
                     normals=normals, tangents=tangents, colors=colors, uvs=uv_layers,
                     indices=indices, index_count=len(indices), submeshes=submeshes,
                     skin=skin, bindposes=bindposes, bone_hashes=bone_hashes,
@@ -2332,53 +2541,19 @@ def write_mesh(path, obj, return_snapshot=False, skin_cache=None):
                     blend_vertices=blend_vertices, blend_frames=blend_frames,
                     blend_channels=blend_channels, blend_weights=blend_weights,
                     additional=additional)
-    writer = Writer(); writer.raw(MAGIC_MESH); writer.i32(6)
-    writer.string(coordinate)
-    writer.string(obj.data.get("eiem_source", "")); writer.string(obj.data.get("eiem_asset", obj.name))
-    writer.i32(len(source_vertices)); writer.floats(vertices); writer.floats(normals)
-    writer.floats(tangents); writer.floats(colors)
-    for values in uv_layers: writer.floats(values)
-    writer.i32(len(indices))
-    writer.uints(indices)
-    writer.i32(len(submeshes))
-    for topology, start, count, base, first, vertex_count in submeshes:
-        writer.i32(topology); writer.u32(start); writer.u32(count)
-        writer.u32(base); writer.u32(first); writer.u32(vertex_count)
-    writer.i32(len(skin))
-    writer.skin(skin)
-    writer.i32(len(bindposes))
-    for matrix in bindposes:
-        values = list(matrix)[:16]
-        values += [0.0] * (16 - len(values))
-        for value in values: writer.f32(value)
-    writer.i32(len(bone_hashes))
-    writer.uints(bone_hashes)
-    writer.i32(len(bone_paths))
-    for value in bone_paths: writer.string(value)
-    writer.i32(len(bone_index_paths))
-    for value in bone_index_paths: writer.string(value)
-    writer.i32(len(bone_sources))
-    for source in bone_sources:
-        writer.string(source[0]); writer.string(source[1]); writer.u32(source[2])
-    writer.i32(len(bone_source_candidates))
-    for candidates in bone_source_candidates:
-        writer.i32(len(candidates))
-        for source in candidates:
-            writer.string(source[0]); writer.string(source[1]); writer.u32(source[2])
-    writer.i32(len(blend_vertices))
-    writer.blend_vertices(blend_vertices)
-    writer.i32(len(blend_frames))
-    for name, first, count, has_normals, has_tangents, has_additional in blend_frames:
-        writer.string(name); writer.u32(first); writer.u32(count)
-        writer.raw(bytes((int(has_normals), int(has_tangents), int(has_additional))))
-    writer.i32(len(blend_channels))
-    for name, name_hash, first, count in blend_channels:
-        writer.string(name); writer.u32(name_hash); writer.u32(first); writer.u32(count)
-    writer.floats(blend_weights)
-    writer.i32(len(additional))
-    for value in additional:
-        for component in value: writer.f32(component)
-    path.write_bytes(writer.data)
+    payload = dict(version=6, coordinate=coordinate,
+                   source=obj.data.get("eiem_source", ""),
+                   name=obj.data.get("eiem_asset", obj.name),
+                   vertex_count=len(source_vertices), vertices=vertices,
+                   normals=normals, tangents=tangents, colors=colors, uvs=uv_layers,
+                   indices=indices, submeshes=submeshes, skin=skin,
+                   bindposes=bindposes, bone_hashes=bone_hashes,
+                   bone_paths=bone_paths, bone_index_paths=bone_index_paths,
+                   bone_sources=bone_sources, bone_source_candidates=bone_source_candidates,
+                   blend_vertices=blend_vertices, blend_frames=blend_frames,
+                   blend_channels=blend_channels, blend_weights=blend_weights,
+                   additional=additional)
+    path.write_bytes(format_io.encode_mesh(payload))
 
 
 def skeleton_author_nodes(obj):
@@ -2451,7 +2626,7 @@ def skeleton_author_nodes(obj):
     return records
 
 
-def write_skeleton(path, obj):
+def encode_skeleton(obj):
     records = skeleton_author_nodes(obj)
     writer = Writer(); writer.raw(MAGIC_SKEL); writer.i32(2)
     writer.string(obj.get("eiem_coordinate_space", "unity-y-up-left-handed"))
@@ -2470,7 +2645,11 @@ def write_skeleton(path, obj):
     writer.i32(-1)
     writer.i32(len(records))
     writer.raw(bytes(int(source) for bone, record, source in records))
-    path.write_bytes(writer.data)
+    return bytes(writer.data)
+
+
+def write_skeleton(path, obj):
+    Path(path).write_bytes(encode_skeleton(obj))
 
 
 def write_texture(path, image):
@@ -2989,9 +3168,21 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
             resource_scope=resource_scope, game_directory=game_directory,
             effect_roots=effect_roots)
         costs=result.get('exportCostsMs',{})
-        print('[EFF] 导出耗时：整理 %.2fs / 编译 %.2fs / 发布 %.2fs；网格缓存 %d 命中 / %d 重建'%(
-            costs.get('author',0)/1000,costs.get('compile',0)/1000,costs.get('publish',0)/1000,
-            result.get('meshSnapshotHits',0),result.get('meshSnapshotMisses',0)))
+        if result.get('format') == 3:
+            detail=result.get('exportDetailMs',{})
+            print('[EFF] Format 3 冷导出：总计 %.2fs / Blender 作者阶段 %.2fs / Format 3 生成与校验 %.2fs / 发布 %.2fs；网格缓存 %d 命中 / %d 重建'%(
+                result.get('exportSeconds',0),costs.get('author',0)/1000,
+                costs.get('format3',0)/1000,costs.get('publish',0)/1000,
+                result.get('meshSnapshotHits',0),result.get('meshSnapshotMisses',0)))
+            print('[EFF] Blender 阶段细分：网格快照 %.2fs / 材质与贴图收集 %.2fs / 网格编码 %.2fs / 特效收集 %.2fs / 写作者目录 %.2fs / 特效作者数据 %.2fs'%(
+                detail.get('meshSnapshot',0)/1000,detail.get('materialTexture',0)/1000,
+                detail.get('meshEncoding',0)/1000,detail.get('effect',0)/1000,
+                detail.get('writeAuthor',0)/1000,detail.get('effectAuthor',0)/1000))
+            print('[EFF] 原生 writer：%s' % result.get('format3Writer','未提供'))
+        else:
+            print('[EFF] 导出耗时：整理 %.2fs / 编译 %.2fs / 发布 %.2fs；网格缓存 %d 命中 / %d 重建'%(
+                costs.get('author',0)/1000,costs.get('compile',0)/1000,costs.get('publish',0)/1000,
+                result.get('meshSnapshotHits',0),result.get('meshSnapshotMisses',0)))
         return result
     finally:
         try:
@@ -4100,23 +4291,6 @@ class EFF_PT_shared_tools(bpy.types.Panel):
             layout.label(text='此目录尚无可用工具，点击“准备工具”下载。')
 
 
-class EFF_PT_index_workspace(bpy.types.Panel):
-    bl_label = 'AnimeStudio 解包索引'
-    bl_idname = 'VIEW3D_PT_eiem_index_workspace'
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'EFF'
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        layout = self.layout
-        workspace = shared_resources.index_workspace()
-        layout.label(text='选择 AnimeStudio 解包索引的位置')
-        layout.label(text=str(workspace) if workspace else '尚未选择', icon='FILE_FOLDER')
-        layout.operator(EFF_OT_choose_index_workspace.bl_idname, icon='FILEBROWSER')
-        layout.label(text='选择工作区或其中的 index 文件夹')
-
-
 def operator_lod_levels(operator, meshes):
     selected = [index for index, enabled in enumerate((
         operator.lod0, operator.lod1, operator.lod2,
@@ -4172,7 +4346,7 @@ class EFF_OT_import(ImportHelper, bpy.types.Operator):
     directory: StringProperty(subtype="DIR_PATH")
     filter_glob: StringProperty(default="mod.ini", options={"HIDDEN"})
     clean: BoolProperty(name="Clear EFF collection", default=False)
-    include_physics: BoolProperty(name="导入物理骨骼与碰撞体", default=False,
+    include_physics: BoolProperty(name="导入物理骨骼与碰撞体", default=True,
                                  description="可选；物理数据不影响只导出 Mesh")
     physics_file: StringProperty(name="物理源文件", subtype="FILE_PATH",
                                 description="可选 components.json 或 .physics；留空使用包内声明")
@@ -4509,29 +4683,6 @@ class EFF_OT_detect_game_directory(bpy.types.Operator):
             return {'CANCELLED'}
 
 
-class EFF_OT_choose_index_workspace(bpy.types.Operator):
-    bl_idname = 'eiem.choose_index_workspace'
-    bl_label = '选择 AnimeStudio 索引位置'
-    bl_description = '选择 AnimeStudio 工作区或其中的 index 文件夹'
-
-    directory: StringProperty(name='AnimeStudio 索引位置', subtype='DIR_PATH')
-
-    def invoke(self, context, _event):
-        current = shared_resources.index_workspace()
-        self.directory = str(current) if current else ''
-        context.window_manager.fileselect_add(self)
-        return {'RUNNING_MODAL'}
-
-    def execute(self, _context):
-        try:
-            shared_resources.set_index_workspace(self.directory)
-            self.report({'INFO'}, 'AnimeStudio 索引位置已保存')
-            return {'FINISHED'}
-        except (OSError, ValueError) as error:
-            self.report({'ERROR'}, str(error))
-            return {'CANCELLED'}
-
-
 class EFF_OT_choose_resource_root(bpy.types.Operator):
     bl_idname = 'eiem.choose_resource_root'
     bl_label = '选择工具存储目录'
@@ -4743,7 +4894,6 @@ classes = (
     EFF_AddonPreferences,
     EFF_OT_choose_resource_root,
     EFF_OT_prepare_shared_tools,
-    EFF_OT_choose_index_workspace,
     EFF_OT_detect_game_directory,
     EFF_OT_check_update,
     EFF_OT_install_update,
@@ -4773,7 +4923,6 @@ classes = (
     EFF_PT_switches,
     EFF_PT_updates,
     EFF_PT_shared_tools,
-    EFF_PT_index_workspace,
     EFF_OT_import,
     EFF_OT_import_animation,
     EFF_OT_export,

@@ -15,8 +15,10 @@ from mathutils import Matrix, Vector
 
 if __package__:
     from . import eiem_effect_document as document
+    from . import eiem_texture_compression as texture_compression
 else:
     import eiem_effect_document as document
+    import eiem_texture_compression as texture_compression
 
 BASIS = Matrix(((-1, 0, 0), (0, 0, -1), (0, 1, 0)))
 
@@ -321,7 +323,6 @@ def texture_tree(native, image, settings):
     shared_resources.add_vendor_path()
     vendor=Path(__file__).parent/'vendor'
     if vendor.is_dir() and str(vendor) not in sys.path:sys.path.insert(0,str(vendor))
-    from PIL import Image
     import numpy as np
     width, height = map(int, image.size)
     document.require(0 < width <= 16384 and 0 < height <= 16384, '贴图尺寸必须为 1～16384')
@@ -333,25 +334,24 @@ def texture_tree(native, image, settings):
     image.pixels.foreach_get(pixels)
     pixels = pixels.reshape(height, width, 4)
     document.require(np.all(np.isfinite(pixels)), '贴图包含非有限像素')
-    if image.is_float and not settings.linear:
+    color_space = native['m_ColorSpace'].data
+    document.require(color_space in (0, 1), '来源贴图缺少有效的 sRGB/Linear 元数据')
+    if image.is_float and color_space == 1:
         rgb = pixels[:, :, :3]
         pixels[:, :, :3] = np.where(rgb <= .0031308, rgb * 12.92, 1.055 * np.maximum(rgb, 0) ** (1 / 2.4) - .055)
-    bitmap = Image.fromarray(np.rint(np.clip(pixels, 0, 1) * 255).astype(np.uint8), 'RGBA')
-    payload, count = bytearray(), 0
-    while True:
-        payload.extend(bitmap.tobytes()); count += 1
-        if not settings.mipmaps or bitmap.size == (1, 1):
-            break
-        bitmap = bitmap.resize((max(1, bitmap.width // 2), max(1, bitmap.height // 2)), Image.Resampling.BOX)
+    rgba = np.rint(np.clip(pixels, 0, 1) * 255).astype(np.uint8).tobytes()
+    compressed = texture_compression.compress_rgba(
+        rgba, width, height, bool(settings.mipmaps), int(native['m_TextureFormat'].data),
+        color_space, shared_resources.native_tool_file('texconv.exe'), flip_y=False)
     tree = copy.deepcopy(native)
     document.require(tree['m_ImageCount'].data == 1 and tree['m_TextureDimension'].data == 2,
                      '来源必须是二维 Texture2D')
     for field, value in dict(m_Name=image.name, m_Width=width, m_Height=height,
-                             m_CompleteImageSize=len(payload), m_MipsStripped=0,
-                             m_TextureFormat=4, m_MipCount=count, m_IsPreProcessed=False,
-                             m_StreamingMipmaps=False, m_ColorSpace=0 if settings.linear else 1).items():
+                             m_CompleteImageSize=len(compressed['pixels']), m_MipsStripped=0,
+                             m_TextureFormat=compressed['formatId'], m_MipCount=compressed['mipCount'], m_IsPreProcessed=False,
+                             m_StreamingMipmaps=False, m_ColorSpace=color_space).items():
         tree.set(field, value)
-    tree.set('image data', bytes(payload))
+    tree.set('image data', compressed['pixels'])
     tree['m_PlatformBlob'].set_items(b'')
     for field, value in dict(offset=0, size=0, path='').items():
         tree['m_StreamData'].set(field, value)

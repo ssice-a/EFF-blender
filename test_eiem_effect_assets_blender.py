@@ -93,17 +93,19 @@ template,_=native.tree(texture['template'])
 decoded=native.codec.decode(template.schema,base64.b64decode(texture['payloadBase64']))
 assert decoded['m_MipCount'].data==3
 raw=decoded['image data'].data
-assert len(raw)==(4*2+2*1+1)*4
-expected=bytes(round(c*255) for c in pixels)
-assert raw[:32]==expected,(raw[:32],expected)
+assert decoded['m_TextureFormat'].data in (25,27)
+assert len(raw)==3*16
 from PIL import Image
 color_file=output/'color-space-check.png'
 color_bytes=bytes((64,128,192,123, 240,32,96,255))
 Image.frombytes('RGBA',(2,1),color_bytes).save(color_file)
 loaded=bpy.data.images.load(str(color_file.resolve()),check_existing=True)
-previous=slot.linear;slot.linear=False
+source_color_space=template['m_ColorSpace'].data
+previous=slot.linear;slot.linear=not bool(source_color_space)
 color_tree=assets.texture_tree(template,loaded,slot)
-assert color_tree['image data'].data[:8]==color_bytes,('sRGB file pixels changed',color_tree['image data'].data[:8],list(loaded.pixels[:8]))
+assert color_tree['m_TextureFormat'].data in (25,27)
+assert len(color_tree['image data'].data)==16
+assert color_tree['m_ColorSpace'].data==source_color_space,'export overrode the source Texture2D color space'
 slot.linear=previous
 assert all(not a['identity'] in edit.objects for a in document['assets'])
 # Both source emitters share the imported Mesh and retain that shared binding.

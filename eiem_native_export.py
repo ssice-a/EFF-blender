@@ -1,9 +1,11 @@
-"""Blender format-2 export through the shared nativepack writer.
+"""Blender author export through the shared nativepack writer.
 
-This entry only assembles author resources and publishes an offline candidate;
-it does not call Unity or install a DLL. Geometry and material decoding remain
-in the canonical nativepack modules and the native compiler.
+Full exports publish self-describing format-3 resources. Legacy partial exports
+remain isolated until format-3 import/readback is available.
 """
+import configparser
+import base64
+import ctypes
 import hashlib
 import io
 import importlib.util
@@ -20,8 +22,12 @@ import types
 import contextlib
 try:
     from . import eiem_shared_resources as shared_resources
+    from . import eiem_texture_compression as texture_compression
+    from . import eiem_format as format_io
 except ImportError:
     import eiem_shared_resources as shared_resources
+    import eiem_texture_compression as texture_compression
+    import eiem_format as format_io
 
 
 # Native partial exports used to rebuild the Blender snapshot on every click,
@@ -33,6 +39,67 @@ _NATIVE_SNAPSHOT_CACHE_LIMIT = 128
 _NATIVE_MATERIAL_FIELDS_CACHE = {}
 _NATIVE_IMAGE_CACHE = {}
 _NATIVE_IMAGE_CACHE_BYTES = 128 * 1024 * 1024
+_FORMAT3_WRITER_LIBRARIES = {}
+
+
+class _AuthorTemplateView(ctypes.Structure):
+    _fields_ = [('kind', ctypes.c_wchar_p), ('path', ctypes.c_wchar_p),
+                ('asset', ctypes.c_wchar_p), ('cab', ctypes.c_wchar_p),
+                ('path_id', ctypes.c_int64), ('file', ctypes.c_wchar_p),
+                ('sha256', ctypes.c_wchar_p)]
+
+
+class _AuthorInputFileView(ctypes.Structure):
+    _fields_ = [('path', ctypes.c_wchar_p), ('data', ctypes.c_void_p),
+                ('size', ctypes.c_size_t)]
+
+
+def write_format3_native_assets(library_path, ini_bytes, templates, resources,
+                                author_files, output_path):
+    path = str(Path(library_path).resolve())
+    library = _FORMAT3_WRITER_LIBRARIES.get(path)
+    if library is None:
+        library = ctypes.CDLL(path)
+        library.EFF_AuthorAssetsAbi.argtypes = []
+        library.EFF_AuthorAssetsAbi.restype = ctypes.c_uint
+        library.EFF_AuthorAssets_ExportMemoryW.argtypes = [
+            ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t,
+            ctypes.POINTER(_AuthorTemplateView), ctypes.c_size_t,
+            ctypes.POINTER(_AuthorInputFileView), ctypes.c_size_t,
+            ctypes.POINTER(_AuthorInputFileView), ctypes.c_size_t,
+            ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_size_t]
+        library.EFF_AuthorAssets_ExportMemoryW.restype = ctypes.c_int
+        _FORMAT3_WRITER_LIBRARIES[path] = library
+    if library.EFF_AuthorAssetsAbi() != 2:
+        raise ValueError('Format 3 native author writer ABI is unsupported')
+    template_array = ((_AuthorTemplateView * len(templates))(
+        *(_AuthorTemplateView(row['kind'], row['path'], row['asset'], row['cab'],
+                              row['pathId'], row['file'], row['sha256'])
+          for row in templates)) if templates else None)
+
+    def file_array(files):
+        names = sorted(files)
+        buffers = [ctypes.c_char_p(files[name]) for name in names]
+        records = ((_AuthorInputFileView * len(names))(
+            *(_AuthorInputFileView(name, ctypes.cast(buffer, ctypes.c_void_p),
+                                   len(files[name]))
+              for name, buffer in zip(names, buffers))) if names else None)
+        return records, buffers
+
+    resource_array, resource_buffers = file_array(resources)
+    author_array, author_buffers = file_array(author_files)
+    ini_buffer = ctypes.c_char_p(ini_bytes)
+    response = ctypes.create_string_buffer(65536)
+    status = library.EFF_AuthorAssets_ExportMemoryW(
+        ctypes.cast(ini_buffer, ctypes.POINTER(ctypes.c_ubyte)), len(ini_bytes),
+        template_array, len(templates), resource_array, len(resources),
+        author_array, len(author_files), str(Path(output_path).resolve()),
+        response, len(response))
+    message = response.value.decode('utf-8', 'replace')
+    _ = (resource_buffers, author_buffers)
+    if status:
+        raise ValueError(message or 'Format 3 native author DLL failed')
+    return message
 
 
 class _MeshSnapshot(dict):
@@ -116,7 +183,7 @@ def pack_modules():
         sys.modules[name] = module
     from importlib import import_module
     modules = {n: import_module(name+'.'+n) for n in
-               ('author_source', 'mesh', 'delta_apply', 'type_tree', 'ini_package', 'ini_reader')}
+               ('author_source', 'mesh', 'delta_apply', 'type_tree', 'ini_package', 'ini_reader', 'author_format3')}
     dll = shared_resources.native_tool_file('eff_author_core.dll')
     return modules, dll
 
@@ -330,7 +397,7 @@ def shape_controls(addon, obj, include_hotkeys):
         result.append(record)
     return result
 
-def _texture_image_signature(addon, image):
+def _texture_image_signature(addon, image, source_color_space, source_format):
     """Identify one image snapshot for the duration of an export."""
     try:
         pointer = int(image.as_pointer())
@@ -350,7 +417,8 @@ def _texture_image_signature(addon, image):
     revision = getattr(addon, '_owner_revision', lambda value: None)(image)
     return (pointer, source, stamp, revision,
             str(image.get('eiem_mipmaps', 'true')),
-            str(image.get('eiem_linear', 'false')),
+            int(source_color_space),
+            str(source_format),
             str(image.get('eiem_filter', '1')),
             str(image.get('eiem_wrap', '0')),
             str(image.get('eiem_aniso', '1')),
@@ -377,15 +445,31 @@ def texture_bitmap(path, cache_disk=False):
             _NATIVE_IMAGE_CACHE.pop(next(iter(_NATIVE_IMAGE_CACHE)))
     return Image.frombytes('RGBA', cached[0], cached[1])
 
+
+def _texture_resource_id(section, image, color_space, target, width, height,
+                         mip_count, settings):
+    """Share one author image across bindings with identical sampling semantics."""
+    section = str(image.get('eiem_section', '') or section).strip()
+    owner = str(image.get('eiem_author_package', '')).replace('\\', '/').casefold()
+    profile = '\0'.join((
+        owner, section.casefold(), str(color_space), target['name'],
+        str(width), str(height), str(mip_count), str(settings['filter']),
+        str(settings['wrap']), str(settings['aniso']), str(settings['mipBias']),
+    ))
+    label = section.removeprefix('Texture') or Path(
+        getattr(image, 'filepath', '') or image.name).stem or image.name
+    suffix = hashlib.sha256(profile.encode('utf-8')).hexdigest()[:12]
+    return 'Texture' + token(label)[:70] + '_' + suffix
+
+
 def collect_material(addon, source, mat, images, textures, temporary, encode,
                      existing=None, texture_only=False, mid=None,
-                     texture_cache=None, existing_package=None):
-    from PIL import Image
+                     texture_cache=None, include_native_fields=True,
+                     texture_inputs=None):
     texture_cache = texture_cache if texture_cache is not None else {}
     mid = mid or material_id(mat)
     matpath = str(mat.get('eiem_target_path', '') or mat.get('eiem_source', ''))
     matasset = str(mat.get('eiem_target_asset', '') or mat.get('eiem_name', mat.name))
-    native = source.resolve('Material', matpath, matasset)
     values, _ = addon.material_override_payload(mat, images, force=True)
     props = dict(line.split('=', 1) for line in values if '=' in line)
     overrides = {k: v for k, v in props.items() if k not in
@@ -400,6 +484,10 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
             value = str(mat.get('eiem_' + key, '')).strip()
             if value and not value.replace('\\', '/').lower().startswith('assets/'):
                 overrides[key] = addon.resolve_material_texture(mat, key, value, images, bindings)
+    needs_texture_template = any(key.startswith('texture.') for key in overrides)
+    native = None
+    if (include_native_fields and not texture_only) or needs_texture_template:
+        native = source.resolve('Material', matpath, matasset)
     edits = []
     for key, section in overrides.items():
         if not key.startswith('texture.'):
@@ -416,56 +504,137 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
             if pointer is None:
                 raise ValueError('材质来源没有可用的 Texture2D 结构模板：' + prop)
         tex = next(r for r in source.manifest['resources'] if r['identity'] == pointer['identity'])
+        details = tex.get('details') or {}
+        color_space = details.get('colorSpace')
+        source_format = details.get('format')
+        if color_space not in (0, 1):
+            raise ValueError('源贴图缺少有效的 sRGB/Linear 元数据：' + tex['logicalPath'])
         image = images[section]
-        binding = hashlib.sha256((mid + '\0' + prop).encode('utf-8')).hexdigest()[:12]
-        tid = 'Texture' + token(tex['name']) + '_' + binding
-        cache_key = _texture_image_signature(addon, image)
+        disk = Path(addon.image_absolute_path(image)) if hasattr(addon, 'image_absolute_path') else Path(image.filepath)
+        is_dds = disk.suffix.casefold() == '.dds'
+        if not is_dds and (not isinstance(source_format, str) or not source_format):
+            raise ValueError('源贴图缺少 Texture2D 格式元数据：' + tex['logicalPath'])
+        cache_key = _texture_image_signature(addon, image, color_space, source_format or '')
         payload = texture_cache.get(cache_key)
         if payload is None:
-            prior = next((t for t in (existing_package or {}).get('textures', []) if t['id'] == tid), None)
-            disk = Path(addon.image_absolute_path(image)) if hasattr(addon, 'image_absolute_path') else Path(image.filepath)
-            direct = disk.is_file() and not getattr(image, 'is_dirty', False) and not getattr(image, 'packed_file', None)
-            png = disk if direct else Path(temporary)/(hashlib.sha256(section.encode()).hexdigest()+'.png')
-            if not direct:
-                addon.write_texture(png, image)
-            with texture_bitmap(png, direct) as mip:
-                width, height = mip.size; raw = bytearray(); count = 0
-                settings = dict(colorSpace=0 if str(image.get('eiem_linear', 'false')) == 'true' else 1,
-                                filter=int(image.get('eiem_filter',1)), wrap=int(image.get('eiem_wrap',0)),
-                                aniso=int(image.get('eiem_aniso',1)), mipBias=float(image.get('eiem_mip_bias',0)))
-                expected_mips = max(width,height).bit_length() if str(image.get('eiem_mipmaps','true')) == 'true' else 1
-                if prior and prior['width'] == width and prior['height'] == height and prior['mipCount'] == expected_mips and all(prior[k] == v for k,v in settings.items()):
-                    resource = (existing_package or {})['_resources'][prior['file']]
-                    pixels = resource['blocks']['pixels']
-                    if pixels[:width*height*4] == mip.transpose(Image.Transpose.FLIP_TOP_BOTTOM).tobytes():
-                        payload = dict(pixels=pixels, pixelLabel=Path(prior['file']).stem, format='RGBA32',
-                                       width=width,height=height,mipCount=expected_mips,retained=True,**settings)
-                while True:
-                    if payload is not None:
-                        break
-                    raw.extend(mip.transpose(Image.Transpose.FLIP_TOP_BOTTOM).tobytes()); count += 1
-                    if str(image.get('eiem_mipmaps', 'true')) != 'true' or mip.size == (1, 1):
-                        break
-                    mip = mip.resize((max(1, mip.width//2), max(1, mip.height//2)), Image.Resampling.BOX)
-            if payload is None:
-                payload = dict(pixels=bytes(raw), pixelLabel=token(Path(image.filepath).stem or image.name),
-                          format='RGBA32', width=width, height=height, mipCount=count,
-                          colorSpace=0 if str(image.get('eiem_linear', 'false')) == 'true' else 1,
-                          filter=int(image.get('eiem_filter', 1)), wrap=int(image.get('eiem_wrap', 0)),
-                          aniso=int(image.get('eiem_aniso', 1)), mipBias=float(image.get('eiem_mip_bias', 0)))
+            settings = dict(colorSpace=color_space,
+                            filter=int(image.get('eiem_filter',1)), wrap=int(image.get('eiem_wrap',0)),
+                            aniso=int(image.get('eiem_aniso',1)), mipBias=float(image.get('eiem_mip_bias',0)))
+            if is_dds:
+                if disk.is_file():
+                    dds_bytes = disk.read_bytes()
+                    dds_source = disk
+                else:
+                    packed = getattr(image, 'packed_file', None)
+                    if packed is None:
+                        raise ValueError('DDS 文件不存在：' + str(disk))
+                    try:
+                        dds_bytes = bytes(packed.data)
+                    except (AttributeError, TypeError, ValueError) as error:
+                        raise ValueError('无法读取打包的 DDS 文件：' + str(disk)) from error
+                    dds_hash = hashlib.sha256(dds_bytes).hexdigest().upper()
+                    dds_source = Path(temporary) / 'dds-passthrough' / (dds_hash + '.dds')
+                    dds_source.parent.mkdir(parents=True, exist_ok=True)
+                    dds_source.write_bytes(dds_bytes)
+                parsed = texture_compression.parse_source_dds(dds_bytes)
+                dds_hash = hashlib.sha256(dds_bytes).hexdigest().upper()
+                source_pixels_hash = hashlib.sha256(parsed['pixels']).hexdigest().upper()
+                target = dict(name=parsed['format'], unity=parsed['formatId'])
+                payload = dict(parsed, pixelLabel=token(disk.stem or image.name),
+                               sourcePixelsHash=source_pixels_hash, ddsHash=dds_hash,
+                               ddsSourcePath=str(dds_source), **settings)
+            else:
+                direct = disk.is_file() and not getattr(image, 'is_dirty', False) and not getattr(image, 'packed_file', None)
+                png = disk if direct else Path(temporary)/(hashlib.sha256(section.encode()).hexdigest()+'.png')
+                if not direct:
+                    addon.write_texture(png, image)
+                from PIL import Image
+                with texture_bitmap(png, direct) as mip:
+                    width, height = mip.size
+                    base_pixels = mip.transpose(Image.Transpose.FLIP_TOP_BOTTOM).tobytes()
+                source_pixels_hash = hashlib.sha256(base_pixels).hexdigest().upper()
+                target = texture_compression.target_format(source_format, color_space)
+                converted = texture_compression.compress_rgba(
+                    base_pixels, width, height,
+                    str(image.get('eiem_mipmaps', 'true')) == 'true', source_format,
+                    color_space, shared_resources.native_tool_file('texconv.exe'), flip_y=False)
+                payload = dict(converted, pixels=converted['pixels'],
+                               pixelLabel=token(Path(image.filepath).stem or image.name),
+                               sourcePixelsHash=source_pixels_hash, ddsHash=None,
+                               ddsSourcePath=None, **settings)
             texture_cache[cache_key] = payload
+        target = dict(name=payload['format'], unity=payload['formatId'])
+        settings = dict(colorSpace=color_space,
+                        filter=int(image.get('eiem_filter',1)), wrap=int(image.get('eiem_wrap',0)),
+                        aniso=int(image.get('eiem_aniso',1)), mipBias=float(image.get('eiem_mip_bias',0)))
+        tid = _texture_resource_id(section, image, color_space, target,
+                                   payload['width'], payload['height'], payload['mipCount'], settings)
         # The game texture is a template, not the identity of an authored
-        # override. Each material binding remains stable across pixel edits,
-        # independent of other variants borrowing the same native texture.
+        # override. One author image/profile is shared across all material bindings.
         record = dict(payload, id=tid, section=tid,
                       sourcePath=tex['logicalPath'], sourceAsset=tex['name'])
-        if tid in textures and textures[tid] != record:
+        if tid in textures and any(textures[tid][key] != record[key] for key in
+                                   ('pixels', 'pixelLabel', 'format', 'formatId',
+                                    'sourcePixelsHash', 'width', 'height', 'mipCount',
+                                    'ddsHash', 'colorSpace', 'filter', 'wrap', 'aniso', 'mipBias')):
             raise ValueError('同一作者材质的纹理绑定在导出期间发生冲突：' + mid + ' / ' + prop)
         textures[tid] = record
+        if texture_inputs is not None:
+            inputs = texture_inputs.setdefault(tid, dict(images=[]))
+            if not any(existing_image is image for existing_image in inputs['images']):
+                inputs['images'].append(image)
+            if payload.get('ddsSourcePath'):
+                prior_hash = inputs.get('dds_hash')
+                if prior_hash and prior_hash != payload['ddsHash']:
+                    raise ValueError('同一作者贴图身份对应不同 DDS 文件：' + tid)
+                inputs['dds_path'] = Path(payload['ddsSourcePath'])
+                inputs['dds_hash'] = payload['ddsHash']
         edits.append(dict(property=prop, texture=tid))
+    author_values = list(values)
     return dict(id=mid, sourcePath=matpath, sourceAsset=matasset,
-                nativeTypeHash=native['native']['typeHash'], textureEdits=edits,
-                fieldData={} if texture_only else native_material_fields(source, native, overrides, encode))
+                nativeTypeHash=(native['native']['typeHash'] if native else '00' * 16),
+                textureEdits=edits,
+                authorData=format_io.bind_effmat_texture_ids(
+                    ('\n'.join(author_values) + '\n').encode('utf-8'), edits),
+                fieldData=(native_material_fields(source, native, overrides, encode)
+                           if include_native_fields and not texture_only else {}))
+
+
+def _copy_texture_dds_inputs(root, texture_inputs):
+    root = Path(root).resolve()
+    parser = configparser.ConfigParser(interpolation=None, delimiters=('=',), strict=True)
+    parser.optionxform = str
+    with (root / 'mod.ini').open(encoding='utf-8-sig') as stream:
+        parser.read_file(stream)
+    for texture_id, inputs in texture_inputs.items():
+        if not parser.has_section(texture_id) or not parser[texture_id].get('dds'):
+            raise ValueError('Format 3 Texture DDS 路径缺失：' + texture_id)
+        relative = parser[texture_id]['dds']
+        destination = (root / relative).resolve()
+        if root not in destination.parents:
+            raise ValueError('Format 3 Texture DDS 路径超出 Mod 目录：' + relative)
+        inputs['dds_relative'] = relative
+        if not inputs.get('dds_path'):
+            continue
+        source = Path(inputs['dds_path'])
+        data = source.read_bytes()
+        if hashlib.sha256(data).hexdigest().upper() != inputs['dds_hash']:
+            raise ValueError('DDS 文件在导出期间发生变化：' + str(source))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+
+
+def _update_texture_image_paths(root, texture_inputs):
+    root = Path(root).resolve()
+    for texture_id, inputs in texture_inputs.items():
+        relative = inputs.get('dds_relative')
+        if not relative:
+            raise ValueError('已发布的 Texture DDS 路径缺失：' + texture_id)
+        path = (root / relative).resolve()
+        if root not in path.parents or not path.is_file():
+            raise ValueError('已发布的 Texture DDS 文件无效：' + str(path))
+        for image in inputs['images']:
+            image.filepath = str(path)
 
 def _replace_published_file(source, destination):
     # ReplaceFile preserves the runtime reader's delete-shared old snapshot.
@@ -768,6 +937,17 @@ def export_native_package(*args, **kwargs):
                         for obj in objects for slot in obj.material_slots
                         if slot.material and slot.material.get('eiem_author_package'))
         modules, _ = pack_modules()
+        addon = args[0] if args else kwargs.get('addon')
+        effect_roots = kwargs.get('effect_roots', args[12] if len(args) > 12 else None)
+        if effect_roots is None and addon is not None:
+            effect_roots = addon.effect_editor.export_roots((), objects, addon)
+            if len(args) > 12:
+                args = (*args[:12], effect_roots, *args[13:])
+            else:
+                kwargs['effect_roots'] = effect_roots
+        for root in effect_roots or ():
+            state = addon.effect_editor.synchronize(root).state
+            packages.add(Path(state['source']).resolve())
         with contextlib.ExitStack() as locks:
             for package in sorted(packages, key=lambda p: str(p).casefold()):
                 locks.enter_context(modules['author_source'].source_read_lock(package))
@@ -783,11 +963,12 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                           game_directory='',effect_roots=None):
     import bpy
     started = time.perf_counter()
-    detail = dict(meshSnapshot=0., materialTexture=0., meshEncoding=0., effect=0., writeAuthor=0.)
+    detail = dict(meshSnapshot=0., materialTexture=0., meshEncoding=0., effect=0., effectAuthor=0., writeAuthor=0.)
     snapshot_hits = snapshot_misses = 0
     exported_physics = exported_skeletons = 0
-    vendor=Path(__file__).parent/'vendor'
-    if vendor.is_dir() and str(vendor) not in sys.path: sys.path.insert(0,str(vendor))
+    physics_author_snapshots = {}
+    # pack_modules() resolves the ABI-matched shared-tools vendor directory.
+    # Do not prepend this add-on's bundled vendor: it may target another Python ABI.
     if resource_scope not in ('ALL', 'MESH', 'MATERIALS', 'TEXTURES', 'PHYSICS'):
         raise ValueError('未知导出资源范围：' + resource_scope)
     if bpy.context.mode != 'OBJECT': raise ValueError('请回到物体模式后导出')
@@ -814,17 +995,20 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
     existing_ini = None
     existing_package = None
     if (destination/'mod.ini').is_file():
+        header = configparser.ConfigParser(interpolation=None, delimiters=('=',), strict=True)
+        header.optionxform = str
+        with (destination/'mod.ini').open(encoding='utf-8-sig') as stream:
+            header.read_file(stream)
+        if header.get('Mod', 'format', fallback='') == '3':
+            if resource_scope != 'ALL':
+                raise ValueError('Format 3 partial export/import readback is not connected yet; this Mod was left unchanged.')
+            raise ValueError('Format 3 Blender import/readback is not connected yet; export to a new Mod directory.')
         existing_package = read_package(destination)
         existing_ini = modules['ini_package'].ini_document(destination)
         if existing_ini['Mod'].get('type','')=='effect':
             raise ValueError('该目录是独立特效 Mod，请为人物与特效选择另一个 Mod 文件夹')
     if resource_scope != 'ALL' and existing_ini is None:
         raise ValueError('部分导出需要已有的完整 Mod；首次请选择全部资源')
-    if __package__:
-        from .eiem_offline_reload import reload_context, compile_reload, prepare_static_sources, publish_reload
-    else:
-        from eiem_offline_reload import reload_context, compile_reload, prepare_static_sources, publish_reload
-    offline_context = reload_context(destination, game_directory=game_directory)
     if destination == source.package or source.package in destination.parents:
         raise ValueError('不能覆盖原生来源目录')
     bpy.context.view_layer.update()
@@ -901,6 +1085,7 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                 selected_materials.add(original.data.materials[slot])
     material_sections = material_ids(selected_materials)
     parts, materials, textures, rules = [], {}, {}, []
+    texture_inputs = {}
     texture_cache = {}
     material_sources = {}
     snapshots, part_cache, snapshot_rigs = {}, {}, {}
@@ -943,7 +1128,7 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                             addon, material_source(source, mat, material_sources), mat,
                             images, textures, temporary, encode, existing_ini,
                             resource_scope == 'TEXTURES', mid, texture_cache,
-                            existing_package)
+                            texture_inputs=texture_inputs)
             texture_paths = modules['ini_package'].texture_output_paths(
                 destination, existing_ini, list(textures.values()),
                 list(materials.values()))
@@ -973,7 +1158,8 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                     if mid not in materials:
                         materials[mid] = collect_material(addon, material_source(source, mat, material_sources), mat, images, textures, temporary,
                                                          encode, existing_ini, resource_scope == 'TEXTURES', mid,
-                                                         texture_cache, existing_package)
+                                                         texture_cache,
+                                                         texture_inputs=texture_inputs)
         for group in plan['sources']:
             if resource_scope in ('MATERIALS', 'TEXTURES'):
                 break
@@ -1008,7 +1194,8 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                                 materials[mid] = collect_material(
                                     addon, material_source(source, variant, material_sources), variant,
                                     images, textures, temporary, encode, mid=mid,
-                                    texture_cache=texture_cache, existing_package=existing_package)
+                                    texture_cache=texture_cache,
+                                    include_native_fields=False, texture_inputs=texture_inputs)
                                 detail['materialTexture'] += (time.perf_counter()-phase)*1000
                         phase = time.perf_counter()
                         fields = native_mesh_fields(modules, source, target, author,
@@ -1028,11 +1215,13 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                                 variant_id = pid + '_switch_' + switch['identity'] + '_' + str(option_index)
                                 mid = material_sections[variant.as_pointer()]
                                 parts.append(dict(common,partId=variant_id,material=mid,
+                                    authorData=addon.format_io.encode_mesh(author),
                                     visibilityBindings=bindings+[dict(variable=switch['variable'],visible=[option_index])]))
                                 cache.append(variant_id)
                         else:
                             selected_material=variants[0] if switch else mat
                             parts.append(dict(common,partId=pid,material=material_sections[selected_material.as_pointer()],
+                                              authorData=addon.format_io.encode_mesh(author),
                                               visibilityBindings=bindings))
                             cache.append(pid)
                     part_cache[identity]=cache
@@ -1062,11 +1251,14 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
             base['level']=0
         if resource_scope == 'ALL':
             phase = time.perf_counter()
-            modules['ini_package'].export_directory(staging,mod_id=token(destination.name),parts=parts,
+            published_package = modules['ini_package'].export_directory(staging,mod_id=token(destination.name),parts=parts,
                         materials=list(materials.values()),textures=list(textures.values()),rules=rules,
                         switches=switches,resource_cache=resource_cache,
                         material_clips=material_clips,effects=effects,key_switch_enabled=modules['ini_reader'].key_switch_enabled(
-                            existing_ini['Mod'].get('key_switch_enabled', '1')) if existing_ini else True)
+                            existing_ini['Mod'].get('key_switch_enabled', '1')) if existing_ini else True,
+                        memory_only=True)
+            ini = published_package['_ini']
+            memory_resources = published_package['_memory_resources']
             detail['writeAuthor'] = (time.perf_counter()-phase)*1000
             # A selected Mesh that actually weights a new chain needs that
             # chain's Skeleton/Physics resource in every matching prefab.
@@ -1098,10 +1290,10 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                 from importlib import import_module
                 physics = import_module(modules['author_source'].__package__ + '.physics')
                 author = sys.modules[addon.__package__ + '.eiem_physics_authoring']
+                physics_document = sys.modules[addon.__package__ + '.eiem_physics_document']
                 native_source = sys.modules[addon.__package__ + '.eiem_physics_source']
                 evidence = native_source.read_evidence(source.package / 'physics/components.json')
                 rigs = {obj.eiem_physics.rig for obj in physics_objects}
-                ini = modules['ini_package'].ini_document(staging)
                 for rig in rigs:
                     groups = [obj for obj in physics_objects if obj.eiem_physics.rig == rig]
                     document = author.author_document(groups, 'shared.skeleton')
@@ -1111,16 +1303,23 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                                   for weights, slots in snapshot['skin']
                                   for weight, slot in zip(weights, slots) if weight > 0}
                                   for identity, snapshot in snapshots.items() if snapshot_rigs[identity] == rig}
-                    targets = {group['id']: physics.group_mesh_targets(group, mesh_bones, rules, part_cache)
+                    published_parts = {
+                        identity: [modules['ini_package'].part_resource_id(part_id)
+                                   for part_id in part_ids]
+                        for identity, part_ids in part_cache.items()}
+                    targets = {group['id']: physics.group_mesh_targets(
+                                   group, mesh_bones, published_package['rules'], published_parts)
                                for group in document['groups']}
                     data = physics.build_resource(source, evidence, document, skeleton, targets)
                     relative = 'resources/physics_' + document['id'] + '.bin'
-                    path = staging / relative
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_bytes(data)
-                    ini['ResourcePhysics' + document['id']] = {'path': relative}
-                modules['ini_package'].save_ini(staging, ini)
-                read_package(staging)
+                    memory_resources[relative] = data
+                    resource_id = 'ResourcePhysics' + document['id']
+                    ini[resource_id] = {'path': relative}
+                    skeleton_bytes = addon.encode_skeleton(rig)
+                    document['skeleton'] = 'skeletons/physics_' + document['id'] + '.skeleton'
+                    author_data = addon.format_io.encode_format3_physics_snapshot(
+                        physics_document.encode(document), skeleton_bytes)
+                    physics_author_snapshots[resource_id] = author_data
         elif resource_scope == 'PHYSICS':
             from importlib import import_module
             physics = import_module(modules['author_source'].__package__ + '.physics')
@@ -1197,6 +1396,101 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
                         textures=list(textures.values()),texture_only=resource_scope == 'TEXTURES',
                         resource_cache=resource_cache,material_clips=material_clips,effects=effects)
         author_done = time.perf_counter()
+        if resource_scope == 'ALL':
+            started_format3 = time.perf_counter()
+            author_files = {}
+            for part in parts:
+                author_part = modules['ini_package'].part_resource_id(part['partId'])
+                relative = author_part + '.mesh'
+                payload = bytes(part['authorData'])
+                if relative in author_files and author_files[relative] != payload:
+                    raise ValueError('One format 3 Part ID maps to different editable Mesh snapshots: ' + author_part)
+                author_files[relative] = payload
+            for material in materials.values():
+                author_material = modules['ini_package'].identifier(material['id'])
+                relative = author_material + '.effmat'
+                payload = material['authorData']
+                if relative in author_files and author_files[relative] != payload:
+                    raise ValueError('One format 3 Material ID maps to different editable snapshots: ' + author_material)
+                author_files[relative] = payload
+            for resource_id, payload in physics_author_snapshots.items():
+                relative = modules['ini_package'].identifier(resource_id) + '.effphys'
+                if relative in author_files and author_files[relative] != payload:
+                    raise ValueError('One format 3 Physics resource ID maps to different editable snapshots: ' + resource_id)
+                author_files[relative] = bytes(payload)
+            phase = time.perf_counter()
+            roots_by_id = {root.get('eff_effect_id'): root for root in (effect_roots or ())}
+            for attachment in effects or ():
+                root = roots_by_id.get(attachment['id'])
+                if root is None:
+                    raise ValueError('Format 3 Effect author root is missing: ' + attachment['id'])
+                edit = addon.effect_editor.synchronize(root)
+                relative = modules['ini_package'].identifier(attachment['id']) + '.effeffect'
+                attachment_author = dict(attachment)
+                owner = root.eff_effect.owner
+                rig = addon.effect_editor.preview.mount_rig(owner) if owner else None
+                if rig is not None:
+                    attachment_author['mountSkeleton'] = base64.b64encode(
+                        addon.encode_skeleton(rig)).decode('ascii')
+                author_files[relative] = addon.format_io.encode_format3_effect_source(
+                    edit.state['source'], edit.state, attachment_author)
+            detail['effectAuthor'] = (time.perf_counter() - phase) * 1000
+            source_packages = {source.package}
+            source_packages.update(material_sources)
+            ini_bytes = modules['ini_package'].serialize_ini(ini)
+            templates = modules['author_format3'].resolve_templates(
+                None, source_packages, ini_bytes=ini_bytes)
+            format3_staging = Path(temporary) / 'format3'
+            tool = shared_resources.native_tool_file('eff_author_assets.dll')
+            try:
+                writer_report = write_format3_native_assets(
+                    tool, ini_bytes, templates, memory_resources, author_files, format3_staging)
+            except (OSError, ValueError) as error:
+                raise ValueError('Format 3 native author writer could not complete: ' + str(error)) from error
+            _copy_texture_dds_inputs(format3_staging, texture_inputs)
+            manifest = modules['author_format3'].read_format3_directory(format3_staging)
+            conversion_done = time.perf_counter()
+            source.assert_current()
+            for material_baseline in material_sources.values():
+                material_baseline.assert_current()
+
+            def publication_reader(path):
+                path = Path(path)
+                if (path / 'mod.ini').is_file():
+                    header = configparser.ConfigParser(interpolation=None, delimiters=('=',), strict=True)
+                    header.optionxform = str
+                    with (path / 'mod.ini').open(encoding='utf-8-sig') as stream:
+                        header.read_file(stream)
+                    if header.get('Mod', 'format', fallback='') == '3':
+                        return modules['author_format3'].read_format3_directory(path)
+                return read_package(path)
+
+            package = publish(format3_staging, destination, publication_reader,
+                              candidate=manifest)
+            _update_texture_image_paths(destination, texture_inputs)
+            publish_done = time.perf_counter()
+            written_texture_files = {ini[section]['path'] for section in ini.sections()
+                                     if section in textures and textures[section].get('_written', True)}
+            return dict(meshes=len(parts), materials=len(materials),
+                        textures=len(written_texture_files), textureBindings=len(textures),
+                        skeletons=exported_skeletons, physics=exported_physics, format=3,
+                        rules=len(rules), resourceScope=resource_scope,
+                        nativeSubmission=True, exportSeconds=time.perf_counter()-started,
+                        effects=len(effects or []), exportDetailMs=detail,
+                        meshSnapshotHits=snapshot_hits, meshSnapshotMisses=snapshot_misses,
+                        exportCostsMs=dict(author=(author_done-started)*1000,
+                            format3=(conversion_done-started_format3)*1000,
+                            publish=(publish_done-conversion_done)*1000),
+                        format3Writer=writer_report,
+                        format3Files=len(package['_files']))
+        # Format 2's offline compiler is only needed by the legacy partial
+        # export path. Full export publishes the format-3 author directory
+        # above and must not spend time preparing consumer-PFB state.
+        if __package__:
+            from .eiem_offline_reload import reload_context, compile_reload, prepare_static_sources, publish_reload
+        else:
+            from eiem_offline_reload import reload_context, compile_reload, prepare_static_sources, publish_reload
+        offline_context = reload_context(destination, game_directory=game_directory)
         _detach_staging_files([staging / 'source-inputs.bin'])
         source_index = prepare_static_sources(staging, source.package, offline_context, previous=destination)
         # --previous-mod supplies the old snapshot. Do not detach/copy tens of
