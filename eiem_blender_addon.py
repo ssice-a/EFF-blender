@@ -2236,7 +2236,7 @@ def explicit_skeleton_bone_index_paths(armature, paths, context=None):
 
 
 def export_skin_binding(obj, armature, source_vertices, skin_cache=None):
-    """Keep original slots; extend with bones from this shared armature."""
+    """Export only the palette slots used by positive vertex weights."""
     if not armature:
         # A static consumer can reuse a source Mesh carrying unused skin
         # metadata. Without a renderer bone palette none of it is a binding.
@@ -2352,6 +2352,26 @@ def export_skin_binding(obj, armature, source_vertices, skin_cache=None):
         skin_by_vertex.append((tuple(w for w,i in influences),tuple(i for w,i in influences)))
     if reduced:
         print("[EFF] %s: %d vertices reduced to the four strongest normalized skin influences" % (obj.name,reduced))
+    used_slots = set()
+    for vertex_index in source_vertices:
+        weights, indices = skin_by_vertex[vertex_index]
+        used_slots.update(index for weight, index in zip(weights, indices)
+                          if weight > 0)
+    used_slots = sorted(used_slots)
+    if not used_slots:
+        return ([], [], [], [], [], [], [])
+
+    # Compact only the serialized Mesh palette; keep the Blender-side source
+    # palette and vertex groups intact for lossless authoring round trips.
+    remap = {old: new for new, old in enumerate(used_slots)}
+    exported_skin = []
+    for vertex_index in source_vertices:
+        weights, indices = skin_by_vertex[vertex_index]
+        exported_skin.append((
+            weights, tuple(remap[index] if weight > 0 else 0
+                           for weight, index in zip(weights, indices))))
+    paths = [paths[index] for index in used_slots]
+    hashes = [hashes[index] for index in used_slots]
     if 'candidates' not in context:
         context['candidates'] = shared_bone_source_candidates(armature)
     catalog = context['candidates']
@@ -2375,7 +2395,7 @@ def export_skin_binding(obj, armature, source_vertices, skin_cache=None):
         raise ValueError("%s source Renderer bone candidate table is incomplete" % obj.name)
     sources = [candidates[0] if candidates else ("", "", 0)
                for candidates in source_candidates]
-    return ([skin_by_vertex[i] for i in source_vertices],
+    return (exported_skin,
             [matrices[p] for p in paths], hashes, paths,
             explicit_skeleton_bone_index_paths(armature, paths, context), sources,
             source_candidates)
@@ -3343,6 +3363,53 @@ class EFF_PT_shape_controls(bpy.types.Panel):
         layout.label(text="新增形态键会自动导出为滑块；快捷键按需设置")
 
 
+def remove_empty_vertex_groups(obj):
+    """Remove only groups without a positive weight, preserving named weights.
+
+    A group index lives on the Mesh, while group names live on its Object.
+    Make shared geometry local before Blender remaps those indices. Export
+    itself only compacts the output palette and never edits authoring data.
+    """
+    if obj.type != 'MESH' or obj.mode != 'OBJECT':
+        raise ValueError('Clear empty vertex groups in Object Mode on a Mesh')
+    if not obj.is_editable or not obj.data.is_editable:
+        raise ValueError('Mesh must be editable to clear empty vertex groups')
+    used = {member.group for vertex in obj.data.vertices
+            for member in vertex.groups if member.weight > 0}
+    empty = [group.name for group in obj.vertex_groups if group.index not in used]
+    if not empty:
+        return []
+    if obj.data.users > 1:
+        obj.data = obj.data.copy()
+    for name in reversed(empty):
+        obj.vertex_groups.remove(obj.vertex_groups[name])
+    obj.data.update()
+    _EXPORT_DIRTY_SERIAL[int(obj.as_pointer())] += 1
+    _EXPORT_DIRTY_SERIAL[int(obj.data.as_pointer())] += 1
+    return empty
+
+
+class EFF_OT_remove_empty_vertex_groups(bpy.types.Operator):
+    bl_idname = 'eiem.remove_empty_vertex_groups'
+    bl_label = '清理空顶点组'
+    bl_description = '清理所选网格中没有正权重的顶点组；保留所有正权重和未匹配顶点的权重'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and any(
+            obj.type == 'MESH' and obj.is_editable and obj.data.is_editable
+            for obj in context.selected_objects)
+
+    def execute(self, context):
+        count = 0
+        for obj in context.selected_objects:
+            if obj.type == 'MESH' and obj.is_editable and obj.data.is_editable:
+                count += len(remove_empty_vertex_groups(obj))
+        self.report({'INFO'}, '已清理 %d 个空顶点组' % count)
+        return {'FINISHED'}
+
+
 class EFF_OT_mesh_restore_source(bpy.types.Operator):
     bl_idname = "eiem.mesh_restore_source"
     bl_label = "恢复来源绑定"
@@ -3384,6 +3451,7 @@ class EFF_PT_mesh_properties(bpy.types.Panel):
         layout.use_property_decorate = False
         obj = context.object
         mesh = obj.data
+        layout.operator('eiem.remove_empty_vertex_groups', icon='BRUSH_DATA')
         if not mesh.get("eiem_section"):
             layout.label(text="Mesh 数据块缺少来源绑定", icon="ERROR")
             layout.operator("eiem.mesh_restore_source", icon="FILE_REFRESH")
@@ -4575,6 +4643,7 @@ classes = (
     EFF_PT_material_properties,
     EFF_PT_mesh_properties,
     EFF_OT_mesh_restore_source,
+    EFF_OT_remove_empty_vertex_groups,
     EFF_PT_image_properties,
 )
 

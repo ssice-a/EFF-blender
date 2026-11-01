@@ -38,7 +38,7 @@ jobs:
           $manifests = @($release.assets | Where-Object { $_.name -eq 'eff-native-tools.json' })
           if ($manifests.Count -ne 1) { throw 'Latest published EFF release must contain one eff-native-tools.json' }
           $tools = Invoke-RestMethod -Uri $manifests[0].browser_download_url -Headers @{ 'User-Agent' = 'EFF-Blender-Build' }
-          if ($tools.format -ne 'EFF_SHARED_NATIVE_TOOLS/1' -or $tools.framework -ne $release.tag_name -or $tools.bytes -le 0 -or $tools.sha256 -notmatch '^[0-9a-fA-F]{64}$') {
+          if ($tools.format -ne 'EFF_SHARED_NATIVE_TOOLS/3' -or $tools.framework -ne $release.tag_name -or $tools.bytes -le 0 -or $tools.sha256 -notmatch '^[0-9a-fA-F]{64}$') {
             throw 'Latest EFF shared-tools receipt is invalid or does not match its release'
           }
           $toolsUri = [Uri]$tools.url
@@ -98,7 +98,7 @@ jobs:
           $env:TMP = $testTemp
           $env:PYTHONPATH = "$pwd/framework/tools/Blender;$pwd/framework/tools"
           Push-Location framework
-          python -m unittest test_eiem_native_export_core test_eiem_native_publish test_eiem_release test_eiem_shape_animation_package test_eiem_material_features test_eiem_update
+          python -m unittest test_author_format3 test_eiem_native_export_core test_eiem_native_publish test_eiem_release test_eiem_shape_animation_package test_eiem_material_features test_eiem_update
           $result = $LASTEXITCODE
           Pop-Location
           if ($result -ne 0) { throw 'Author/update contracts failed' }

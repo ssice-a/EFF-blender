@@ -187,6 +187,32 @@ class Format3PublicationTests(unittest.TestCase):
         self.assertIn("controls.effres", validated["_files"])
         self.assertIn("[ResourceControls]", (output / "mod.ini").read_text("utf-8"))
 
+    def test_effect_attachment_uses_declared_format3_part_id(self):
+        source_part = "PartS_actor_wulfa_cloth_01_lod0_1.___8c6702d24e8fe635"
+        runtime_part = "Part" + source_part
+        parts = [dict(partId=source_part, object="Cloth", visibilityExpression=(
+            "number", 1.0, "", None, None))]
+        effect = dict(id="Petals", label="Petals", part=source_part, bone="",
+                      autoplay=True, position=[0.0, 0.0, 0.0],
+                      rotation=[0.0, 0.0, 0.0, 1.0], scale=[1.0, 1.0, 1.0],
+                      native=dict(key="A" * 64, prefab="assets/effect.prefab",
+                                  rootName="Effect", root=0, particles=0, bundles=[]))
+
+        encoded, _ = author_format3._controls_resource(
+            "EffectSmoke", parts, [], [], [effect])
+        header = HEADER.unpack_from(encoded)
+        metadata = encoded[HEADER.size:HEADER.size + header[3]]
+        expected = runtime_part.encode("utf-8")
+        stale = source_part.encode("utf-8")
+        self.assertIn(struct.pack("<Q", len(expected)) + expected, metadata)
+        self.assertNotIn(struct.pack("<Q", len(stale)) + stale, metadata)
+
+    def test_effect_attachment_rejects_an_undeclared_part(self):
+        effect = dict(part="MissingPart")
+        with self.assertRaisesRegex(ValueError, "Effect attachment Part is not declared"):
+            author_format3._effect_runtime_part(
+                effect, [dict(partId="OtherPart")])
+
     def test_texture_effres_does_not_repeat_manifest_or_dds_metadata(self):
         encoded = (self.root / "textures/a.effres").read_bytes()
         self.assertEqual(HEADER.unpack_from(encoded)[3], 0)

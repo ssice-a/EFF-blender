@@ -3,6 +3,7 @@ import configparser
 import importlib.util
 import json
 import sys
+import types
 import zlib
 from pathlib import Path
 
@@ -10,8 +11,12 @@ import bpy
 from mathutils import Matrix, Quaternion, Vector
 
 addon_path, output = map(Path, sys.argv[sys.argv.index('--') + 1:])
+package=types.ModuleType('eiem_skeleton_package')
+package.__path__=[str(addon_path.parent)]
+sys.modules[package.__name__]=package
 spec=importlib.util.spec_from_file_location('eiem_skeleton_test',addon_path)
 addon=importlib.util.module_from_spec(spec)
+addon.__package__=package.__name__
 sys.modules[spec.name] = addon
 spec.loader.exec_module(addon); addon.register()
 
@@ -64,9 +69,11 @@ for bone,r,source in records:
     if not source: assert close(basis@world@basis.inverted(),bone.matrix_local),bone.name
 
 new_file=output/'test.mesh'; addon.write_mesh(new_file,first); result=addon.read_mesh(new_file)
-assert result['bone_paths'][:2]==['','Rig/Unused']
-assert result['bone_index_paths'][:2]==['','0'], result['bone_index_paths']
-assert result['bindposes'][:2]==[root_pose,unused_pose] # original zero-weight slots are not pruned
+assert result['bone_paths']==['Rig/Extra','Rig/Extra/Tip']
+assert result['bone_index_paths']==['1','1/0'], result['bone_index_paths']
+assert len(result['bindposes'])==len(result['bone_hashes'])==2
+assert json.loads(first['eiem_bone_palette_json'])==[0,2]
+assert json.loads(first['eiem_bindposes_json'])==[root_pose,unused_pose]
 for vertex,path in enumerate(('Rig/Extra','Rig/Extra','Rig/Extra/Tip')):
     weights,indices=result['skin'][vertex]; assert weights==[1,0,0,0]
     assert result['bone_paths'][indices[0]]==path
@@ -74,172 +81,40 @@ for vertex,path in enumerate(('Rig/Extra','Rig/Extra','Rig/Extra/Tip')):
     bind=Matrix([result['bindposes'][indices[0]][r::4] for r in range(4)])
     assert close(native_world[index]@bind,Matrix.Identity(4)) # bind frame is coherent
 
-try:
-    addon.export_package(output/'missing-rig',[first],[])
-    raise AssertionError('new bone exported without its Skeleton dependency')
-except ValueError as ex: assert '同时选择共享骨架' in str(ex),str(ex)
-assert not (output/'missing-rig').exists()
-
-# Explicit Mesh-only export skips author Skeleton/Physics dependency checks but
-# still writes the mesh's existing skin payload for runtime deformation.
-mesh_only = output/'mesh-only-explicit'
-mesh_only_stats = addon.export_package(
-    mesh_only, [first], [], physics_objects=[], mesh_only=True)
-assert mesh_only_stats['meshes'] == 1
-assert mesh_only_stats['skeletons'] == 0 and mesh_only_stats['physics'] == 0
-mesh_only_ini = configparser.ConfigParser(interpolation=None)
-mesh_only_ini.read(mesh_only/'mod.ini', encoding='utf-8')
-assert 'skeleton' not in mesh_only_ini['RenderFirst']
-assert 'physics' not in mesh_only_ini['RenderFirst']
-
-# Other selected Meshes may share an author Rig that contains unrelated new
-# bones. They do not own a Skeleton dependency unless positive weights use one.
-native_only=mesh('NativeOnly')
-obj_names.remove(native_only.name)
-native_only.vertex_groups.remove(native_only.vertex_groups['Extra'])
-native_only.vertex_groups.remove(native_only.vertex_groups['Tip'])
-native_only.vertex_groups['Unused'].add([0,1,2],1,'REPLACE')
-native_package=output/'native-only'
-native_stats=addon.export_package(native_package,[native_only],[])
-assert native_stats['meshes']==1 and native_stats['skeletons']==0,native_stats
-native_ini=configparser.ConfigParser(interpolation=None)
-native_ini.read(native_package/'mod.ini',encoding='utf-8')
-assert 'skeleton' not in native_ini['RenderNativeOnly']
-
-package=output/'package'; stats=addon.export_package(package,[first,second],[rig])
-assert stats['meshes']==2 and stats['skeletons']==1 and stats['physics']==0,stats
-ini=configparser.ConfigParser(interpolation=None); ini.read(package/'mod.ini',encoding='utf-8')
-assert ini['RenderFirst']['skeleton']==ini['RenderSecond']['skeleton']=='SkeletonShared'
-skel_file=package/ini['SkeletonShared']['path']; original_skeleton=skel_file.read_bytes()
-payload=addon.read_skeleton(skel_file); assert payload['version']==2 and payload['source_nodes']==[True,True,True,False,False]
-assert list(payload['nodes'][:3])==nodes or all(close(matrix(a),matrix(b)) for a,b in zip(payload['nodes'][:3],nodes))
-
-# Selecting a v1 group alongside Meshes emits one Physics resource for their
-# shared Rig. The Rig dependency is automatic, and every same-Rig Render action
-# receives the same physics= binding.
-physics=addon.physics_authoring
-group=physics.create_group(rig,[rig.data.bones['Extra'],rig.data.bones['Tip']],'新增尾链')
-group.eiem_physics.gravity=6.25
-
-# A split source with one shared Rig is merged into one Mesh on the source
-# Renderer. Skeleton and Physics remain model-level dependencies on that action.
-split_part=second.copy(); split_part.data=second.data.copy()
-bpy.context.scene.collection.objects.link(split_part)
-split_part.name='SplitPart'
-split_part.data['eiem_section']='MeshSplitPart'
-split_part.data['eiem_source']=first.data['eiem_source']
-split_part.data['eiem_asset']=first.data['eiem_asset']
-split_part['eiem_render_section']='RenderSplitPart'
-split_package=output/'shared-merged'; stats=addon.export_package(
-    split_package,[first,split_part],[rig])
-assert stats['meshes']==1 and stats['skeletons']==1 and stats['physics']==1,stats
-split_ini=configparser.ConfigParser(interpolation=None)
-split_ini.read(split_package/'mod.ini',encoding='utf-8')
-split_root=split_ini['RenderFirst']
-assert split_root['skeleton']=='SkeletonShared'
-split_physics=next(name for name in split_ini.sections()
-                   if name.startswith('Physics'))
-assert split_root['physics']==split_physics
-assert 'mesh' in split_root
-assert not any(key.startswith('partner.') for key in split_root)
-bpy.data.objects.remove(split_part,do_unlink=True)
-
-# A Mesh that has positive weights on an authored Physics group's bones owns
-# that dependency even when the helper Empty was not manually selected. This
-# prevents a normal Mesh re-export from silently deleting its working Physics.
-inferred=output/'inferred-physics'
-stats=addon.export_package(inferred,[first],[rig])
-assert stats['physics']==1,stats
-inferred_ini=configparser.ConfigParser(interpolation=None)
-inferred_ini.read(inferred/'mod.ini',encoding='utf-8')
-assert 'physics' in inferred_ini['RenderFirst']
-
-bpy.ops.object.select_all(action='DESELECT')
-for selected in (first,second,group): selected.select_set(True)
-bpy.context.view_layer.objects.active=first
-combined=output/'combined'; stats=addon.export_package(combined)
-assert stats['meshes']==2 and stats['skeletons']==1 and stats['physics']==1,stats
-ini=configparser.ConfigParser(interpolation=None); ini.read(combined/'mod.ini',encoding='utf-8')
-physics_sections=[name for name in ini.sections() if name.startswith('Physics')]
-assert len(physics_sections)==1,physics_sections
-physics_section=physics_sections[0]
-assert ini['RenderFirst']['physics']==ini['RenderSecond']['physics']==physics_section
-document=physics.document.read(combined/ini[physics_section]['path'])
-assert document['colliders']==[] and document['groups'][0]['parameters']['gravity']==6.25
-physics_file=combined/ini[physics_section]['path']
-physics_skeleton=(physics_file.parent/document['skeleton']).resolve()
-render_skeleton=(combined/ini[ini['RenderFirst']['skeleton']]['path']).resolve()
-assert physics_skeleton==render_skeleton and physics_skeleton.is_file()
-
-# Authoring colliders are emitted into the combined package. The runtime uses
-# one component per author collider and shares that component across group refs.
-collider=physics.create_collider(rig,rig.data.bones['Rig'],'CAPSULE','测试碰撞体')
-group.eiem_physics.colliders.add().object = collider
-with_collider=output/'with-collider'
-stats=addon.export_package(with_collider,[first],[rig],[group])
-assert stats['physics']==1,stats
-collider_ini=configparser.ConfigParser(interpolation=None)
-collider_ini.read(with_collider/'mod.ini',encoding='utf-8')
-collider_section=collider_ini['RenderFirst']['physics']
-collider_document=physics.document.read(with_collider/collider_ini[collider_section]['path'])
-assert len(collider_document['colliders'])==1
-assert collider_document['colliders'][0]['shape']=='CAPSULE'
-assert collider_document['groups'][0]['colliders']==[collider_document['colliders'][0]['id']]
-group.eiem_physics.colliders.clear()
-visual=collider.eiem_physics.visual
-if visual: bpy.data.objects.remove(visual,do_unlink=True)
-bpy.data.objects.remove(collider,do_unlink=True)
-
-# Save/reopen authoring state: no runtime-generated identities are needed.
-bpy.ops.wm.save_as_mainfile(filepath=str(output/'author.blend'))
-bpy.ops.wm.open_mainfile(filepath=str(output/'author.blend'))
-rig=bpy.data.objects['SkeletonShared']; first,second=[bpy.data.objects[n] for n in obj_names]
-addon.export_package(package,[first,second],[rig])
-reloaded_ini=configparser.ConfigParser(interpolation=None)
-reloaded_ini.read(package/'mod.ini',encoding='utf-8')
-reloaded_skeleton=package/reloaded_ini[reloaded_ini['RenderFirst']['skeleton']]['path']
-assert reloaded_skeleton.read_bytes()==original_skeleton
-reloaded_mesh=addon.read_mesh(package/'meshes/MeshFirst.mesh')
-original_mesh=addon.read_mesh(new_file)
+# The Format 3 package path requires a real source baseline. Test this
+# authoring contract directly; native package/source transactions have their
+# own current Format 3 integration fixtures.
+skel_file=output/'test.skel'
+addon.write_skeleton(skel_file,rig)
+payload=addon.read_skeleton(skel_file)
+assert payload['version']==2
+assert payload['source_nodes']==[True,True,True,False,False]
+assert len(payload['nodes'])==5
+assert all(close(matrix(a),matrix(b)) for a,b in zip(payload['nodes'][:3],nodes))
+original_skeleton=skel_file.read_bytes()
+blend=output/'skeleton-author.blend'
+bpy.ops.wm.save_as_mainfile(filepath=str(blend))
+rig_name,first_name=rig.name,first.name
+bpy.ops.wm.open_mainfile(filepath=str(blend))
+rig=bpy.data.objects[rig_name]
+first=bpy.data.objects[first_name]
+addon.write_skeleton(skel_file,rig)
+assert skel_file.read_bytes()==original_skeleton
+reloaded=output/'reloaded.mesh'
+addon.write_mesh(reloaded,first)
+reloaded_mesh=addon.read_mesh(reloaded)
 for field in ('skin','bindposes','bone_paths','bone_index_paths','bone_sources'):
-    assert reloaded_mesh[field]==original_mesh[field], field
-# Later authoring can add valid source donors without changing the vertex or
-# primary binding payload saved before reopening the .blend.
-for old,new in zip(original_mesh['bone_source_candidates'],
-                   reloaded_mesh['bone_source_candidates']):
-    assert set(old).issubset(new)
-
-# Two target resources may use author rigs whose copied section names collide.
-# Keep their files and Render associations distinct.
-copy_rig=rig.copy(); copy_rig.data=rig.data.copy(); bpy.context.scene.collection.objects.link(copy_rig)
-copy_mesh=first.copy(); copy_mesh.data=first.data.copy(); bpy.context.scene.collection.objects.link(copy_mesh)
-copy_mesh.modifiers[0].object=copy_rig
-copy_mesh.name='FirstCopy'; copy_mesh.data['eiem_section']='MeshFirstCopy'
-copy_mesh.data['eiem_source']='assets/test/FirstCopy.asset'
-copy_mesh.data['eiem_asset']='FirstCopy'
-copy_mesh['eiem_render_section']='RenderFirstCopy'
-bpy.context.view_layer.objects.active=copy_rig; bpy.ops.object.mode_set(mode='EDIT')
-copy_rig.data.edit_bones['Extra'].head.x+=.2
-bpy.ops.object.mode_set(mode='OBJECT')
-duplicate_package=output/'duplicate-rigs'
-stats=addon.export_package(duplicate_package,[first,copy_mesh],[rig,copy_rig])
-assert stats['meshes']==2 and stats['skeletons']==2,stats
-ini=configparser.ConfigParser(interpolation=None); ini.read(duplicate_package/'mod.ini',encoding='utf-8')
-bindings=[ini[s] for s in ini.sections() if 'skeleton' in ini[s]]
-assert len(bindings)==2 and bindings[0]['skeleton']!=bindings[1]['skeleton']
-assert bindings[0]['mesh']!=bindings[1]['mesh']
-mesh_files=[duplicate_package/ini[b['mesh']]['path'] for b in bindings]
-assert mesh_files[0].read_bytes()!=mesh_files[1].read_bytes()
-bpy.data.objects.remove(copy_mesh,do_unlink=True); bpy.data.objects.remove(copy_rig,do_unlink=True)
-
-# Source edits are not silently ignored, and cannot damage an existing export.
-bpy.context.view_layer.objects.active=rig; bpy.ops.object.mode_set(mode='EDIT')
+    assert reloaded_mesh[field]==result[field],field
+# Source rest edits remain an error, rather than silently changing the bind.
+bpy.context.view_layer.objects.active=rig
+bpy.ops.object.mode_set(mode='EDIT')
 rig.data.edit_bones['Rig'].head.x+=.1
 bpy.ops.object.mode_set(mode='OBJECT')
 try:
-    addon.export_package(package,[first],[rig])
+    addon.write_skeleton(skel_file,rig)
     raise AssertionError('source rest edit was silently ignored')
-except ValueError as ex: assert '源骨骼绑定姿态已改变' in str(ex),str(ex)
-assert reloaded_skeleton.read_bytes()==original_skeleton
+except ValueError as ex:
+    assert '源骨骼绑定姿态已改变' in str(ex),str(ex)
+assert skel_file.read_bytes()==original_skeleton
 addon.unregister()
 print('EFF_SKELETON_EXPORT_OK')

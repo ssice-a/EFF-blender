@@ -59,20 +59,20 @@ before=[[(g.group,g.weight) for g in v.groups] for v in obj.data.vertices]
 file=output/'expanded.mesh'
 addon.write_mesh(file,obj)
 result=addon.read_mesh(file)
-assert result['bind_count']==5, result['bind_count']
-assert result['bone_paths'][:2]==['Root','Root/Unused']
-assert dict(zip(result['bone_paths'], result['bone_index_paths'])) == {
-    'Root': '', 'Root/Unused': '0', 'Root/Pelvis': '1',
-    'Root/Pelvis/Foot': '1/0', 'Root/Accessory': '2',
-}, result['bone_index_paths']
-assert result['bindposes'][:2]==[poses['Root'],poses['Root/Unused']]
+assert result['bind_count']==3, result['bind_count']
+assert result['bone_paths']==['Root/Accessory','Root/Pelvis','Root/Pelvis/Foot']
+assert result['bone_index_paths']==['2','1','1/0'], result['bone_index_paths']
+assert result['bindposes']==[poses['Root/Accessory'],poses['Root/Pelvis'],poses['Root/Pelvis/Foot']]
+assert len(result['bone_hashes'])==len(result['bone_sources'])==len(result['bone_source_candidates'])==3
 for vertex,name in enumerate(('Root/Pelvis','Root/Pelvis/Foot','Root/Accessory')):
     weights,indices=result['skin'][vertex]
     assert weights==[1,0,0,0], (vertex,weights)
     assert result['bone_paths'][indices[0]]==name
-assert result['bindposes'][result['bone_paths'].index('Root/Pelvis')]==poses['Root/Pelvis']
+assert all(path!='Root/Unused' for path in result['bone_paths'])
 assert before==[[(g.group,g.weight) for g in v.groups] for v in obj.data.vertices]
 assert json.loads(obj['eiem_bone_palette_json'])==[by_path['Root'],by_path['Root/Unused']]
+assert json.loads(obj['eiem_bone_paths_json'])==['Root','Root/Unused']
+assert json.loads(obj['eiem_bindposes_json'])==[poses['Root'],poses['Root/Unused']]
 
 # One export may process several Meshes on the same rig. Reuse only the
 # skeleton-wide data; per-object weights and source slots remain independent.
@@ -133,15 +133,33 @@ finally:
     addon.shared_bone_source_candidates=donors_fn
     bpy.data.objects.remove(twin,do_unlink=True)
 
+source_keys=('eiem_bone_paths_json','eiem_bone_palette_json',
+             'eiem_bone_hashes_json','eiem_bindposes_json',
+             'eiem_bone_sources_json')
+source_values={key:obj.get(key) for key in source_keys}
+source_paths=['Root/Pelvis','Root/Pelvis/Foot']
+obj['eiem_bone_paths_json']=json.dumps(source_paths)
+obj['eiem_bone_palette_json']=json.dumps([by_path[p] for p in source_paths])
+obj['eiem_bone_hashes_json']=json.dumps([zlib.crc32(p.encode()) for p in source_paths])
+obj['eiem_bindposes_json']=json.dumps([poses[p] for p in source_paths])
 obj['eiem_bone_sources_json'] = json.dumps([
     ['assets/a.mesh', 'MeshA', 3], ['assets/a.mesh', 'MeshA', 7]])
 assert json.loads(obj['eiem_bone_sources_json'])[1][2] == 7
-addon.write_mesh(file,obj)
-with_sources = addon.read_mesh(file)
-assert with_sources['skin'] == result['skin']
-assert ('assets/a.mesh', 'MeshA', 3) in with_sources['bone_source_candidates'][0]
-assert ('assets/a.mesh', 'MeshA', 7) in with_sources['bone_source_candidates'][1]
-first=file.read_bytes(); addon.write_mesh(file,obj); assert file.read_bytes()==first
+try:
+    addon.write_mesh(file,obj)
+    with_sources = addon.read_mesh(file)
+    for vertex,path in enumerate(('Root/Pelvis','Root/Pelvis/Foot','Root/Accessory')):
+        weights,indices=with_sources['skin'][vertex]
+        assert with_sources['bone_paths'][indices[0]]==path
+    path_slots={path:index for index,path in enumerate(with_sources['bone_paths'])}
+    assert ('assets/a.mesh', 'MeshA', 3) in with_sources['bone_source_candidates'][path_slots['Root/Pelvis']]
+    assert ('assets/a.mesh', 'MeshA', 7) in with_sources['bone_source_candidates'][path_slots['Root/Pelvis/Foot']]
+finally:
+    for key,value in source_values.items():
+        if value is None: del obj[key]
+        else: obj[key]=value
+addon.write_mesh(file,obj); first=file.read_bytes()
+addon.write_mesh(file,obj); assert file.read_bytes()==first
 
 # Donor meshes may have another bind frame. Convert using common original
 # slots, rather than recomputing every inverse bind from prefab transforms.
@@ -151,7 +169,7 @@ donor['eiem_bindposes_json']=json.dumps([
     flat(Matrix([poses[p][r::4] for r in range(4)]) @ donor_basis) for p in donor_paths])
 addon.write_mesh(file,obj)
 converted=addon.read_mesh(file)
-for p in donor_paths:
+for p in converted['bone_paths']:
     actual=converted['bindposes'][converted['bone_paths'].index(p)]
     assert max(abs(a-b) for a,b in zip(actual,poses[p])) < 1e-5, (p,actual)
 
@@ -197,4 +215,29 @@ try:
 except ValueError as ex:
     assert 'MissingBone' in str(ex), str(ex)
 assert file.read_bytes()==first
+# Explicit cleanup removes zero-only/unused groups, including locked empty
+# groups, without changing any positive named weights or shared Mesh users.
+cleanup=mesh('Cleanup',['Root'])
+for name in ('Empty','Root','ZeroOnly','Tiny','LockedEmpty'):
+    cleanup.vertex_groups.new(name=name)
+cleanup.vertex_groups['Root'].add([0,1],1,'REPLACE')
+cleanup.vertex_groups['ZeroOnly'].add([0],0,'REPLACE')
+cleanup.vertex_groups['Tiny'].add([2],1e-9,'REPLACE')
+cleanup.vertex_groups['LockedEmpty'].lock_weight=True
+linked=cleanup.copy(); bpy.context.scene.collection.objects.link(linked)
+def named_rows(obj):
+    names=[g.name for g in obj.vertex_groups]
+    return [{names[m.group]:m.weight for m in v.groups if m.weight>0}
+            for v in obj.data.vertices]
+named_before=named_rows(cleanup)
+linked_before=named_rows(linked)
+geometry_before=[tuple(v.co) for v in cleanup.data.vertices]
+assert addon.remove_empty_vertex_groups(cleanup)==['Empty','ZeroOnly','LockedEmpty']
+assert [g.name for g in cleanup.vertex_groups]==['Root','Tiny']
+assert named_rows(cleanup)==named_before
+assert named_rows(linked)==linked_before
+assert cleanup.data!=linked.data
+assert geometry_before==[tuple(v.co) for v in cleanup.data.vertices]
+assert addon.remove_empty_vertex_groups(cleanup)==[]
+assert len(linked.vertex_groups)==5
 print('EFF_SKIN_EXPORT_OK')
