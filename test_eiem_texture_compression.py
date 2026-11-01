@@ -65,6 +65,23 @@ class TextureCompressionTests(unittest.TestCase):
 
         self.assertIn('--srgb-in', commands[0])
         self.assertNotIn('--srgb-in', commands[1])
+        self.assertEqual(commands[0][commands[0].index('-bc') + 1], 'q')
+        self.assertEqual(commands[1][commands[1].index('-bc') + 1], 'q')
+
+    def test_bc5_compression_does_not_use_the_bc7_quick_mode(self):
+        commands = []
+
+        def fake_texconv(command, **_kwargs):
+            commands.append(command)
+            output = Path(command[command.index('-o') + 1]) / 'source.dds'
+            output.write_bytes(dds_fixture(2, 2, 1, 83, bytes(16)))
+            return SimpleNamespace(returncode=0, stderr='', stdout='')
+
+        with patch('eiem_texture_compression.subprocess.run', side_effect=fake_texconv):
+            compress_rgba(bytes((128, 64, 32, 255)) * 4, 2, 2, False,
+                          'BC5', 0, 'texconv.exe')
+
+        self.assertNotIn('-bc', commands[0])
 
     def test_bc5_source_format_is_preserved_for_linear_normal_maps(self):
         bc5 = target_format('BC5', 0)

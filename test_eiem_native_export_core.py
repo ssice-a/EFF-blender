@@ -27,6 +27,14 @@ def load_module(name, path):
     return module
 
 
+def source_stub(native, resources, **attributes):
+    source = SimpleNamespace(manifest=dict(resources=resources), **attributes)
+    source.resolve = lambda *args: native
+    source.resolve_identity = lambda identity: next(
+        row for row in source.manifest['resources'] if row['identity'] == identity)
+    return source
+
+
 exporter = load_module('eiem_native_export_core_test',
                        Path(__file__).with_name('eiem_native_export.py'))
 class Material(dict):
@@ -197,9 +205,9 @@ class NativeExportCoreTests(unittest.TestCase):
         raw_dds = dds_bc7(4, 4, payload)
         native = dict(details=dict(textures=[dict(property='_BaseMap', pointer=dict(
             isNull=False, identity='native-texture'))]), native=dict(typeHash='12' * 16))
-        source = SimpleNamespace(resolve=lambda *args: native, manifest=dict(resources=[dict(
+        source = source_stub(native, [dict(
             identity='native-texture', logicalPath='assets/body_d', name='Body_D',
-            details=dict(colorSpace=1))]))
+            details=dict(colorSpace=1))])
         addon = SimpleNamespace(image_absolute_path=lambda image: image.filepath,
             material_override_payload=lambda *args, **kwargs:
                 (['texture._BaseMap=slot'], None))
@@ -224,9 +232,9 @@ class NativeExportCoreTests(unittest.TestCase):
         from PIL import Image
         native = dict(details=dict(textures=[dict(property='_BaseMap', pointer=dict(
             isNull=False, identity='native-texture'))]), native=dict(typeHash='12' * 16))
-        source = SimpleNamespace(resolve=lambda *args: native, manifest=dict(resources=[dict(
+        source = source_stub(native, [dict(
             identity='native-texture', logicalPath='assets/body_d', name='Body_D',
-            details=dict(format='BC7', colorSpace=1))]))
+            details=dict(format='BC7', colorSpace=1))])
         addon = SimpleNamespace(image_absolute_path=lambda image: image.filepath,
             material_override_payload=lambda *args, **kwargs:
                 (['texture._BaseMap=slot'], None))
@@ -236,12 +244,16 @@ class NativeExportCoreTests(unittest.TestCase):
             image = Material('Replacement', {'eiem_section': 'TextureReplacement'})
             image.filepath = str(png_path)
             textures, texture_inputs = {}, {}
-            material = Material('Body', {'eiem_source': 'assets/body', 'eiem_name': 'Body'})
+            material = Material('Body', {
+                'eiem_source': 'assets/body', 'eiem_name': 'Body',
+                'eiem_texture._BaseMap': str(png_path),
+            })
             record = exporter.collect_material(addon, source, material, {'slot': image},
                 textures, folder, None, texture_only=True, texture_inputs=texture_inputs)
             self.texture_compressor_mock.assert_called_once()
             texture_id = record['textureEdits'][0]['texture']
             self.assertEqual(texture_inputs[texture_id]['images'], [image])
+            self.assertEqual(texture_inputs[texture_id]['bindings'], [(material, '_BaseMap')])
             self.assertNotIn('dds_path', texture_inputs[texture_id])
 
             root = Path(folder) / 'published'
@@ -255,6 +267,7 @@ class NativeExportCoreTests(unittest.TestCase):
             self.assertEqual(exporter.texture_compression.parse_source_dds(
                 published_dds.read_bytes())['format'], 'BC7')
             self.assertEqual(Path(image.filepath), published_dds)
+            self.assertEqual(Path(material['eiem_texture._BaseMap']), published_dds)
 
     def test_format3_passthrough_copies_exact_dds_and_updates_image_path(self):
         payload = bytes(range(16))
@@ -559,9 +572,9 @@ class NativeExportCoreTests(unittest.TestCase):
             native = dict(details=dict(textures=[dict(property='_BaseMap',
                           pointer=dict(isNull=False, identity='native-tex'))]),
                           native=dict(typeHash='12' * 16))
-            source = SimpleNamespace(resolve=lambda *args: native, manifest=dict(resources=[
+            source = source_stub(native, [
                 dict(identity='native-tex', logicalPath='assets/shared_d', name='Shared_D',
-                     details=dict(format='BC7', colorSpace=1))]))
+                     details=dict(format='BC7', colorSpace=1))])
             addon = SimpleNamespace(image_absolute_path=lambda image: image.filepath,
                 write_texture=lambda path, image: shutil.copyfile(image.filepath, path),
                 material_override_payload=lambda mat, *args, **kwargs:
@@ -596,9 +609,9 @@ class NativeExportCoreTests(unittest.TestCase):
             native = dict(details=dict(textures=[dict(property='_BaseMap',
                           pointer=dict(isNull=False, identity='native-tex'))]),
                           native=dict(typeHash='12' * 16))
-            source = SimpleNamespace(resolve=lambda *args: native, manifest=dict(resources=[
+            source = source_stub(native, [
                 dict(identity='native-tex', logicalPath='assets/shared_d', name='Shared_D',
-                     details=dict(format='BC7', colorSpace=1))]))
+                     details=dict(format='BC7', colorSpace=1))])
             addon = SimpleNamespace(image_absolute_path=lambda owner: owner.filepath,
                 write_texture=lambda output, owner: shutil.copyfile(owner.filepath, output),
                 material_override_payload=lambda *args, **kwargs:
@@ -625,12 +638,10 @@ class NativeExportCoreTests(unittest.TestCase):
             native = dict(details=dict(textures=[dict(property='_BaseMap',
                           pointer=dict(isNull=False, identity='native-tex'))]),
                           native=dict(typeHash='12' * 16))
-            source = SimpleNamespace(package=root,
-                resolve=lambda *args: native,
-                manifest=dict(resources=[dict(identity='native-tex',
+            source = source_stub(native, [dict(identity='native-tex',
                     logicalPath='assets/game/source', name='Source',
                     authorFile='textures/source.png',
-                    details=dict(format='BC7', colorSpace=1))]))
+                    details=dict(format='BC7', colorSpace=1))], package=root)
             addon = SimpleNamespace(
                 image_absolute_path=lambda owner: owner.filepath,
                 material_override_payload=lambda *args, **kwargs: (
@@ -785,17 +796,37 @@ class NativeExportCoreTests(unittest.TestCase):
             path = root/'source/manifest.json'
             row = dict(type='Mesh', logicalPath='assets/body.mesh', name='Body',
                        identity='old:1', native=dict(cab='old', pathId=1))
-            manifest = dict(format='EFFSOURCE', serializedFiles=[], resources=[row])
+            manifest = dict(format='EFFSOURCE', version=1,
+                            serializedFiles=[], resources=[row])
             path.write_text(json.dumps(manifest))
             original = module.AuthorSource(root, None)
             self.assertEqual(original.resolve('Mesh', 'assets/body.mesh', 'Body')['native']['pathId'], 1)
+            self.assertEqual(original.resolve_identity('old:1')['native']['pathId'], 1)
             row.update(identity='new:2', native=dict(cab='new', pathId=2))
             path.write_text(json.dumps(manifest))
             with self.assertRaisesRegex(ValueError, '导出期间发生更新'):
                 original.assert_current()
             refreshed = module.AuthorSource(root, None)
             self.assertEqual(refreshed.resolve('Mesh', 'assets/body.mesh', 'Body')['native'], dict(cab='new', pathId=2))
+            self.assertEqual(refreshed.resolve_identity('new:2')['native']['pathId'], 2)
             refreshed.assert_current()
+
+    def test_source_target_index_preserves_duplicate_target_rejection(self):
+        module = exporter.pack_modules()[0]['author_source']
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); (root/'source').mkdir()
+            rows = [
+                dict(type='Mesh', logicalPath='assets/body.mesh', name='Body',
+                     identity='cab-a:1'),
+                dict(type='Mesh', logicalPath='assets/body.mesh', name='Body',
+                     identity='cab-b:2'),
+            ]
+            (root/'source/manifest.json').write_text(json.dumps(dict(
+                format='EFFSOURCE', version=1, serializedFiles=[], resources=rows)))
+            source = module.AuthorSource(root, None)
+            with self.assertRaisesRegex(ValueError, '2 matches'):
+                source.resolve('Mesh', 'assets/body.mesh', 'Body')
+            self.assertEqual(source.resolve_identity('cab-a:1')['identity'], 'cab-a:1')
 
     def test_material_uses_its_own_source_and_reuses_loaded_package(self):
         class Source:
@@ -833,7 +864,10 @@ class NativeExportCoreTests(unittest.TestCase):
             native = dict(details=dict(textures=[dict(property=prop, pointer=dict(
                 isNull=False, identity='native-tex')) for prop in ('_BaseMap', '_DetailMap')]),
                 native=dict(typeHash='12' * 16))
-            source = SimpleNamespace(resolve=lambda *args: native, manifest=dict(resources=[tex]))
+            source = SimpleNamespace(resolve=lambda *args: native,
+                resolve_identity=lambda identity: next(
+                    row for row in source.manifest['resources'] if row['identity'] == identity),
+                manifest=dict(resources=[tex]))
             material = Material('MaterialBody', dict(eiem_source='assets/body', eiem_name='Body'))
             textures, cache = {}, {}
             def collect():
@@ -880,7 +914,10 @@ class NativeExportCoreTests(unittest.TestCase):
             image=Material('Emission',{'eiem_linear':'true'}); image.filepath=str(path)
             native=dict(details=dict(textures=[dict(property='_EmissionMap',pointer=dict(isNull=True)),
                          dict(property='_BaseMap',pointer=dict(isNull=False,identity='base'))]),native=dict(typeHash='12'*16))
-            source=SimpleNamespace(resolve=lambda *args:native,manifest=dict(resources=[dict(identity='base',name='Base_D',logicalPath='assets/base',details=dict(format='BC7',colorSpace=1))]))
+            source=SimpleNamespace(resolve=lambda *args:native,
+                resolve_identity=lambda identity: next(
+                    row for row in source.manifest['resources'] if row['identity'] == identity),
+                manifest=dict(resources=[dict(identity='base',name='Base_D',logicalPath='assets/base',details=dict(format='BC7',colorSpace=1))]))
             addon=SimpleNamespace(material_override_payload=lambda *args,**kwargs:(['texture._EmissionMap=image'],None))
             mat=Material('MaterialNew',dict(eiem_source='assets/mat',eiem_name='Template'))
             textures={}

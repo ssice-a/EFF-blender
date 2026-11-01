@@ -142,6 +142,8 @@ def compress_rgba(pixels, width, height, mipmaps, source_format, color_space,
         image.save(source, format='PNG', optimize=False)
         command = [str(Path(texconv)), '-nologo', '-y', '-dx10', '-f', target['dxgi'],
                    '-m', str(mip_count), '-if', 'BOX']
+        if target['name'] == 'BC7':
+            command.extend(('-bc', 'q'))
         if target['dxgi'].endswith('_SRGB'):
             command.append('--srgb-in')
         command.extend(('-o', str(root), str(source)))

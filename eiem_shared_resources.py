@@ -14,10 +14,10 @@ import zipfile
 
 
 SETTINGS_FORMAT = 'EFF_SHARED_RESOURCES/1'
-TOOLS_FORMAT = 'EFF_SHARED_NATIVE_TOOLS/2'
+TOOLS_FORMAT = 'EFF_SHARED_NATIVE_TOOLS/3'
 TOOLS_API = 'https://api.github.com/repos/ssice-a/EFF/releases/latest'
 TOOLS_ASSET = 'eff-native-tools.json'
-TOOLS_INSTALL_FORMAT = 'EFF_SHARED_NATIVE_TOOLS_INSTALL/2'
+TOOLS_INSTALL_FORMAT = 'EFF_SHARED_NATIVE_TOOLS_INSTALL/3'
 MAX_TOOLS_BYTES = 512 * 1024 * 1024
 PIL_REQUIRED_FILES = (
     'PIL/__init__.py',
@@ -102,9 +102,14 @@ def _validate_tools_manifest(value):
     if len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
         raise ValueError('EFF 共享工具包 SHA256 无效')
     expected = {
+        'compiler': 'nativepack/eff_resource_pack.exe',
+        'indexUpdater': 'nativepack/eff_source_index.exe',
+        'protocol': 'nativepack/package-protocol.json',
         'authorAssets': 'nativepack/eff_author_assets.dll',
         'authorCore': 'nativepack/eff_author_core.dll',
         'textureCompressor': 'nativepack/texconv.exe',
+        'legacyMigrator': 'nativepack/eff_migrate_mods.exe',
+        'migrationSourceExporter': 'nativepack/source-exporter/eff_migrate_sources.exe',
         'archiveRoot': 'EFF_Native_Tools',
     }
     if any(value.get(key) != item for key, item in expected.items()):

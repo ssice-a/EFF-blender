@@ -19,6 +19,27 @@ SPEC.loader.exec_module(shared)
 
 
 class SharedResourceTests(unittest.TestCase):
+    def test_format3_manifest_declares_repair_author_and_migration_tools(self):
+        manifest = {
+            'format': shared.TOOLS_FORMAT,
+            'url': 'https://github.com/ssice-a/EFF/releases/download/v-test/EFF_Shared_Native_Tools_v-test.zip',
+            'bytes': 1,
+            'sha256': 'a' * 64,
+            'archiveRoot': 'EFF_Native_Tools',
+            'compiler': 'nativepack/eff_resource_pack.exe',
+            'indexUpdater': 'nativepack/eff_source_index.exe',
+            'protocol': 'nativepack/package-protocol.json',
+            'authorAssets': 'nativepack/eff_author_assets.dll',
+            'authorCore': 'nativepack/eff_author_core.dll',
+            'textureCompressor': 'nativepack/texconv.exe',
+            'legacyMigrator': 'nativepack/eff_migrate_mods.exe',
+            'migrationSourceExporter': 'nativepack/source-exporter/eff_migrate_sources.exe',
+        }
+        self.assertIs(shared._validate_tools_manifest(manifest), manifest)
+        del manifest['compiler']
+        with self.assertRaises(ValueError):
+            shared._validate_tools_manifest(manifest)
+
     def test_resource_root_is_the_only_blender_storage_setting(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

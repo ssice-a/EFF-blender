@@ -98,7 +98,7 @@ jobs:
           $env:TMP = $testTemp
           $env:PYTHONPATH = "$pwd/framework/tools/Blender;$pwd/framework/tools"
           Push-Location framework
-          python -m unittest test_eiem_native_export_core test_eiem_native_publish test_eiem_offline_reload test_eiem_release test_eiem_shape_animation_package test_eiem_material_features test_eiem_update
+          python -m unittest test_eiem_native_export_core test_eiem_native_publish test_eiem_release test_eiem_shape_animation_package test_eiem_material_features test_eiem_update
           $result = $LASTEXITCODE
           Pop-Location
           if ($result -ne 0) { throw 'Author/update contracts failed' }

@@ -605,7 +605,7 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
                             if not entry['pointer']['isNull'] and entry['pointer'].get('identity')), None)
             if pointer is None:
                 raise ValueError('材质来源没有可用的 Texture2D 结构模板：' + prop)
-        tex = next(r for r in source.manifest['resources'] if r['identity'] == pointer['identity'])
+        tex = source.resolve_identity(pointer['identity'])
         details = tex.get('details') or {}
         color_space = details.get('colorSpace')
         source_format = details.get('format')
@@ -684,6 +684,9 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
             inputs = texture_inputs.setdefault(tid, dict(images=[]))
             if not any(existing_image is image for existing_image in inputs['images']):
                 inputs['images'].append(image)
+            binding = (mat, prop)
+            if binding not in inputs.setdefault('bindings', []):
+                inputs['bindings'].append(binding)
             if payload.get('ddsSourcePath'):
                 prior_hash = inputs.get('dds_hash')
                 if prior_hash and prior_hash != payload['ddsHash']:
@@ -712,6 +715,10 @@ def _update_texture_image_paths(root, texture_inputs):
             raise ValueError('已发布的 Texture DDS 文件无效：' + str(path))
         for image in inputs['images']:
             image.filepath = str(path)
+        for material, property_name in inputs.get('bindings', ()):
+            key = 'eiem_texture.' + property_name
+            if key in material:
+                material[key] = str(path)
 
 def _replace_published_file(source, destination):
     # ReplaceFile preserves the runtime reader's delete-shared old snapshot.
@@ -814,7 +821,7 @@ def publish(staging, destination, reader, previous=None, candidate=None):
             output.parent.mkdir(parents=True, exist_ok=True)
             _replace_published_file(pending/'new'/name, output)
             applied.append(name)
-        return reader(destination)
+        return candidate
     except Exception as error:
         try:
             for name in reversed(applied):
@@ -873,7 +880,7 @@ def export_native_package(addon, destination, mesh_objects, *, armatures=None,
                         if slot.material and slot.material.get('eiem_author_package'))
         if effect_roots is None and addon is not None:
             effect_roots = addon.effect_editor.export_roots((), objects, addon)
-        modules, _ = pack_modules()
+        modules, dll = pack_modules()
         for root in effect_roots or ():
             state = addon.effect_editor.synchronize(root).state
             packages.add(Path(state['source']).resolve())
@@ -881,7 +888,8 @@ def export_native_package(addon, destination, mesh_objects, *, armatures=None,
             for package in sorted(packages, key=lambda p: str(p).casefold()):
                 locks.enter_context(modules['author_source'].source_read_lock(package))
             return _export_native_package(
-                addon, destination, objects, armatures=armatures,
+                addon, destination, objects, modules=modules, dll=dll,
+                source_package=primary, armatures=armatures,
                 physics_objects=physics_objects, lod_levels=lod_levels,
                 include_switches=include_switches, source_baseline=source_baseline,
                 resource_cache=cache, effect_roots=effect_roots)
@@ -890,7 +898,8 @@ def export_native_package(addon, destination, mesh_objects, *, armatures=None,
             stream.close()
 
 
-def _export_native_package(addon, destination, mesh_objects, armatures=None,
+def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
+                          source_package, armatures=None,
                           physics_objects=None, lod_levels=None,
                           include_switches=True, source_baseline='', resource_cache=None,
                           effect_roots=None):
@@ -900,14 +909,11 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
     snapshot_hits = snapshot_misses = 0
     exported_physics = exported_skeletons = 0
     physics_resources = []
-    # pack_modules() resolves the ABI-matched shared-tools vendor directory.
-    # Do not prepend this add-on's bundled vendor: it may target another Python ABI.
     if bpy.context.mode != 'OBJECT': raise ValueError('请回到物体模式后导出')
     objects = list(mesh_objects)
     physics_objects = list(physics_objects or [])
     if not objects: raise ValueError('Format 3 导出需要至少一个 EFF Mesh')
-    modules, dll = pack_modules()
-    source = modules['author_source'].AuthorSource(baseline_for(objects, source_baseline, physics_objects),
+    source = modules['author_source'].AuthorSource(source_package,
                 modules['author_source'].AuthorCore(dll))
     destination = Path(destination).resolve()
     resource_cache = resource_cache if resource_cache is not None else {}
@@ -1187,10 +1193,11 @@ def _export_native_package(addon, destination, mesh_objects, armatures=None,
             author_files[relative] = addon.format_io.encode_format3_effect_source(
                 edit.state['source'], edit.state, attachment_author)
         detail['effectAuthor'] = (time.perf_counter() - phase) * 1000
-        source_packages = {source.package}
-        source_packages.update(material_sources)
+        source_packages = {source.package: source}
+        source_packages.update((baseline.package, baseline)
+                               for baseline in material_sources.values())
         templates = modules['author_format3'].resolve_templates(
-            source_packages, rules, include_texture=bool(textures))
+            source_packages.values(), rules, include_texture=bool(textures))
         native_meshes, native_textures = format3_native_records(
             modules['author_format3'], source, parts, textures.values(), rules)
         format3_staging = Path(temporary) / 'format3'

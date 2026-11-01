@@ -10,6 +10,7 @@ import sys
 import importlib
 import types
 import zipfile
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 CORE_NAME = "_eff_canonical_nativepack"
@@ -48,6 +49,18 @@ class Format3PublicationTests(unittest.TestCase):
             _effres(b"", b"native Texture2D scaffold"))
         (self.root / "textures/a.dds").write_bytes(_dds())
 
+    def indexed_source(self, package, manifest, rows):
+        by_target = {}
+        by_type = {}
+        for row in manifest["resources"]:
+            identity = (row.get("type"), row.get("logicalPath"), row.get("name"))
+            by_target.setdefault(identity, []).append(row)
+            by_type.setdefault(row.get("type"), []).append(row)
+        return types.SimpleNamespace(
+            package=package.resolve(), manifest=manifest, rows=rows, files={},
+            find_all=lambda kind, path, asset: by_target.get((kind, path, asset), ()),
+            first_of_type=lambda kind: next(iter(by_type.get(kind, ())), None))
+
     def test_template_table_uses_selected_source_snapshot_without_index(self):
         source = self.root / "source.eff"
         (source / "source" / "snapshots").mkdir(parents=True)
@@ -64,15 +77,93 @@ class Format3PublicationTests(unittest.TestCase):
         }
         (source / "source" / "manifest.json").write_text(
             json.dumps(manifest), encoding="utf-8")
+        source_object = self.indexed_source(
+            source, manifest, {row["cab"]: row for row in manifest["serializedFiles"]})
         rules = [dict(hidden=False, targets=[dict(
             sourcePath="assets/game/mesh.mesh", sourceAsset="MeshA")])]
-        templates = author_format3.resolve_templates([source], rules)
-        memory_templates = author_format3.resolve_templates([source], rules)
+        templates = author_format3.resolve_templates([source_object], rules)
+        memory_templates = author_format3.resolve_templates([source_object], rules)
         self.assertEqual(len(templates), 1)
         self.assertEqual(memory_templates, templates)
         self.assertEqual(templates[0]["cab"], "CAB-mesh")
         self.assertEqual(templates[0]["pathId"], 42)
         self.assertEqual(Path(templates[0]["file"]), snapshot_path.resolve())
+
+    def test_identical_template_snapshots_shared_across_prefabs_are_deduplicated(self):
+        identity = ("Mesh", "assets/game/mesh.mesh", "MeshA")
+        rules = [dict(hidden=False, targets=[dict(sourcePath=identity[1], sourceAsset=identity[2])])]
+
+        def make_source(name, snapshot):
+            source = self.root / name
+            snapshot_path = source / "source" / "snapshots" / "CAB-shared.bytes"
+            snapshot_path.parent.mkdir(parents=True)
+            snapshot_path.write_bytes(snapshot)
+            serialized = dict(cab="CAB-shared", snapshot=dict(
+                file="source/snapshots/CAB-shared.bytes",
+                sha256=hashlib.sha256(snapshot).hexdigest().upper()))
+            manifest = dict(format="EFFSOURCE", version=1,
+                serializedFiles=[serialized],
+                resources=[dict(type=identity[0], logicalPath=identity[1], name=identity[2],
+                                native=dict(cab="CAB-shared", pathId=42))])
+            (source / "source" / "manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8")
+            return self.indexed_source(source, manifest, {"CAB-shared": serialized})
+
+        first = make_source("source-duplicate-a", b"identical serialized mesh")
+        second = make_source("source-duplicate-b", b"identical serialized mesh")
+        templates = author_format3.resolve_templates([second, first], rules)
+        self.assertEqual(len(templates), 1)
+        self.assertEqual(templates[0]["cab"], "CAB-shared")
+        self.assertEqual(Path(templates[0]["file"]),
+                         (self.root / "source-duplicate-a" / "source" / "snapshots" / "CAB-shared.bytes").resolve())
+
+        conflicting = make_source("source-conflict", b"different serialized mesh")
+        with self.assertRaisesRegex(ValueError, "ambiguous exact Mesh template"):
+            author_format3.resolve_templates([first, conflicting], rules)
+
+    def test_template_resolution_hashes_only_needed_unique_cabs(self):
+        source = self.root / "source-many"
+        snapshot_dir = source / "source" / "snapshots"
+        snapshot_dir.mkdir(parents=True)
+        mesh_bytes, texture_bytes = b"mesh cab", b"texture cab"
+        mesh_path, texture_path = snapshot_dir / "mesh.bin", snapshot_dir / "texture.bin"
+        mesh_path.write_bytes(mesh_bytes)
+        texture_path.write_bytes(texture_bytes)
+        serialized = [
+            dict(cab="CAB-mesh", snapshot=dict(file="source/snapshots/mesh.bin",
+                 sha256=hashlib.sha256(mesh_bytes).hexdigest().upper())),
+            dict(cab="CAB-texture", snapshot=dict(file="source/snapshots/texture.bin",
+                 sha256=hashlib.sha256(texture_bytes).hexdigest().upper())),
+        ]
+        manifest = dict(format="EFFSOURCE", version=1, serializedFiles=serialized,
+            resources=[
+                dict(type="Mesh", logicalPath="assets/game/a.mesh", name="MeshA",
+                     native=dict(cab="CAB-mesh", pathId=1)),
+                dict(type="Mesh", logicalPath="assets/game/b.mesh", name="MeshB",
+                     native=dict(cab="CAB-mesh", pathId=2)),
+                dict(type="Texture2D", logicalPath="assets/game/t.tex", name="Texture",
+                     native=dict(cab="CAB-texture", pathId=3)),
+            ])
+        source_object = self.indexed_source(
+            source, manifest, {row["cab"]: row for row in serialized})
+        class NoResourceScan(list):
+            def __iter__(self):
+                raise AssertionError("template resolution scanned every EFFSOURCE resource")
+        source_object.manifest["resources"] = NoResourceScan(manifest["resources"])
+        rules = [dict(hidden=False, targets=[
+            dict(sourcePath="assets/game/a.mesh", sourceAsset="MeshA"),
+            dict(sourcePath="assets/game/b.mesh", sourceAsset="MeshB")])]
+        digest = author_format3._digest
+        with mock.patch.object(author_format3, "_digest", wraps=digest) as verify:
+            templates = author_format3.resolve_templates([source_object], rules)
+        self.assertEqual(len(templates), 2)
+        self.assertEqual(verify.call_count, 1)
+        self.assertEqual(verify.call_args.args[0], mesh_path.resolve())
+        with mock.patch.object(author_format3, "_digest", wraps=digest) as verify:
+            templates = author_format3.resolve_templates([source_object], rules,
+                                                         include_texture=True)
+        self.assertEqual(len(templates), 3)
+        self.assertEqual(verify.call_count, 2)
 
     def tearDown(self):
         self.temp.cleanup()
