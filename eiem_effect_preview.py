@@ -214,6 +214,7 @@ def mount_matrix(root):
     hierarchy and apply the pose delta rather than using the display bone alone.
     """
     cfg=root.eff_effect;owner=cfg.owner
+    if owner and not cfg.bone:return owner.matrix_world@root.matrix_local
     rig=mount_rig(owner)
     if not rig or cfg.bone not in rig.data.bones:return root.matrix_world.copy()
     bone=rig.data.bones[cfg.bone];chain=[];parent=bone

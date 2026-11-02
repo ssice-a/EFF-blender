@@ -316,7 +316,7 @@ class EFF_PG_effect_object(bpy.types.PropertyGroup):
     all_lods:BoolProperty(name='覆盖全部 LOD',default=True,
         description='跟随挂载部件的全部模型 LOD；导出的特效不因原生距离或质量 LOD 降级关闭。关闭则保留来源特效的降级设置')
     owner:PointerProperty(name='挂载目标 Mesh',type=bpy.types.Object,poll=lambda self,obj:obj.type=='MESH' and not obj.get('eff_preview'))
-    bone:StringProperty(name='挂载骨骼',description='使用完整骨骼路径；事件触发暂不支持')
+    bone:StringProperty(name='挂载骨骼',description='留空时挂到目标 Mesh 的 Renderer Transform；事件触发暂不支持')
     toggle_keys:CollectionProperty(type=EFF_PG_effect_key)
     build_path:StringProperty(name='原生构建目录',subtype='DIR_PATH')
     compiler:StringProperty(name='AnimeStudio',subtype='FILE_PATH')
@@ -708,8 +708,8 @@ def attachment(root,part='',addon=None):
     cfg=root.eff_effect;owner=cfg.owner
     if not owner:raise ValueError(root.name+' 缺少挂载目标 Mesh')
     rig=preview.mount_rig(owner)
-    if not rig or not cfg.bone or cfg.bone not in rig.data.bones:raise ValueError('必须选择目标骨架中的挂载骨骼')
-    bone=str(rig.data.bones[cfg.bone].get('eiem_path',cfg.bone));p=owner.data
+    if cfg.bone and (not rig or cfg.bone not in rig.data.bones):raise ValueError('挂载骨骼不属于目标 Mesh 的骨架')
+    bone=str(rig.data.bones[cfg.bone].get('eiem_path',cfg.bone)) if cfg.bone else '';p=owner.data
     path=str(p.get('eiem_target_path','') or p.get('eiem_source',''));asset=str(p.get('eiem_target_asset','') or p.get('eiem_asset',''))
     if not path or not asset:raise ValueError('挂载 Mesh 缺少精确游戏来源')
     position,rotation,scale=(BASIS.inverted()@root.matrix_local@BASIS).decompose()
@@ -721,14 +721,17 @@ def attachment(root,part='',addon=None):
     use=next((u for u in uses if u['ownerPath']==owner_path),uses[0] if len(uses)==1 else None)
     if not use:raise ValueError('来源含多个 Mesh 消费者，请明确原生 Renderer 路径')
     paths={h['transform']:h['path'] for h in proof['hierarchy']}
-    anchor=paths.get((use.get('skinningRoot') or {}).get('identity'))
-    if anchor is None:raise ValueError('来源缺少骨架根证明')
+    anchor_identity=(use.get('skinningRoot') or {}).get('identity')
+    anchor=paths.get(anchor_identity) if anchor_identity else None
     palette=[]
-    for ptr in use.get('bones',[]):
+    source_bones=use.get('bones',[])
+    if source_bones and anchor is None:raise ValueError('来源骨骼调色板缺少骨架根证明')
+    for ptr in source_bones:
         value=paths.get(ptr.get('identity'))
         if value is None or not (value==anchor or value.startswith(anchor+'/')):raise ValueError('来源骨骼不属于已验证骨架')
         palette.append(value)
-    if not palette:raise ValueError('来源 Mesh 没有骨骼调色板')
+    if bone and (not palette or not anchor or not (bone==anchor or bone.startswith(anchor+'/'))):
+        raise ValueError('骨骼挂载需要目标 Mesh 的完整骨架调色板')
     toggle_keys=[switch_controls.validate_switch_key(item.key) for item in cfg.toggle_keys]
     document.require(len(toggle_keys)==len(set(toggle_keys)),'特效显隐按键不能重复')
     return dict(id=root['eff_effect_id'],label=root.name,part=part,bone=bone,autoplay=True,keys=toggle_keys,build=bpy.path.abspath(cfg.build_path),position=list(position),rotation=[rotation.x,rotation.y,rotation.z,rotation.w],scale=list(scale),targetPath=path,targetAsset=asset,bones=palette,targetPrefab=proof['prefab'],rendererPath=use['ownerPath'])
@@ -962,10 +965,10 @@ class EFF_PT_effect_object(bpy.types.Panel):
                         body.prop(cfg,'enabled');body.prop(cfg,'all_lods');body.prop(cfg,'owner')
                         if cfg.all_lods:effect_ui.hint(body,'导出时解除来源特效的距离/画质降级；同骨架的模型 LOD 共用一次播放。')
                         rig=preview.mount_rig(cfg.owner)
-                        if rig:body.prop_search(cfg,'bone',rig.data,'bones')
-                        else:body.prop(cfg,'bone')
+                        if rig:body.prop_search(cfg,'bone',rig.data,'bones',text='挂载骨骼 (留空为 Renderer)')
+                        else:body.prop(cfg,'bone',text='挂载骨骼 (留空为 Renderer)')
                         body.label(text='随挂载 Mesh 显隐；触发事件暂不支持')
-                        effect_ui.hint(body,'预览按所选骨骼的位置与朝向计算；根物体变换作为骨骼局部偏移。')
+                        effect_ui.hint(body,'预览跟随 Renderer Transform 或所选骨骼；根物体变换作为挂载点局部偏移。')
                         key_box=body.box();key_header=key_box.row(align=True);key_header.label(text='特效显隐按键')
                         op=key_header.operator('eiem.effect_key',text='录制按键',icon='REC');op.action='ADD';op.root_name=root.name
                         for index,item in enumerate(cfg.toggle_keys):

@@ -41,6 +41,11 @@ def build(output, revision, name=None, framework_root=None):
     source = ast.parse((ROOT / '__init__.py').read_text('utf-8'))
     info = next(ast.literal_eval(node.value) for node in source.body if isinstance(node, ast.Assign)
                 and any(isinstance(target, ast.Name) and target.id == 'bl_info' for target in node.targets))
+    addon_source = ast.parse((ROOT / 'eiem_blender_addon.py').read_text('utf-8'))
+    addon_info = next(ast.literal_eval(node.value) for node in addon_source.body if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == 'bl_info' for target in node.targets))
+    if addon_info != info:
+        raise ValueError('Package entry and add-on implementation metadata differ')
     manifest = dict(format='EFF_BLENDER_BUILD/1', revision=revision, version=list(info['version']),
                     files={p.relative_to(package).as_posix(): updates.digest(p)
                     for p in sorted(package.rglob('*')) if p.is_file() and p.name != updates.BUILD_FILE})

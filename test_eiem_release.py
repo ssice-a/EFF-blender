@@ -1,3 +1,4 @@
+import ast
 import io
 import json
 import tempfile
@@ -8,6 +9,18 @@ import eiem_release
 
 
 class ReleaseCheckTests(unittest.TestCase):
+    def test_package_and_update_metadata_match(self):
+        root = Path(__file__).parent
+
+        def read_info(name):
+            tree = ast.parse((root / name).read_text(encoding="utf-8"))
+            return next(ast.literal_eval(node.value) for node in tree.body
+                        if isinstance(node, ast.Assign)
+                        and any(isinstance(target, ast.Name) and target.id == "bl_info"
+                                for target in node.targets))
+
+        self.assertEqual(read_info("__init__.py"), read_info("eiem_blender_addon.py"))
+
     def test_format3_update_rejects_legacy_mod_io_modules(self):
         required = (
             '__init__.py', 'eiem_blender_addon.py', 'eiem_release.py',

@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import os
 import importlib.util
 from pathlib import Path
@@ -101,5 +102,21 @@ class RuntimeControlsTests(unittest.TestCase):
         data=effect_encode('Test',row);decoded=effect_decode(decode_resource(data,10));self.assertEqual(decoded['bone'],row['bone'])
         damaged=bytearray(data);damaged[-1]^=1
         with self.assertRaises(ValueError):effect_decode(decode_resource(damaged,10))
+    def test_static_renderer_effect_roundtrips_without_bone_palette(self):
+        archive=b'UnityFS\0static weapon effect'
+        native=dict(key='A'*64,prefab='assets/effects/spark.prefab',rootName='Spark',root=0,particles=0,
+                    bundles=[dict(file='effects/0',hash=hashlib.sha256(archive).hexdigest().upper(),
+                                  dependencies=[],data=archive)])
+        row=dict(id='weapon_spark',label='Weapon Spark',part='',bone='',build='unused',
+                 targetPrefab='assets/weapons/weapon.prefab',rendererPath='',
+                 targetPath='assets/weapons/weapon.mesh',targetAsset='Weapon',bones=[])
+        with patch('nativepack.runtime_controls.native_build',return_value=native):
+            decoded=effect_decode(decode_resource(effect_encode('WeaponFx',row),10))
+        self.assertEqual(decoded['rendererPath'],'')
+        self.assertEqual(decoded['bones'],[])
+        self.assertEqual(decoded['targetAsset'],'Weapon')
+        with patch('nativepack.runtime_controls.native_build',return_value=native):
+            with self.assertRaisesRegex(ValueError,'source attachment proof'):
+                effect_encode('WeaponFx',dict(row,bone='Root/Hand'))
 
 if __name__=='__main__':unittest.main()

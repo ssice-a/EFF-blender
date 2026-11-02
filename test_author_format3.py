@@ -195,6 +195,8 @@ class Format3PublicationTests(unittest.TestCase):
         effect = dict(id="Petals", label="Petals", part=source_part, bone="",
                       autoplay=True, position=[0.0, 0.0, 0.0],
                       rotation=[0.0, 0.0, 0.0, 1.0], scale=[1.0, 1.0, 1.0],
+                      targetPrefab="assets/actor.prefab", rendererPath="Cloth",
+                      targetPath="assets/cloth.mesh", targetAsset="Cloth", bones=[],
                       native=dict(key="A" * 64, prefab="assets/effect.prefab",
                                   rootName="Effect", root=0, particles=0, bundles=[]))
 
@@ -206,6 +208,35 @@ class Format3PublicationTests(unittest.TestCase):
         stale = source_part.encode("utf-8")
         self.assertIn(struct.pack("<Q", len(expected)) + expected, metadata)
         self.assertNotIn(struct.pack("<Q", len(stale)) + stale, metadata)
+
+    def test_static_effect_requires_exact_renderer_source_proof(self):
+        effect = dict(id="Spark", label="Spark", part="", bone="", autoplay=True,
+                      position=[0.0, 0.0, 0.0], rotation=[0.0, 0.0, 0.0, 1.0],
+                      scale=[1.0, 1.0, 1.0], native={})
+        with self.assertRaisesRegex(ValueError, "exact Prefab/Renderer/Mesh source proof"):
+            author_format3._controls_resource("WeaponFx", [], [], [], [effect])
+
+    def test_static_renderer_effect_accepts_an_empty_bone_palette(self):
+        effect = dict(id="WeaponSpark", label="Weapon Spark", part="", bone="",
+                      autoplay=True, position=[0.0, 0.0, 0.0],
+                      rotation=[0.0, 0.0, 0.0, 1.0], scale=[1.0, 1.0, 1.0],
+                      targetPrefab="assets/weapons/weapon.prefab",
+                      rendererPath="",
+                      targetPath="assets/weapons/weapon.mesh", targetAsset="Weapon",
+                      bones=[], native=dict(key="A" * 64, prefab="assets/effect.prefab",
+                          rootName="Effect", root=0, particles=0,
+                          bundles=[dict(file="effects/0", hash="B" * 64,
+                                        size=48, dependencies=[],
+                                        data=b"UnityFS\x00static effect fixture")]))
+        encoded, _ = author_format3._controls_resource("WeaponFx", [], [], [], [effect])
+        header = HEADER.unpack_from(encoded)
+        metadata = encoded[HEADER.size:HEADER.size + header[3]]
+        self.assertIn(b"WeaponSpark", metadata)
+        self.assertIn(b"assets/weapons/weapon.prefab", metadata)
+
+        with self.assertRaisesRegex(ValueError, "bone-mounted Effect requires a source bone palette"):
+            author_format3._controls_resource(
+                "WeaponFx", [], [], [], [dict(effect, bone="Root/Hand")])
 
     def test_effect_attachment_rejects_an_undeclared_part(self):
         effect = dict(part="MissingPart")
