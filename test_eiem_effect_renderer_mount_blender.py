@@ -51,6 +51,19 @@ with tempfile.TemporaryDirectory(prefix="eiem-renderer-mount-") as temporary:
     assert static["bones"] == []
     assert static["targetPrefab"] == proof["prefab"]
     assert static["rendererPath"] == renderer_path
+
+    proof["resources"] = []
+    manifest.write_text(json.dumps(proof), encoding="utf-8")
+    try:
+        editor.attachment(root)
+    except ValueError as error:
+        assert "Renderer" in str(error)
+    else:
+        raise AssertionError("static attachment accepted missing Renderer source proof")
+    proof["resources"] = [dict(type="Mesh", logicalPath=mesh_path,
+                                name=mesh_asset, identity="mesh-id")]
+    manifest.write_text(json.dumps(proof), encoding="utf-8")
+
     owner.location = (2.0, 3.0, 4.0)
     root.location = (1.0, 0.0, 0.0)
     bpy.context.view_layer.update()

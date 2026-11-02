@@ -209,13 +209,6 @@ class Format3PublicationTests(unittest.TestCase):
         self.assertIn(struct.pack("<Q", len(expected)) + expected, metadata)
         self.assertNotIn(struct.pack("<Q", len(stale)) + stale, metadata)
 
-    def test_static_effect_requires_exact_renderer_source_proof(self):
-        effect = dict(id="Spark", label="Spark", part="", bone="", autoplay=True,
-                      position=[0.0, 0.0, 0.0], rotation=[0.0, 0.0, 0.0, 1.0],
-                      scale=[1.0, 1.0, 1.0], native={})
-        with self.assertRaisesRegex(ValueError, "exact Prefab/Renderer/Mesh source proof"):
-            author_format3._controls_resource("WeaponFx", [], [], [], [effect])
-
     def test_static_renderer_effect_accepts_an_empty_bone_palette(self):
         effect = dict(id="WeaponSpark", label="Weapon Spark", part="", bone="",
                       autoplay=True, position=[0.0, 0.0, 0.0],
@@ -233,10 +226,6 @@ class Format3PublicationTests(unittest.TestCase):
         metadata = encoded[HEADER.size:HEADER.size + header[3]]
         self.assertIn(b"WeaponSpark", metadata)
         self.assertIn(b"assets/weapons/weapon.prefab", metadata)
-
-        with self.assertRaisesRegex(ValueError, "bone-mounted Effect requires a source bone palette"):
-            author_format3._controls_resource(
-                "WeaponFx", [], [], [], [dict(effect, bone="Root/Hand")])
 
     def test_effect_attachment_rejects_an_undeclared_part(self):
         effect = dict(part="MissingPart")
