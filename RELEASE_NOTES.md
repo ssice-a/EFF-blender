@@ -1,4 +1,13 @@
-# EFF Blender v0.50.0
+# EFF Blender v0.50.1
+
+配套 EFF v2.0.4、AnimeStudio v1.9.1；Windows x64 / Blender 5.2。
+
+- 导入 AnimeStudio `EFFSOURCE` 解包包中的网格、材质和贴图，同时保留 Format 3 Mod 导入。
+- 保持 AnimeStudio 来源贴图的行方向；修改后的 DDS 从 Blender 当前像素重新编码，未修改 DDS 原样保留。
+- 明确区分 Format 2、Format 3 和 `EFFSOURCE` 输入，不把解包包误判为 Format 2 Mod。
+- 补充包类型、贴图回写和 Blender 5.2 插件注册回归测试。
+
+## EFF Blender v0.50.0
 
 配套 EFF v2.0.0、AnimeStudio v1.9.0；Windows x64 / Blender 5.2。
 

@@ -108,6 +108,15 @@ class FormatTests(unittest.TestCase):
         values = eiem_format.read_effmat_snapshot(result)
         self.assertEqual(values["texture._BaseMap"], "TextureBody_D_123456789abc")
 
+    def test_animestudio_effmat_source_accepts_full_snapshot_without_mod_delta_flag(self):
+        source = ("format=EFFMAT\nversion=1\nsource=assets/base/body.mat\nname=Body\n"
+                  "texture._BaseMap=TextureBody\nfloat._Gloss=0.4\n").encode()
+        values = eiem_format.read_effmat_source(source)
+        self.assertEqual(values["texture._BaseMap"], "TextureBody")
+        self.assertEqual(values["float._Gloss"], "0.4")
+        with self.assertRaisesRegex(ValueError, "format-3 Material author snapshot header differs"):
+            eiem_format.read_effmat_snapshot(source)
+
     def test_format3_physics_snapshot_roundtrips_with_native_resource(self):
         document = b"EFFPHYS\0editable-document"
         skeleton = b"EFFSKEL\0editable-skeleton"

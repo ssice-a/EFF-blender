@@ -88,6 +88,16 @@ for cycle in range(3):
     assert bpy.ops.eiem.shape_key_record.get_rna_type() is not None
     assert hasattr(bpy.types, "EFF_UL_switch_states")
     assert hasattr(bpy.types, "VIEW3D_PT_eiem_updates")
+    assert hasattr(bpy.types, "VIEW3D_PT_eiem_switches")
+    assert hasattr(bpy.types, "EFF_PT_shape_animation")
+    assert hasattr(bpy.types, "EFF_PT_physics_editor")
+    for panel_name in ("VIEW3D_PT_eiem_switches", "VIEW3D_PT_eiem_updates",
+                       "VIEW3D_PT_eiem_shared_tools", "EFF_PT_shape_animation",
+                       "EFF_PT_physics_editor"):
+        panel = getattr(bpy.types, panel_name)
+        assert panel.bl_space_type == "VIEW_3D"
+        assert panel.bl_region_type == "UI"
+        assert panel.bl_category == "EFF"
     assert not hasattr(bpy.types, "VIEW3D_PT_eiem_index_workspace")
     assert hasattr(bpy.types, "VIEW3D_PT_eiem_shared_tools")
     assert hasattr(bpy.types, "EFF_PT_physics_editor")

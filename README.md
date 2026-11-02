@@ -1,5 +1,7 @@
 # EFF Blender
 
+EFF panels appear in the 3D View sidebar. Move the pointer over a 3D View, press **N**, then select the **EFF** tab. Panels in Material, Object, and Mesh Data Properties remain in their matching Properties contexts.
+
 EFF Blender is the authoring add-on for AnimeStudio source packages. Install its release archive from [EFF Blender Releases](https://github.com/ssice-a/EFF-blender/releases).
 
 The supported Blender version and current authoring workflow are documented in the [EFF main repository](https://github.com/ssice-a/EFF), including the [Mod tutorial](https://github.com/ssice-a/EFF/blob/main/Mod%20Tutorial.md) and [shared tools and index setup](https://github.com/ssice-a/EFF/blob/main/docs/shared-tools-and-indexes.md).

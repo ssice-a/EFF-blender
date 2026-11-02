@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import struct
+import types
 from pathlib import Path
 import sys
 import tempfile
@@ -37,6 +38,17 @@ def source_stub(native, resources, **attributes):
 
 exporter = load_module('eiem_native_export_core_test',
                        Path(__file__).with_name('eiem_native_export.py'))
+
+
+def bundled_mesh_module():
+    name = '_eiem_shipped_nativepack'
+    if name not in sys.modules:
+        package = types.ModuleType(name)
+        package.__path__ = [str(Path(__file__).with_name('nativepack'))]
+        sys.modules[name] = package
+    return importlib.import_module(name + '.mesh')
+
+
 class Material(dict):
     def __init__(self, name, values=None):
         super().__init__(values or {})
@@ -92,6 +104,14 @@ class NativeExportCoreTests(unittest.TestCase):
     def test_exporter_has_one_complete_format3_entry(self):
         self.assertFalse(hasattr(exporter, 'validate_format3_export_scope'))
         self.assertNotIn('resource_scope', inspect.signature(exporter.export_native_package).parameters)
+
+    def test_shipped_bundle_mesh_writer_preserves_authored_uv_values(self):
+        mesh = bundled_mesh_module()
+        channels = [[.1, .2, .8, .9]] + [[]] * 7
+        converted, tangents = mesh.game_texture_coordinates(
+            channels, [1., 0., 0., 1., 0., 1., 0., -1.], 2)
+        np.testing.assert_allclose(converted[0], [[.1, .2], [.8, .9]])
+        np.testing.assert_array_equal(tangents.reshape(2, 4)[:, 3], [1., -1.])
 
     def test_typed_author_input_preserves_signed_unity_path_ids(self):
         template = dict(kind='Mesh', path='assets/test.asset', asset='MeshTest',
@@ -937,6 +957,44 @@ class NativeExportCoreTests(unittest.TestCase):
             addon.write_texture=lambda output,owner:(writes.append(owner),shutil.copyfile(owner.filepath,output))
             exporter.collect_material(addon,source,mat,{'image':image},{},folder,None,texture_only=True)
             self.assertEqual(len(writes),1)
+            self.assertTrue(self.texture_compressor_mock.call_args.kwargs['flip_y'])
+
+    def test_dirty_dds_recompresses_current_blender_pixels(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as folder:
+            dds = Path(folder) / 'edited.dds'
+            dds.write_bytes(dds_bc7(4, 4, b'D' * 16))
+            image = Material('EditedDDS', {'eiem_linear': 'false'})
+            image.filepath = str(dds)
+            image.is_dirty = True
+            addon = SimpleNamespace(
+                image_absolute_path=lambda owner: owner.filepath,
+                write_texture=lambda output, owner: Image.new(
+                    'RGBA', (2, 2), (17, 33, 65, 255)).save(output),
+                material_override_payload=lambda *args, **kwargs: (
+                    ['texture._BaseMap=slot'], None))
+            texture = dict(identity='source-texture', logicalPath='assets/body_d', name='Body_D',
+                           details=dict(format='BC7', colorSpace=1))
+            native = dict(details=dict(textures=[dict(property='_BaseMap', pointer=dict(
+                isNull=False, identity='source-texture'))]), native=dict(typeHash='12' * 16))
+            source = SimpleNamespace(resolve=lambda *args: native,
+                resolve_identity=lambda identity: texture,
+                manifest=dict(resources=[texture]))
+            material = Material('MaterialBody', dict(eiem_source='assets/body', eiem_name='Body'))
+            textures = {}
+
+            record = exporter.collect_material(
+                addon, source, material, {'slot': image}, textures, folder, None,
+                texture_only=True)
+
+            exported = textures[record['textureEdits'][0]['texture']]
+            self.assertEqual(exported['width'], 2)
+            self.assertEqual(exported['height'], 2)
+            self.assertIsNone(exported['ddsHash'])
+            self.assertIsNone(exported['ddsSourcePath'])
+            self.assertEqual(self.texture_compressor_mock.call_args.args[0],
+                             bytes((17, 33, 65, 255)) * 4)
+            self.assertTrue(self.texture_compressor_mock.call_args.kwargs['flip_y'])
 
     def test_export_staging_closes_frozen_resources_before_cleanup(self):
         class Stream:

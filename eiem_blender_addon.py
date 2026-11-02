@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 50, 0),
+    "version": (0, 50, 1),
     "blender": (5, 2, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
@@ -1137,9 +1137,14 @@ def mesh_resource_collection(root_collection, section, payload):
 
 
 def import_package(root, clean=False, include_physics=False, physics_file=""):
+    root = Path(root).resolve()
     parser = parse_ini(root)
-    if parser.get("Mod", "format", fallback="") != "3":
-        raise ValueError("Blender 只读取 Format 3 Mod；请先使用 Mod Manager 迁移旧格式。")
+    kind = format_io.package_kind(root, parser)
+    if kind == "format2":
+        raise ValueError("这是旧 Format 2 运行时 Mod；请在 Mod Manager 的修复页迁移后再导入。")
+    if kind == "unknown":
+        raise ValueError("目录既不是 AnimeStudio EFFSOURCE 解包包，也不是 Format 3 运行时 Mod。")
+    is_source_package = kind == "source"
     resources = {section: dict(parser.items(section)) for section in parser.sections()}
     effect_attachments = []
     for section, values in resources.items():
@@ -1203,8 +1208,16 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
         # Do not let Blender's global filepath cache alias two imported
         # Mod packages. Their section/source metadata is package-local,
         # even when both happen to point at the same DDS.
-        image_path = values["dds"]
-        image = bpy.data.images.load(str(safe_path(root, image_path)), check_existing=False)
+        image_path = values["path"] if is_source_package else values.get("dds", "")
+        if not image_path:
+            raise ValueError("Texture %s has no image file" % section)
+        image_file = safe_path(root, image_path)
+        if not image_file.is_file():
+            raise ValueError("Texture image is missing: " + str(image_file))
+        image = bpy.data.images.load(str(image_file), check_existing=False)
+        if image.size[0] <= 0 or image.size[1] <= 0:
+            bpy.data.images.remove(image)
+            raise ValueError("无法解码贴图：" + str(image_file))
         used = {str(item.get("eiem_section")): item for item in bpy.data.images
                 if item.get("eiem_section") and item is not image}
         image_section = section
@@ -1225,18 +1238,30 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
         image["eiem_wrap"] = values.get("wrap", "0")
         image["eiem_aniso"] = values.get("aniso", "1")
         image["eiem_mip_bias"] = values.get("mip_bias", "0")
+        image.colorspace_settings.name = "Non-Color" if image["eiem_linear"].lower() == "true" else "sRGB"
         textures[section] = image
     materials = {}
     for section, values in resources.items():
         if section.lower().startswith("material") and values.get("path"):
-            material_values = format_io.read_format3_material_resource(
-                safe_path(root, values["path"]), section, values["path"])
-            material_values.pop("_source_asset", None)
-            material_values.pop("_author_hash", None)
-            material_values["target.path"] = values.get(
-                "source.path", material_values["source"])
-            material_values["target.asset"] = values.get(
-                "source.asset", material_values.get("name", section))
+            material_path = safe_path(root, values["path"])
+            if is_source_package:
+                material_values = format_io.read_effmat_source(material_path.read_bytes())
+                material_values.pop("format", None)
+                material_values.pop("version", None)
+                material_values["target.path"] = material_values.get("source", "")
+                material_values["target.asset"] = material_values.get("name", section)
+                for key, texture_id in material_values.items():
+                    if key.startswith("texture.") and texture_id not in textures:
+                        raise ValueError("Source Material references a missing Texture: " + texture_id)
+            else:
+                material_values = format_io.read_format3_material_resource(
+                    material_path, section, values["path"])
+                material_values.pop("_source_asset", None)
+                material_values.pop("_author_hash", None)
+                material_values["target.path"] = values.get(
+                    "source.path", material_values["source"])
+                material_values["target.asset"] = values.get(
+                    "source.asset", material_values.get("name", section))
             material = load_material(root, section, material_values, textures)
             material["eiem_material_file"] = values["path"]
             materials[section] = material
@@ -1265,7 +1290,9 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
     for section, values in resources.items():
         if not section.lower().startswith("mesh") or not values.get("path"):
             continue
-        payload = format_io.read_format3_mesh_resource(safe_path(root, values["path"]))
+        mesh_path = safe_path(root, values["path"])
+        payload = (format_io.read_mesh(mesh_path) if is_source_package else
+                   format_io.read_format3_mesh_resource(mesh_path))
         mesh = make_mesh(section, payload)
         # Preserve offline identity for authoring and for the generated Render
         # selector. Resource declarations do not apply replacements themselves.
@@ -4272,7 +4299,7 @@ class EFF_OT_import_animation(ImportHelper, bpy.types.Operator):
 
 class EFF_OT_import(ImportHelper, bpy.types.Operator):
     bl_idname = "eiem.import_package"
-    bl_label = "Import EFF package"
+    bl_label = "Import EFF source package or Format 3 Mod"
     directory: StringProperty(subtype="DIR_PATH")
     filter_glob: StringProperty(default="mod.ini", options={"HIDDEN"})
     clean: BoolProperty(name="Clear EFF collection", default=False)
@@ -4595,7 +4622,7 @@ class EFF_OT_ignore_update_release(bpy.types.Operator):
 
 
 def menu_import(self, context):
-    self.layout.operator(EFF_OT_import.bl_idname, text="EFF Mod 包")
+    self.layout.operator(EFF_OT_import.bl_idname, text="EFF 来源包 / Format 3 Mod")
     self.layout.operator(EFF_OT_import_animation.bl_idname, text='EFF 动画（选中骨架）')
 
 

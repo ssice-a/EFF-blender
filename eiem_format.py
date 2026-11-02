@@ -159,6 +159,28 @@ def parse_ini(root):
     return parser
 
 
+def package_kind(root, parser=None):
+    """Classify a Blender input as a runtime Mod or an AnimeStudio source package."""
+    root = Path(root)
+    if not (root / "mod.ini").is_file():
+        return "unknown"
+    parser = parser or parse_ini(root)
+    runtime_format = parser.get("Mod", "format", fallback="")
+    if runtime_format == "3":
+        return "format3"
+    if runtime_format == "2":
+        return "format2"
+    manifest_path = root / "source" / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return "unknown"
+        if manifest.get("format") == "EFFSOURCE" and manifest.get("version") == 1:
+            return "source"
+    return "unknown"
+
+
 def safe_path(root, relative):
     path = (Path(root) / relative).resolve()
     root = Path(root).resolve()
@@ -285,24 +307,38 @@ class _AuthorMetadataReader:
             raise ValueError("format-3 metadata has trailing bytes")
 
 
-def read_effmat_snapshot(data):
-    """Decode the portable, editable EFFMAT author snapshot."""
+def _read_effmat_values(data):
     try:
         text = data.decode("utf-8-sig", "strict")
     except UnicodeDecodeError as error:
-        raise ValueError("format-3 Material author snapshot is not UTF-8") from error
+        raise ValueError("EFFMAT author snapshot is not UTF-8") from error
     values = {}
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith((";", "#")):
             continue
         if "=" not in line:
-            raise ValueError("format-3 Material author snapshot has an invalid line")
+            raise ValueError("EFFMAT author snapshot has an invalid line")
         key, value = line.split("=", 1)
         key, value = key.strip(), value.strip()
         if not key or key in values:
-            raise ValueError("format-3 Material author snapshot has an empty or duplicate key")
+            raise ValueError("EFFMAT author snapshot has an empty or duplicate key")
         values[key] = value
+    return values
+
+
+def read_effmat_source(data):
+    """Read the complete EFFMAT material snapshot emitted by AnimeStudio."""
+    values = _read_effmat_values(data)
+    if (values.get("format") != "EFFMAT" or values.get("version") != "1" or
+            not values.get("source", "").strip()):
+        raise ValueError("AnimeStudio Material source snapshot header differs")
+    return values
+
+
+def read_effmat_snapshot(data):
+    """Decode a sparse editable EFFMAT snapshot stored by a Format 3 Mod."""
+    values = _read_effmat_values(data)
     if (values.get("format") != "EFFMAT" or values.get("version") != "1" or
             values.get("overrides", "").lower() != "true" or not values.get("source", "").strip()):
         raise ValueError("format-3 Material author snapshot header differs")

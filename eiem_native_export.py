@@ -639,12 +639,27 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
                     dds_source.parent.mkdir(parents=True, exist_ok=True)
                     dds_source.write_bytes(dds_bytes)
                 parsed = texture_compression.parse_source_dds(dds_bytes)
-                dds_hash = hashlib.sha256(dds_bytes).hexdigest().upper()
-                source_pixels_hash = hashlib.sha256(parsed['pixels']).hexdigest().upper()
-                target = dict(name=parsed['format'], unity=parsed['formatId'])
-                payload = dict(parsed, pixelLabel=token(disk.stem or image.name),
-                               sourcePixelsHash=source_pixels_hash, ddsHash=dds_hash,
-                               ddsSourcePath=str(dds_source), **settings)
+                if getattr(image, 'is_dirty', False):
+                    png = Path(temporary)/(hashlib.sha256(section.encode()).hexdigest()+'.png')
+                    addon.write_texture(png, image)
+                    with texture_bitmap(png, False) as mip:
+                        width, height = mip.size
+                        base_pixels = texture_compression.rgba_pixels_top_down(mip)
+                    source_pixels_hash = hashlib.sha256(base_pixels).hexdigest().upper()
+                    converted = texture_compression.compress_rgba(
+                        base_pixels, width, height,
+                        str(image.get('eiem_mipmaps', 'true' if parsed['mipCount'] > 1 else 'false')) == 'true',
+                        source_format, color_space,
+                        shared_resources.native_tool_file('texconv.exe'), flip_y=True)
+                    payload = dict(converted, pixelLabel=token(disk.stem or image.name),
+                                   sourcePixelsHash=source_pixels_hash, ddsHash=None,
+                                   ddsSourcePath=None, **settings)
+                else:
+                    dds_hash = hashlib.sha256(dds_bytes).hexdigest().upper()
+                    source_pixels_hash = hashlib.sha256(parsed['pixels']).hexdigest().upper()
+                    payload = dict(parsed, pixelLabel=token(disk.stem or image.name),
+                                   sourcePixelsHash=source_pixels_hash, ddsHash=dds_hash,
+                                   ddsSourcePath=str(dds_source), **settings)
             else:
                 direct = disk.is_file() and not getattr(image, 'is_dirty', False) and not getattr(image, 'packed_file', None)
                 png = disk if direct else Path(temporary)/(hashlib.sha256(section.encode()).hexdigest()+'.png')
@@ -658,7 +673,7 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
                 converted = texture_compression.compress_rgba(
                     base_pixels, width, height,
                     str(image.get('eiem_mipmaps', 'true')) == 'true', source_format,
-                    color_space, shared_resources.native_tool_file('texconv.exe'), flip_y=False)
+                    color_space, shared_resources.native_tool_file('texconv.exe'), flip_y=True)
                 payload = dict(converted, pixels=converted['pixels'],
                                pixelLabel=token(Path(image.filepath).stem or image.name),
                                sourcePixelsHash=source_pixels_hash, ddsHash=None,
