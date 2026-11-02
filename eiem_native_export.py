@@ -8,6 +8,7 @@ import ctypes
 import hashlib
 import io
 import importlib.util
+import json
 import math
 import os
 from pathlib import Path
@@ -39,6 +40,11 @@ _NATIVE_SNAPSHOT_CACHE_LIMIT = 128
 _NATIVE_MATERIAL_FIELDS_CACHE = {}
 _NATIVE_IMAGE_CACHE = {}
 _NATIVE_IMAGE_CACHE_BYTES = 128 * 1024 * 1024
+_NATIVE_TEXTURE_COMPRESSION_CACHE_BYTES = 512 * 1024 * 1024
+_NATIVE_TEXTURE_COMPRESSION_CACHE_MAGIC = b'EIEMBCN1'
+_NATIVE_TEXTURE_COMPRESSION_CODE_HASH = None
+_NATIVE_TEXTURE_EXPORT_CODE_HASH = None
+_NATIVE_TEXTURE_COMPRESSOR_HASHES = {}
 _FORMAT3_WRITER_LIBRARIES = {}
 
 
@@ -554,6 +560,159 @@ def texture_bitmap(path, cache_disk=False):
     return Image.frombytes('RGBA', cached[0], cached[1])
 
 
+def _texture_compression_cache_root():
+    return shared_resources.metadata_root() / 'texture-cache' / 'bcn-v1'
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _texture_compressor_identity(texconv):
+    global _NATIVE_TEXTURE_COMPRESSION_CODE_HASH, _NATIVE_TEXTURE_EXPORT_CODE_HASH
+    if _NATIVE_TEXTURE_COMPRESSION_CODE_HASH is None:
+        try:
+            _NATIVE_TEXTURE_COMPRESSION_CODE_HASH = _file_sha256(texture_compression.__file__)
+        except (AttributeError, OSError, TypeError, ValueError):
+            _NATIVE_TEXTURE_COMPRESSION_CODE_HASH = 'unknown-compressor-code'
+    if _NATIVE_TEXTURE_EXPORT_CODE_HASH is None:
+        try:
+            _NATIVE_TEXTURE_EXPORT_CODE_HASH = _file_sha256(__file__)
+        except (OSError, TypeError, ValueError):
+            _NATIVE_TEXTURE_EXPORT_CODE_HASH = 'unknown-export-code'
+
+    path = Path(texconv).expanduser().resolve()
+    try:
+        stat_result = path.stat()
+        fingerprint = (str(path), stat_result.st_size, stat_result.st_mtime_ns)
+    except OSError:
+        fingerprint = (str(path), None, None)
+    tool_hash = _NATIVE_TEXTURE_COMPRESSOR_HASHES.get(fingerprint)
+    if tool_hash is None:
+        try:
+            tool_hash = _file_sha256(path)
+        except OSError:
+            tool_hash = str(path)
+        if len(_NATIVE_TEXTURE_COMPRESSOR_HASHES) >= 16:
+            _NATIVE_TEXTURE_COMPRESSOR_HASHES.clear()
+        _NATIVE_TEXTURE_COMPRESSOR_HASHES[fingerprint] = tool_hash
+    value = '\0'.join((_NATIVE_TEXTURE_COMPRESSION_CODE_HASH,
+                        _NATIVE_TEXTURE_EXPORT_CODE_HASH, tool_hash))
+    return hashlib.sha256(value.encode('utf-8')).hexdigest()
+
+
+def _texture_compression_cache_key(source_pixels_hash, width, height, mipmaps,
+                                   source_format, color_space, texconv):
+    identity = dict(
+        version=1, sourcePixels=source_pixels_hash, width=width, height=height,
+        mipmaps=bool(mipmaps), sourceFormat=str(source_format),
+        colorSpace=int(color_space), flipY=True,
+        compressor=_texture_compressor_identity(texconv))
+    encoded = json.dumps(identity, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _read_texture_compression_cache(key, expected_size):
+    path = _texture_compression_cache_root() / (key + '.bcncache')
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    header_size = len(_NATIVE_TEXTURE_COMPRESSION_CACHE_MAGIC) + 32
+    payload = data[header_size:]
+    valid = (
+        data.startswith(_NATIVE_TEXTURE_COMPRESSION_CACHE_MAGIC) and
+        len(data) == header_size + expected_size and
+        hashlib.sha256(payload).digest() == data[len(_NATIVE_TEXTURE_COMPRESSION_CACHE_MAGIC):header_size]
+    )
+    if not valid:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+    try:
+        os.utime(path, None)
+    except OSError:
+        pass
+    return payload
+
+
+def _write_texture_compression_cache(key, payload):
+    payload = bytes(payload)
+    if len(payload) > _NATIVE_TEXTURE_COMPRESSION_CACHE_BYTES:
+        return
+    root = _texture_compression_cache_root()
+    temporary = None
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        descriptor, name = tempfile.mkstemp(prefix=key + '.', suffix='.tmp', dir=root)
+        temporary = Path(name)
+        with os.fdopen(descriptor, 'wb') as stream:
+            stream.write(_NATIVE_TEXTURE_COMPRESSION_CACHE_MAGIC)
+            stream.write(hashlib.sha256(payload).digest())
+            stream.write(payload)
+        os.replace(temporary, root / (key + '.bcncache'))
+    except OSError:
+        pass
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _prune_texture_compression_cache():
+    try:
+        files = list(_texture_compression_cache_root().glob('*.bcncache'))
+        entries = []
+        for path in files:
+            try:
+                stat_result = path.stat()
+            except OSError:
+                continue
+            entries.append((stat_result.st_mtime_ns, stat_result.st_size, path))
+        entries.sort(key=lambda entry: entry[0])
+        total = sum(size for _, size, _ in entries)
+        for _, size, path in entries:
+            if total <= _NATIVE_TEXTURE_COMPRESSION_CACHE_BYTES:
+                break
+            try:
+                path.unlink()
+                total -= size
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
+def _compress_texture_blocks(base_pixels, width, height, mipmaps,
+                             source_format, color_space, texconv,
+                             source_pixels_hash=None):
+    target = texture_compression.target_format(source_format, color_space)
+    mip_count = max(width, height).bit_length() if mipmaps else 1
+    expected_size = texture_compression._mip_extent(
+        width, height, mip_count, target['block_bytes'])
+    pixels_hash = source_pixels_hash or hashlib.sha256(base_pixels).hexdigest().upper()
+    key = _texture_compression_cache_key(
+        pixels_hash, width, height, mipmaps, source_format, color_space, texconv)
+    cached = _read_texture_compression_cache(key, expected_size)
+    if cached is not None:
+        return dict(pixels=cached, format=target['name'], formatId=target['unity'],
+                    width=width, height=height, mipCount=mip_count)
+    converted = texture_compression.compress_rgba(
+        base_pixels, width, height, mipmaps, source_format, color_space,
+        texconv, flip_y=True)
+    if len(converted.get('pixels', b'')) == expected_size:
+        _write_texture_compression_cache(key, converted['pixels'])
+    return converted
+
+
 def _texture_resource_id(section, image, color_space, target, width, height,
                          mip_count, settings):
     """Share one author image across bindings with identical sampling semantics."""
@@ -652,11 +811,12 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
                         width, height = mip.size
                         base_pixels = texture_compression.rgba_pixels_top_down(mip)
                     source_pixels_hash = hashlib.sha256(base_pixels).hexdigest().upper()
-                    converted = texture_compression.compress_rgba(
+                    converted = _compress_texture_blocks(
                         base_pixels, width, height,
                         str(image.get('eiem_mipmaps', 'true' if parsed['mipCount'] > 1 else 'false')) == 'true',
                         source_format, color_space,
-                        shared_resources.native_tool_file('texconv.exe'), flip_y=True)
+                        shared_resources.native_tool_file('texconv.exe'),
+                        source_pixels_hash)
                     payload = dict(converted, pixelLabel=token(disk.stem or image.name),
                                    sourcePixelsHash=source_pixels_hash, ddsHash=None,
                                    ddsSourcePath=None, **settings)
@@ -675,11 +835,11 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
                     width, height = mip.size
                     base_pixels = texture_compression.rgba_pixels_top_down(mip)
                 source_pixels_hash = hashlib.sha256(base_pixels).hexdigest().upper()
-                target = texture_compression.target_format(source_format, color_space)
-                converted = texture_compression.compress_rgba(
+                converted = _compress_texture_blocks(
                     base_pixels, width, height,
                     str(image.get('eiem_mipmaps', 'true')) == 'true', source_format,
-                    color_space, shared_resources.native_tool_file('texconv.exe'), flip_y=True)
+                    color_space, shared_resources.native_tool_file('texconv.exe'),
+                    source_pixels_hash)
                 payload = dict(converted, pixels=converted['pixels'],
                                pixelLabel=token(Path(image.filepath).stem or image.name),
                                sourcePixelsHash=source_pixels_hash, ddsHash=None,
@@ -702,12 +862,7 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
             raise ValueError('同一作者材质的纹理绑定在导出期间发生冲突：' + mid + ' / ' + prop)
         textures[tid] = record
         if texture_inputs is not None:
-            inputs = texture_inputs.setdefault(tid, dict(images=[]))
-            if not any(existing_image is image for existing_image in inputs['images']):
-                inputs['images'].append(image)
-            binding = (mat, prop)
-            if binding not in inputs.setdefault('bindings', []):
-                inputs['bindings'].append(binding)
+            inputs = texture_inputs.setdefault(tid, {})
             if payload.get('ddsSourcePath'):
                 prior_hash = inputs.get('dds_hash')
                 if prior_hash and prior_hash != payload['ddsHash']:
@@ -724,22 +879,6 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
                 fieldData=(native_material_fields(source, native, overrides, encode)
                            if include_native_fields and not texture_only else {}))
 
-
-def _update_texture_image_paths(root, texture_inputs):
-    root = Path(root).resolve()
-    for texture_id, inputs in texture_inputs.items():
-        relative = inputs.get('dds_relative')
-        if not relative:
-            raise ValueError('已发布的 Texture DDS 路径缺失：' + texture_id)
-        path = (root / relative).resolve()
-        if root not in path.parents or not path.is_file():
-            raise ValueError('已发布的 Texture DDS 文件无效：' + str(path))
-        for image in inputs['images']:
-            image.filepath = str(path)
-        for material, property_name in inputs.get('bindings', ()):
-            key = 'eiem_texture.' + property_name
-            if key in material:
-                material[key] = str(path)
 
 def _replace_published_file(source, destination):
     # ReplaceFile preserves the runtime reader's delete-shared old snapshot.
@@ -1238,9 +1377,6 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
             raise ValueError('Format 3 native author writer could not complete: ' + str(error)) from error
         manifest = modules['author_format3'].read_format3_directory(format3_staging)
         format3_done = time.perf_counter()
-        for texture_id in texture_inputs:
-            texture_inputs[texture_id]['dds_relative'] = (
-                'textures/' + modules['author_format3'].identifier(texture_id) + '.dds')
         source.assert_current()
         for material_baseline in material_sources.values():
             material_baseline.assert_current()
@@ -1258,7 +1394,7 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
 
         package = publish(format3_staging, destination, publication_reader,
                           candidate=manifest)
-        _update_texture_image_paths(destination, texture_inputs)
+        _prune_texture_compression_cache()
         publish_done = time.perf_counter()
         return dict(meshes=len(parts), materials=len(materials),
                     textures=len(native_textures), textureBindings=len(textures),

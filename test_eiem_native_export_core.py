@@ -120,6 +120,13 @@ class NativeExportCoreTests(unittest.TestCase):
         self.texture_compressor = patch.object(exporter.texture_compression, 'compress_rgba', side_effect=compress)
         self.texture_compressor_mock = self.texture_compressor.start()
         self.addCleanup(self.texture_compressor.stop)
+        self.texture_cache_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.texture_cache_directory.cleanup)
+        self.texture_cache_root = patch.object(
+            exporter, '_texture_compression_cache_root',
+            return_value=Path(self.texture_cache_directory.name))
+        self.texture_cache_root.start()
+        self.addCleanup(self.texture_cache_root.stop)
         self.texture_tool = patch.object(exporter.shared_resources, 'native_tool_file', return_value=Path('texconv.exe'))
         self.texture_tool.start()
         self.addCleanup(self.texture_tool.stop)
@@ -295,8 +302,7 @@ class NativeExportCoreTests(unittest.TestCase):
                 textures, folder, None, texture_only=True, texture_inputs=texture_inputs)
             self.texture_compressor_mock.assert_called_once()
             texture_id = record['textureEdits'][0]['texture']
-            self.assertEqual(texture_inputs[texture_id]['images'], [image])
-            self.assertEqual(texture_inputs[texture_id]['bindings'], [(material, '_BaseMap')])
+            self.assertEqual(texture_inputs[texture_id], {})
             self.assertNotIn('dds_path', texture_inputs[texture_id])
 
             root = Path(folder) / 'published'
@@ -304,15 +310,31 @@ class NativeExportCoreTests(unittest.TestCase):
             format3 = exporter.pack_modules()[0]['author_format3']
             format3.write_format3_directory(
                 root, 'Smoke', [], {}, list(textures.values()), [], [], [], [])
-            texture_inputs[texture_id]['dds_relative'] = 'textures/' + texture_id + '.dds'
             published_dds = root / 'textures' / (texture_id + '.dds')
-            exporter._update_texture_image_paths(root, texture_inputs)
             self.assertEqual(exporter.texture_compression.parse_source_dds(
                 published_dds.read_bytes())['format'], 'BC7')
-            self.assertEqual(Path(image.filepath), published_dds)
-            self.assertEqual(Path(material['eiem_texture._BaseMap']), published_dds)
+            self.assertEqual(Path(image.filepath), png_path)
+            self.assertEqual(Path(material['eiem_texture._BaseMap']), png_path)
 
-    def test_format3_passthrough_copies_exact_dds_and_updates_image_path(self):
+            next_textures, next_inputs = {}, {}
+            exporter.collect_material(addon, source, material, {'slot': image},
+                next_textures, folder, None, texture_only=True,
+                texture_inputs=next_inputs)
+            self.assertEqual(self.texture_compressor_mock.call_count, 1,
+                             'unchanged source PNG should reuse compressed BCn blocks')
+
+            stamp = png_path.stat()
+            Image.new('RGBA', (4, 4), (32, 96, 224, 255)).save(png_path)
+            self.assertEqual(png_path.stat().st_size, stamp.st_size)
+            os.utime(png_path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            next_textures, next_inputs = {}, {}
+            exporter.collect_material(addon, source, material, {'slot': image},
+                next_textures, folder, None, texture_only=True,
+                texture_inputs=next_inputs)
+            self.assertEqual(self.texture_compressor_mock.call_count, 2)
+            self.assertEqual(Path(material['eiem_texture._BaseMap']), png_path)
+
+    def test_format3_passthrough_copies_exact_dds(self):
         payload = bytes(range(16))
         raw_dds = dds_bc7(4, 4, payload, dxgi=99)
         with tempfile.TemporaryDirectory() as folder:
@@ -323,8 +345,6 @@ class NativeExportCoreTests(unittest.TestCase):
                 encoding='utf-8')
             source_dds = Path(folder) / 'source.dds'
             source_dds.write_bytes(raw_dds)
-            image = Material('Image', {})
-            image.filepath = str(Path(folder) / 'source.png')
             parsed_source = exporter.texture_compression.parse_source_dds(raw_dds)
             texture = dict(parsed_source, id='TextureExample', colorSpace=1,
                            filter=1, wrap=0, aniso=1, mipBias=0.0,
@@ -333,19 +353,19 @@ class NativeExportCoreTests(unittest.TestCase):
             texture_inputs = {'TextureExample': {
                 'dds_path': source_dds,
                 'dds_hash': hashlib.sha256(raw_dds).hexdigest().upper(),
-                'images': [image],
             }}
 
             exporter.pack_modules()[0]['author_format3'].write_format3_directory(
                 root, 'Smoke', [], {}, [texture], [], [], [], [])
-            texture_inputs['TextureExample']['dds_relative'] = 'textures/TextureExample.dds'
-            exporter._update_texture_image_paths(root, texture_inputs)
-
             output_dds = root / 'textures/TextureExample.dds'
             self.assertEqual(output_dds.read_bytes(), raw_dds)
             parsed = exporter.texture_compression.parse_source_dds(output_dds.read_bytes())
             self.assertEqual(parsed['pixels'], payload)
-            self.assertEqual(Path(image.filepath), output_dds)
+
+    def test_export_pipeline_has_no_published_path_rewrite(self):
+        self.assertFalse(hasattr(exporter, '_update_texture_image_paths'))
+        self.assertNotIn('_update_texture_image_paths',
+                         inspect.getsource(exporter.export_native_package))
 
     def test_material_switch_definition_validates_user_selected_materials(self):
         validate = addon_function('material_switch_definition', {
@@ -832,6 +852,45 @@ class NativeExportCoreTests(unittest.TestCase):
             with exporter.texture_bitmap(path, False) as uncached:
                 self.assertEqual(uncached.tobytes(), changed.tobytes())
 
+    def test_texture_compression_cache_key_tracks_pixels_and_settings(self):
+        base = exporter._texture_compression_cache_key(
+            'A' * 64, 256, 128, True, 'BC7', 1, 'texconv.exe')
+        variants = (
+            exporter._texture_compression_cache_key(
+                'B' * 64, 256, 128, True, 'BC7', 1, 'texconv.exe'),
+            exporter._texture_compression_cache_key(
+                'A' * 64, 256, 128, False, 'BC7', 1, 'texconv.exe'),
+            exporter._texture_compression_cache_key(
+                'A' * 64, 256, 128, True, 'BC7', 0, 'texconv.exe'),
+            exporter._texture_compression_cache_key(
+                'A' * 64, 256, 128, True, 'BC5', 1, 'texconv.exe'),
+        )
+        self.assertTrue(all(key != base for key in variants))
+
+    def test_texture_compression_cache_validates_payload_checksum(self):
+        key = 'c' * 64
+        payload = b'compressed BCn blocks'
+        exporter._write_texture_compression_cache(key, payload)
+        path = Path(self.texture_cache_directory.name) / (key + '.bcncache')
+        self.assertEqual(exporter._read_texture_compression_cache(key, len(payload)), payload)
+        path.write_bytes(exporter._NATIVE_TEXTURE_COMPRESSION_CACHE_MAGIC + b'X' * 32 + payload)
+        self.assertIsNone(exporter._read_texture_compression_cache(key, len(payload)))
+        self.assertFalse(path.exists())
+
+    def test_texture_compression_cache_prunes_oldest_entries_to_limit(self):
+        root = Path(self.texture_cache_directory.name)
+        root.mkdir(parents=True, exist_ok=True)
+        oldest = root / 'old.bcncache'
+        newest = root / 'new.bcncache'
+        oldest.write_bytes(b'A' * 12)
+        newest.write_bytes(b'B' * 12)
+        os.utime(oldest, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(newest, ns=(2_000_000_000, 2_000_000_000))
+        with patch.object(exporter, '_NATIVE_TEXTURE_COMPRESSION_CACHE_BYTES', 12):
+            exporter._prune_texture_compression_cache()
+        self.assertFalse(oldest.exists())
+        self.assertTrue(newest.exists())
+
     def test_reextracted_source_rebinds_objects_and_rejects_mid_export_change(self):
         module = exporter.pack_modules()[0]['author_source']
         with tempfile.TemporaryDirectory() as folder:
@@ -969,17 +1028,20 @@ class NativeExportCoreTests(unittest.TestCase):
             texture=textures[record['textureEdits'][0]['texture']]
             self.assertEqual(texture['sourceAsset'],'Base_D')
             self.assertEqual(texture['colorSpace'],1)
+            self.texture_compressor_mock.assert_called_once()
             self.texture_compressor_mock.reset_mock()
             reused={}
             exporter.collect_material(addon,source,mat,{'image':image},reused,folder,None,
                                       texture_only=True)
-            self.texture_compressor_mock.assert_called_once()
+            self.texture_compressor_mock.assert_not_called()
             self.assertFalse(next(iter(reused.values())).get('retained', False))
             image.is_dirty=True
             writes=[]
-            addon.write_texture=lambda output,owner:(writes.append(owner),shutil.copyfile(owner.filepath,output))
+            addon.write_texture=lambda output,owner:(writes.append(owner),Image.new(
+                'RGBA',(2,2),(0,255,0,255)).save(output))
             exporter.collect_material(addon,source,mat,{'image':image},{},folder,None,texture_only=True)
             self.assertEqual(len(writes),1)
+            self.texture_compressor_mock.assert_called_once()
             self.assertTrue(self.texture_compressor_mock.call_args.kwargs['flip_y'])
 
     def test_dirty_dds_recompresses_current_blender_pixels(self):
