@@ -1,4 +1,12 @@
-# EFF Blender v0.50.1
+# EFF Blender v0.50.2
+
+配套 EFF v2.0.5、AnimeStudio v1.9.1；Windows x64 / Blender 5.2。
+
+- 正确识别 `packages/` 与 `assets/` 下的游戏资源身份，支持 package 来源贴图和 Mesh 目标的 Format 3 导入、保留与导出。
+- 将游戏资源身份与本地图片路径区分，避免把 package 贴图误判为需要重建的图片文件。
+- 增加非法路径校验与 package 资源路径回归测试。
+
+## EFF Blender v0.50.1
 
 配套 EFF v2.0.4、AnimeStudio v1.9.1；Windows x64 / Blender 5.2。
 

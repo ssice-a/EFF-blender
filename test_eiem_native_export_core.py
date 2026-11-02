@@ -85,6 +85,29 @@ def addon_function(name, namespace, path=ADDON):
 
 
 class NativeExportCoreTests(unittest.TestCase):
+    def test_all_resource_identity_paths_share_assets_and_packages_namespaces(self):
+        format3 = exporter.pack_modules()[0]['author_format3']
+        for path in (
+                'assets/characters/body.mesh',
+                'packages/com.hg.game/runtime/weapons/sword.mesh',
+                'packages/com.hg.render-pipelines/runtime/renderpipelineresources/material/defaultmaterial.mat'):
+            self.assertTrue(format3.is_logical_resource_path(path), path)
+        for path in ('packages/../assets/body.mesh', 'packages\\game\\body.mesh',
+                     'C:/game/body.mesh', 'assets//body.mesh'):
+            self.assertFalse(format3.is_logical_resource_path(path), path)
+
+    def test_texture_only_export_preserves_package_texture_identity(self):
+        source_path = 'packages/com.hg.render-pipelines/runtime/renderpipelineresources/texture/body.tex'
+        material = Material('MaterialBody', {'eiem_texture._BaseMap': source_path})
+        addon = SimpleNamespace(
+            material_override_payload=lambda *args, **kwargs: (['format=EFFMAT', 'version=1'], None),
+            parse_json_property=lambda *args, **kwargs: {},
+            resolve_material_texture=lambda *args, **kwargs: self.fail('game identity treated as image path'))
+        result = exporter.collect_material(addon, object(), material, {}, {}, '.', None,
+            existing={'MaterialBody': {'texture._BaseMap'}}, texture_only=True,
+            mid='MaterialBody')
+        self.assertEqual(result['textureEdits'], [])
+
     def setUp(self):
         def compress(pixels, width, height, mipmaps, source_format, color_space, texconv, flip_y=False):
             target = exporter.texture_compression.target_format(source_format, color_space)

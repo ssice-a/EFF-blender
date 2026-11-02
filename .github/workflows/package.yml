@@ -122,6 +122,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
-          draft: true
+          draft: false
           files: dist/update/${{ steps.source.outputs.archive }}
           body_path: RELEASE_NOTES.md

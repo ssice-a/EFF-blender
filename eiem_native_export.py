@@ -42,6 +42,12 @@ _NATIVE_IMAGE_CACHE_BYTES = 128 * 1024 * 1024
 _FORMAT3_WRITER_LIBRARIES = {}
 
 
+def _is_logical_resource_path(path):
+    return (isinstance(path, str) and '\0' not in path and '\\' not in path and
+            ':' not in path and path.lower().startswith(('assets/', 'packages/')) and
+            all(part not in ('', '.', '..') for part in path.split('/')))
+
+
 class _TypedAuthorWriter:
     def __init__(self):
         self.data = bytearray()
@@ -584,7 +590,7 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
             if not key.startswith('texture.') or key in overrides:
                 continue
             value = str(mat.get('eiem_' + key, '')).strip()
-            if value and not value.replace('\\', '/').lower().startswith('assets/'):
+            if value and not _is_logical_resource_path(value):
                 overrides[key] = addon.resolve_material_texture(mat, key, value, images, bindings)
     needs_texture_template = any(key.startswith('texture.') for key in overrides)
     native = None
