@@ -90,6 +90,24 @@ try:
         obj = mesh_objects[0]
         assert len(obj.data.vertices) == 3 and len(obj.data.polygons) == 1
         assert len(obj.data.uv_layers) == 1
+        source_mesh = format_io.read_mesh(root / "meshes" / "body.mesh")
+        for loop in obj.data.loops:
+            start = loop.vertex_index * 2
+            expected = source_mesh["uvs"][0][start:start + 2]
+            actual = tuple(obj.data.uv_layers["UV0"].data[loop.index].uv)
+            assert actual == tuple(expected), (loop.index, actual, expected)
+        roundtrip = addon.eiem_blender_addon.write_mesh(None, obj, return_snapshot=True)
+        expected_by_vertex = {
+            tuple(source_mesh["vertices"][index * 3:index * 3 + 3]):
+                tuple(source_mesh["uvs"][0][index * 2:index * 2 + 2])
+            for index in range(source_mesh["vertex_count"])
+        }
+        actual_by_vertex = {
+            tuple(roundtrip["vertices"][index * 3:index * 3 + 3]):
+                tuple(roundtrip["uvs"][0][index * 2:index * 2 + 2])
+            for index in range(roundtrip["vertex_count"])
+        }
+        assert actual_by_vertex == expected_by_vertex, (actual_by_vertex, expected_by_vertex)
         assert obj.data.materials and obj.data.materials[0]["eiem_source"] == "assets/test/body.mat"
         image = next(image for image in bpy.data.images if image.get("eiem_author_package") == str(root))
         assert image.colorspace_settings.name == "Non-Color"

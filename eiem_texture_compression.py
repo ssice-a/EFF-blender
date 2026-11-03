@@ -124,8 +124,8 @@ def unpack_dds(data, width, height, mip_count, target):
 
 
 def compress_rgba(pixels, width, height, mipmaps, source_format, color_space,
-                  texconv, flip_y=False):
-    """Compress top-down RGBA pixels to validated BCn blocks using texconv."""
+                  texconv, *, flip_y):
+    """Compress RGBA bytes to native BCn rows; callers must declare input row order."""
     from PIL import Image
 
     if (type(width) is not int or type(height) is not int or width <= 0 or height <= 0

@@ -143,6 +143,16 @@ class NativeExportCoreTests(unittest.TestCase):
         np.testing.assert_allclose(converted[0], [[.1, .2], [.8, .9]])
         np.testing.assert_array_equal(tangents.reshape(2, 4)[:, 3], [1., -1.])
 
+    def test_shipped_bundle_writer_restores_blender_author_uvs_and_tangents(self):
+        mesh = bundled_mesh_module()
+        channels = [[.1, .2, .8, .9], [.3, .4, .7, .6]] + [[]] * 6
+        converted, tangents = mesh.game_texture_coordinates(
+            channels, [1., 0., 0., -1., 0., 1., 0., 1.], 2,
+            coordinate='Blender')
+        np.testing.assert_allclose(converted[0], [[.1, .8], [.8, .1]], atol=3e-8)
+        np.testing.assert_allclose(converted[1], [[.3, .6], [.7, .4]])
+        np.testing.assert_array_equal(tangents.reshape(2, 4)[:, 3], [1., -1.])
+
     def test_typed_author_input_preserves_signed_unity_path_ids(self):
         template = dict(kind='Mesh', path='assets/test.asset', asset='MeshTest',
                         cab='CAB-test', pathId=-123456789012345,

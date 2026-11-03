@@ -61,12 +61,35 @@ class TextureCompressionTests(unittest.TestCase):
         with patch('eiem_texture_compression.subprocess.run', side_effect=fake_texconv):
             for color_space in (1, 0):
                 compress_rgba(bytes((128, 64, 32, 255)) * 4, 2, 2, False,
-                              'RGBA32', color_space, 'texconv.exe')
+                              'RGBA32', color_space, 'texconv.exe', flip_y=False)
 
         self.assertIn('--srgb-in', commands[0])
         self.assertNotIn('--srgb-in', commands[1])
         self.assertEqual(commands[0][commands[0].index('-bc') + 1], 'q')
         self.assertEqual(commands[1][commands[1].index('-bc') + 1], 'q')
+
+    def test_compressor_applies_native_row_order_only_when_requested(self):
+        from PIL import Image
+
+        source_rows = bytes((255, 0, 0, 255, 0, 0, 255, 255))
+        observed = []
+
+        def fake_texconv(command, **_kwargs):
+            source = Path(command[-1])
+            with Image.open(source) as image:
+                observed.append(image.convert('RGBA').tobytes())
+            output = Path(command[command.index('-o') + 1]) / 'source.dds'
+            output.write_bytes(dds_fixture(1, 2, 1, 98, bytes(16)))
+            return SimpleNamespace(returncode=0, stderr='', stdout='')
+
+        with patch('eiem_texture_compression.subprocess.run', side_effect=fake_texconv):
+            compress_rgba(source_rows, 1, 2, False, 'RGBA32', 0,
+                          'texconv.exe', flip_y=True)
+            compress_rgba(source_rows, 1, 2, False, 'RGBA32', 0,
+                          'texconv.exe', flip_y=False)
+
+        flipped = source_rows[4:] + source_rows[:4]
+        self.assertEqual(observed, [flipped, source_rows])
 
     def test_bc5_compression_does_not_use_the_bc7_quick_mode(self):
         commands = []
@@ -79,7 +102,7 @@ class TextureCompressionTests(unittest.TestCase):
 
         with patch('eiem_texture_compression.subprocess.run', side_effect=fake_texconv):
             compress_rgba(bytes((128, 64, 32, 255)) * 4, 2, 2, False,
-                          'BC5', 0, 'texconv.exe')
+                          'BC5', 0, 'texconv.exe', flip_y=False)
 
         self.assertNotIn('-bc', commands[0])
 

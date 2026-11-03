@@ -1,4 +1,13 @@
-# EFF Blender v0.50.2
+# EFF Blender v0.50.3
+
+配套 EFF v2.0.6、AnimeStudio v1.9.1；Windows x64 / Blender 5.2。
+
+- 按坐标约定往返 Mesh UV：游戏原生坐标保持原值，Blender 作者坐标仅在写回时转换一次。
+- DDS 未修改时逐字节保留；PNG 压缩显式声明并应用 Unity 纹理行序。
+- Format 3 包缺少 Skeleton 区段时，仍从 Mesh 骨骼路径恢复顶点组权重，并在导出时保留骨骼完整路径。
+- 增加 Blender 5.2 的来源网格 UV 往返和 Format 3 权重导入测试。
+
+## EFF Blender v0.50.2
 
 配套 EFF v2.0.5、AnimeStudio v1.9.1；Windows x64 / Blender 5.2。
 

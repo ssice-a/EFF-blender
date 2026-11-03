@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 50, 2),
+    "version": (0, 50, 3),
     "blender": (5, 2, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
@@ -1023,6 +1023,47 @@ def bind_mesh_weights(obj, payload, armature, palette):
             groups[bone_index].add([vertex_index], float(weight), "REPLACE")
 
 
+def bind_mesh_weights_from_paths(obj, payload):
+    """Restore editable weights when a Mod has no imported Skeleton resource."""
+    skin = payload.get("skin") or []
+    if not obj or not skin:
+        return
+    paths = payload.get("bone_paths") or []
+    bindposes = payload.get("bindposes") or []
+    if not paths or len(paths) != len(bindposes) or len(set(paths)) != len(paths):
+        raise ValueError(
+            "%s has skin data but no complete, unique bone path palette" % obj.name)
+
+    used_slots = set()
+    for weights, indices in skin:
+        for weight, palette_index in zip(weights, indices):
+            if weight <= 0.0:
+                continue
+            if not 0 <= palette_index < len(paths):
+                raise ValueError("%s skin data references an invalid bone slot" % obj.name)
+            used_slots.add(palette_index)
+
+    groups = {}
+    group_paths = {}
+    for palette_index in sorted(used_slots):
+        path = str(paths[palette_index])
+        name = path.rsplit("/", 1)[-1] or "root"
+        group = obj.vertex_groups.new(name=name)
+        groups[palette_index] = group
+        group_paths[group.name] = path
+
+    for vertex_index, (weights, indices) in enumerate(skin):
+        if vertex_index >= len(obj.data.vertices):
+            raise ValueError("%s skin data has more vertices than its Mesh" % obj.name)
+        for weight, palette_index in zip(weights, indices):
+            if weight > 0.0:
+                groups[palette_index].add(
+                    [vertex_index], float(weight), "REPLACE")
+
+    obj["eiem_vertex_group_bone_paths_json"] = json.dumps(
+        group_paths, separators=(",", ":"))
+
+
 def make_armature(section, payload, collection):
     armature = bpy.data.armatures.new(section)
     obj = bpy.data.objects.new(section, armature)
@@ -1317,6 +1358,8 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
         # not derive from topology.
         obj["eiem_bindposes_json"] = json.dumps(payload["bindposes"], separators=(",", ":"))
         obj["eiem_bone_hashes_json"] = json.dumps(payload["bone_hashes"], separators=(",", ":"))
+        obj["eiem_bone_paths_json"] = json.dumps(
+            payload.get("bone_paths", []), separators=(",", ":"))
         obj["eiem_bone_index_paths_json"] = json.dumps(
             payload.get("bone_index_paths", []), separators=(",", ":"))
         obj["eiem_bone_sources_json"] = json.dumps(
@@ -1325,6 +1368,7 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
             payload.get("bone_source_candidates", []), separators=(",", ":"))
         obj.data["eiem_original_vertex_count"] = int(payload["vertex_count"])
         import_blend_shapes(obj, payload)
+    meshes_with_armature_binding = set()
     for section, values in resources.items():
         if not section.lower().startswith("render") or not values.get("mesh"):
             continue
@@ -1353,6 +1397,8 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
             modifier = obj.modifiers.get("EFF Armature") or obj.modifiers.new("EFF Armature", "ARMATURE")
             modifier.object = skeleton
             bind_mesh_weights(obj, mesh_payloads.get(values["mesh"], {}), skeleton, palette)
+            if mesh_payloads.get(values["mesh"], {}).get("skin"):
+                meshes_with_armature_binding.add(values["mesh"])
         for key, material_section in values.items():
             if key.startswith("material.") and material_section in materials:
                 try:
@@ -1365,6 +1411,9 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
                     pass
         obj["eiem_original_material_sections_json"] = json.dumps(
             original_materials, sort_keys=True, separators=(",", ":"))
+    for section, obj in meshes.items():
+        if section not in meshes_with_armature_binding:
+            bind_mesh_weights_from_paths(obj, mesh_payloads.get(section, {}))
     for section, values in resources.items():
         if not section.lower().startswith("part") or not values.get("mesh"):
             continue
@@ -2281,6 +2330,10 @@ def export_skin_binding(obj, armature, source_vertices, skin_cache=None):
     if missing:
         raise ValueError("原骨骼已不在共享骨架中：" + sorted(missing)[0])
     by_name = context['by_name']
+    imported_group_paths = parse_json_property(
+        obj, "eiem_vertex_group_bone_paths_json", {})
+    if not isinstance(imported_group_paths, dict):
+        imported_group_paths = {}
     paths = list(original)
     # An empty vertex group is not a skinning dependency. In particular, a
     # copied garment can carry names of new physics chains it never uses.
@@ -2289,8 +2342,17 @@ def export_skin_binding(obj, armature, source_vertices, skin_cache=None):
     weighted_vertices = [[(int(g.group), float(g.weight)) for g in vertex.groups
                           if g.weight > 0] for vertex in obj.data.vertices]
     used_groups = {index for influences in weighted_vertices for index, weight in influences}
-    additions = sorted({by_name[group_names[index]] for index in used_groups
-                        if 0 <= index < len(group_names) and group_names[index] in by_name} - original.keys())
+
+    def group_path(index):
+        if not 0 <= index < len(group_names):
+            return None
+        mapped = imported_group_paths.get(group_names[index])
+        if mapped in by_path:
+            return mapped
+        return by_name.get(group_names[index])
+
+    additions = sorted({path for index in used_groups
+                         if (path := group_path(index)) is not None} - original.keys())
     matrices = dict(original)
     if additions:
         def matrix(values):
@@ -2340,13 +2402,19 @@ def export_skin_binding(obj, armature, source_vertices, skin_cache=None):
         paths.extend(additions)
         hashes.extend(zlib.crc32(p.encode("utf-8")) & 0xffffffff for p in additions)
     slot = {by_path[p].name:i for i,p in enumerate(paths)}
+    path_slots = {path: index for index, path in enumerate(paths)}
     # Resolve vertex-group names once. The old path read every Blender RNA
     # vertex-group name twice: once for validation and again while building
     # the exported influences. Large clothing meshes can have hundreds of
     # thousands of vertex/group pairs, so keep the same validation while
     # constructing the final influence list in one pass.
-    group_slots = {index: slot[name] for index, name in enumerate(group_names)
-                   if name in slot}
+    group_slots = {}
+    for index, name in enumerate(group_names):
+        path = group_path(index)
+        if path in path_slots:
+            group_slots[index] = path_slots[path]
+        elif name in slot:
+            group_slots[index] = slot[name]
     skin_by_vertex = []
     reduced = 0
     used = {loop.vertex_index for loop in obj.data.loops}

@@ -12,6 +12,8 @@
 - Blender 从 `EFFSOURCE` 基线读取被选 Mesh、Material 和 Texture 所需的原生模板；不扫描游戏 PFB，也不编译消费者清单。
 - 完整导出在目标目录外生成候选文件，校验全部 Format 3 关系和资源，再事务式发布。失败时保留上一个完整 Mod。
 - DDS 是可直接替换的纹理文件。已有 DDS 原样复制；PNG 按原 Texture2D 的线性/sRGB 语义压缩为 DDS。运行时尺寸、格式和 mip 信息以 DDS 头为准。
+- Mesh 运行时 UV 与切线手性保持游戏原生值。`EFFMESH` 标记为 `Blender` 时，写回只反转 V 和 UV0 切线手性；Unity 坐标快照原样保留。Format 2 迁移只在 CPU 形态键路径需要时展开压缩帧，不翻转运行时 UV。
+- 未改动的源 DDS 逐字节直通。顶部优先的 PNG 像素压缩时转换为 Unity Texture2D 行序；特效编辑器传入的 Blender 底部优先像素不做该转换。
 - Blender 回读使用 Format 3 的 Mesh、Material、Physics、Effect 作者数据及对应资源声明；材质导入只接受 Material `.effres`，并按 `mod.ini` 绑定 DDS。
 - Mesh 快照缓存仅存在于当前 Blender 会话。导出计时分别记录作者数据准备、Format 3 写入校验和发布。
 
