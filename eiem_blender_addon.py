@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 50, 3),
+    "version": (0, 50, 4),
     "blender": (5, 2, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
@@ -468,39 +468,36 @@ def load_material(root, section, values, textures=None):
 
 
 def import_material_file(path, obj):
-    """Import one Format 3 Material resource into the active Mesh slot."""
+    """Import one EFFSOURCE .mat or Format 3 Material into the active slot."""
     path = Path(path).resolve()
     if obj is None or obj.type != "MESH":
         raise ValueError('请先选择要指定材质的网格')
     root = next((parent for parent in path.parents if (parent / "mod.ini").is_file()), None)
     if root is None:
-        raise ValueError("所选资源不属于 Format 3 Mod")
+        raise ValueError("所选材质不属于 EFFSOURCE 解包包或 Format 3 Mod；请保留配套 mod.ini。")
     parser = parse_ini(root)
-    if parser.get("Mod", "format", fallback="") != "3":
-        raise ValueError("Blender 只读取 Format 3 Mod；请先使用 Mod Manager 迁移旧格式。")
+    kind = format_io.package_kind(root, parser)
+    if kind == "format2":
+        raise ValueError("这是旧 Format 2 运行时 Mod；请在 Mod Manager 的修复页迁移后再导入。")
+    if kind == "unknown":
+        raise ValueError("材质目录既不是 AnimeStudio EFFSOURCE 解包包，也不是 Format 3 运行时 Mod。")
     resources = {section: dict(parser.items(section)) for section in parser.sections()}
     matches = [(section, values) for section, values in resources.items()
                if section.lower().startswith("material") and values.get("path") and
                safe_path(root, values["path"]) == path]
     if len(matches) != 1:
-        raise ValueError("所选 .effres 必须由 mod.ini 中唯一一个 Material 声明")
+        raise ValueError("所选材质必须由 mod.ini 中唯一一个 Material 声明")
     section, declaration = matches[0]
-    values = format_io.read_format3_material_resource(path, section, declaration["path"])
-    values.pop("_source_asset", None)
-    values.pop("_author_hash", None)
-    values["target.path"] = declaration.get("source.path", values["source"])
-    values["target.asset"] = declaration.get("source.asset", values.get("name", section))
+    values = format_io.read_package_material(root, section, declaration, kind)
     textures = {}
     for key, texture_id in values.items():
         if not key.startswith("texture."):
             continue
         texture = resources.get(texture_id)
-        if not texture or not texture.get("dds"):
-            raise ValueError("Format 3 Material references an undeclared DDS Texture: " + texture_id)
-        dds = safe_path(root, texture["dds"])
-        if dds.suffix.lower() != ".dds" or not dds.is_file():
-            raise ValueError("Format 3 Texture DDS is missing or invalid: " + str(dds))
-        textures[texture_id] = (dds, texture)
+        if not texture or not texture_id.lower().startswith("texture"):
+            raise ValueError("Material references an undeclared Texture: " + texture_id)
+        textures[texture_id] = (
+            format_io.package_texture_path(root, texture_id, texture, kind), texture)
     # Allocation happens only after reference validation. Failure leaves the
     # selected slot and every old Material/Image data block unchanged.
     created_images, material = [], None
@@ -515,8 +512,15 @@ def import_material_file(path, obj):
             image_section = unique_texture_section(disk, used)
             image["eiem_section"] = image_section
             used[image_section] = image
+            image["eiem_source_section"] = texture_id
+            image["eiem_author_package"] = str(root)
+            image["eiem_relative_path"] = texture_values.get(
+                "path" if kind == "source" else "dds", "")
+            image["eiem_native_resource_path"] = texture_values.get("path", "")
             image["eiem_source"] = texture_values.get("source", "")
             image["eiem_name"] = texture_values.get("name", disk.stem)
+            image["eiem_target_path"] = texture_values.get("target.path", "")
+            image["eiem_target_asset"] = texture_values.get("target.asset", "")
             for key, default in (("linear", "false"), ("mipmaps", "true"), ("filter", "1"),
                                  ("wrap", "0"), ("aniso", "1"), ("mip_bias", "0")):
                 image["eiem_" + key] = texture_values.get(key, default)
@@ -1249,12 +1253,8 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
         # Do not let Blender's global filepath cache alias two imported
         # Mod packages. Their section/source metadata is package-local,
         # even when both happen to point at the same DDS.
-        image_path = values["path"] if is_source_package else values.get("dds", "")
-        if not image_path:
-            raise ValueError("Texture %s has no image file" % section)
-        image_file = safe_path(root, image_path)
-        if not image_file.is_file():
-            raise ValueError("Texture image is missing: " + str(image_file))
+        image_path = values.get("path" if is_source_package else "dds", "")
+        image_file = format_io.package_texture_path(root, section, values, kind)
         image = bpy.data.images.load(str(image_file), check_existing=False)
         if image.size[0] <= 0 or image.size[1] <= 0:
             bpy.data.images.remove(image)
@@ -1284,25 +1284,10 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
     materials = {}
     for section, values in resources.items():
         if section.lower().startswith("material") and values.get("path"):
-            material_path = safe_path(root, values["path"])
-            if is_source_package:
-                material_values = format_io.read_effmat_source(material_path.read_bytes())
-                material_values.pop("format", None)
-                material_values.pop("version", None)
-                material_values["target.path"] = material_values.get("source", "")
-                material_values["target.asset"] = material_values.get("name", section)
-                for key, texture_id in material_values.items():
-                    if key.startswith("texture.") and texture_id not in textures:
-                        raise ValueError("Source Material references a missing Texture: " + texture_id)
-            else:
-                material_values = format_io.read_format3_material_resource(
-                    material_path, section, values["path"])
-                material_values.pop("_source_asset", None)
-                material_values.pop("_author_hash", None)
-                material_values["target.path"] = values.get(
-                    "source.path", material_values["source"])
-                material_values["target.asset"] = values.get(
-                    "source.asset", material_values.get("name", section))
+            material_values = format_io.read_package_material(root, section, values, kind)
+            for key, texture_id in material_values.items():
+                if key.startswith("texture.") and texture_id not in textures:
+                    raise ValueError("Material references a missing Texture: " + texture_id)
             material = load_material(root, section, material_values, textures)
             material["eiem_material_file"] = values["path"]
             materials[section] = material
@@ -3215,9 +3200,9 @@ def draw_eiem_rna_property(layout, owner, key, label, factor=0.24):
 
 class EFF_OT_import_material(ImportHelper, bpy.types.Operator):
     bl_idname = "eiem.import_material"
-    bl_label = '导入 Format 3 材质'
+    bl_label = '导入 EFF 材质'
     bl_options = {"REGISTER", "UNDO"}
-    filter_glob: StringProperty(default="*.effres", options={"HIDDEN"})
+    filter_glob: StringProperty(default="*.mat;*.effres", options={"HIDDEN"})
 
     def execute(self, context):
         try:

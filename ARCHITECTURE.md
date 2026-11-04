@@ -4,7 +4,7 @@
 
 - Mod Manager 独占旧 Mod 到 Format 3 的迁移。迁移完成后，Mod 目录只保留 Format 3。
 - 游戏 DLL 只解析和加载 Format 3；不探测、转换或兼容旧 Mod。
-- Blender 只导入和导出 Format 3。旧 Mod 必须先由 Mod Manager 迁移。
+- Blender 导入 EFFSOURCE 解包来源和 Format 3 Mod，只导出 Format 3。旧 Mod 必须先由 Mod Manager 迁移；EFFSOURCE 不是旧 Mod。
 - Format 3 的 `mod.ini` 是唯一资源关系与文件路径清单；资源文件和 DDS 路径可由作者直接编辑，不依赖额外索引。
 
 ## 作者工作流
@@ -13,8 +13,9 @@
 - 完整导出在目标目录外生成候选文件，校验全部 Format 3 关系和资源，再事务式发布。失败时保留上一个完整 Mod。
 - DDS 是可直接替换的纹理文件。已有 DDS 原样复制；PNG 按原 Texture2D 的线性/sRGB 语义压缩为 DDS。运行时尺寸、格式和 mip 信息以 DDS 头为准。
 - Mesh 运行时 UV 与切线手性保持游戏原生值。`EFFMESH` 标记为 `Blender` 时，写回只反转 V 和 UV0 切线手性；Unity 坐标快照原样保留。Format 2 迁移只在 CPU 形态键路径需要时展开压缩帧，不翻转运行时 UV。
-- 未改动的源 DDS 逐字节直通。顶部优先的 PNG 像素压缩时转换为 Unity Texture2D 行序；特效编辑器传入的 Blender 底部优先像素不做该转换。
-- Blender 回读使用 Format 3 的 Mesh、Material、Physics、Effect 作者数据及对应资源声明；材质导入只接受 Material `.effres`，并按 `mod.ini` 绑定 DDS。
+- 未改动的源 DDS 逐字节直通。普通 PNG 压缩为游戏 DDS 时垂直翻转 Blender 像素行；特效编辑器传入的像素遵循其独立行序约定。
+- Blender 回读使用 Format 3 的 Mesh、Material、Physics、Effect 作者数据及对应资源声明。整包和单材质导入共用包类型适配：EFFSOURCE `.mat` 读取完整 EFFMAT 与 Texture `path` 图片；Format 3 Material `.effres` 读取稀疏编辑与 Texture `dds`。两者保留配套 `mod.ini`，不靠改后缀转换格式；单材质入口只分配该材质引用的图片。
+- 解包材质的完整值作为未修改基线；Mod 材质的稀疏编辑必须继续作为覆盖值导出。Mod 不包含原生模板，回读后再次导出使用选定的 EFFSOURCE 基线解析原 Material/Texture 结构，不能把 Mod 目录当作解包来源。
 - Mesh 快照缓存仅存在于当前 Blender 会话。导出计时分别记录作者数据准备、Format 3 写入校验和发布。
 
 ## 写入边界

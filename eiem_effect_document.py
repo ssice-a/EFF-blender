@@ -82,7 +82,10 @@ def load_source(directory):
     try:
         from .nativepack.author_source import source_read_lock
     except ImportError:
-        from nativepack.author_source import source_read_lock
+        try:
+            from tools.nativepack.author_source import source_read_lock
+        except ImportError:
+            from nativepack.author_source import source_read_lock
     directory = str(Path(directory).resolve())
     with source_read_lock(directory):
         raw = safe_path(directory, 'effect.json').read_bytes()

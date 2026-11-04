@@ -864,16 +864,18 @@ class NativeExportCoreTests(unittest.TestCase):
 
     def test_texture_compression_cache_key_tracks_pixels_and_settings(self):
         base = exporter._texture_compression_cache_key(
-            'A' * 64, 256, 128, True, 'BC7', 1, 'texconv.exe')
+            'A' * 64, 256, 128, True, 'BC7', 1, 'texconv.exe', flip_y=False)
         variants = (
             exporter._texture_compression_cache_key(
-                'B' * 64, 256, 128, True, 'BC7', 1, 'texconv.exe'),
+                'B' * 64, 256, 128, True, 'BC7', 1, 'texconv.exe', flip_y=False),
             exporter._texture_compression_cache_key(
-                'A' * 64, 256, 128, False, 'BC7', 1, 'texconv.exe'),
+                'A' * 64, 256, 128, False, 'BC7', 1, 'texconv.exe', flip_y=False),
             exporter._texture_compression_cache_key(
-                'A' * 64, 256, 128, True, 'BC7', 0, 'texconv.exe'),
+                'A' * 64, 256, 128, True, 'BC7', 0, 'texconv.exe', flip_y=False),
             exporter._texture_compression_cache_key(
-                'A' * 64, 256, 128, True, 'BC5', 1, 'texconv.exe'),
+                'A' * 64, 256, 128, True, 'BC5', 1, 'texconv.exe', flip_y=False),
+            exporter._texture_compression_cache_key(
+                'A' * 64, 256, 128, True, 'BC7', 1, 'texconv.exe', flip_y=True),
         )
         self.assertTrue(all(key != base for key in variants))
 
@@ -955,6 +957,23 @@ class NativeExportCoreTests(unittest.TestCase):
         self.assertIs(exporter.material_source(main, foreign, cache), resolved)
         local['eiem_author_package'] = str(main.package)
         self.assertIs(exporter.material_source(main, local, cache), main)
+
+    def test_mod_material_uses_selected_baseline_instead_of_mod_as_native_source(self):
+        module = exporter.pack_modules()[0]['author_source']
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = root / 'source-package'
+            (baseline / 'source').mkdir(parents=True)
+            (baseline / 'source/manifest.json').write_text(json.dumps(dict(
+                format='EFFSOURCE', version=1, serializedFiles=[], resources=[])))
+            mod = root / 'runtime-mod'
+            mod.mkdir()
+            (mod / 'mod.ini').write_text('[Mod]\nformat=3\n')
+            primary = module.AuthorSource(baseline, None)
+            material = Material('ModMaterial', dict(eiem_author_package=str(mod)))
+            cache = {}
+            self.assertIs(exporter.material_source(primary, material, cache), primary)
+            self.assertEqual(cache, {})
 
     def test_shared_texture_conversion_reuses_pixels_and_preserves_conflicts(self):
         from PIL import Image

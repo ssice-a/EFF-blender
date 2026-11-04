@@ -333,12 +333,17 @@ def baseline_for(objects, configured, physics_objects=()):
 
 
 def material_source(primary, material, cache):
-    """A material imported from another package retains that package's schema."""
+    """Source materials retain their schema; Mod edits use the chosen baseline."""
     owner = str(material.get('eiem_author_package', '')).strip()
     if not owner:
         return primary
     package = Path(owner).resolve()
     if package == primary.package:
+        return primary
+    # Runtime Mods carry sparse edits and DDS, not native source templates.
+    # Keep their author-package identity for bindings, but resolve the original
+    # Material/Texture schemas against the export's EFFSOURCE baseline.
+    if (package / 'mod.ini').is_file() and format_io.package_kind(package) == 'format3':
         return primary
     if package not in cache:
         cache[package] = type(primary)(package, primary.core)
@@ -606,11 +611,11 @@ def _texture_compressor_identity(texconv):
 
 
 def _texture_compression_cache_key(source_pixels_hash, width, height, mipmaps,
-                                   source_format, color_space, texconv):
+                                   source_format, color_space, texconv, *, flip_y):
     identity = dict(
-        version=1, sourcePixels=source_pixels_hash, width=width, height=height,
+        version=2, sourcePixels=source_pixels_hash, width=width, height=height,
         mipmaps=bool(mipmaps), sourceFormat=str(source_format),
-        colorSpace=int(color_space), flipY=True,
+        colorSpace=int(color_space), flipY=bool(flip_y),
         compressor=_texture_compressor_identity(texconv))
     encoded = json.dumps(identity, sort_keys=True, separators=(',', ':')).encode('utf-8')
     return hashlib.sha256(encoded).hexdigest()
@@ -699,15 +704,18 @@ def _compress_texture_blocks(base_pixels, width, height, mipmaps,
     expected_size = texture_compression._mip_extent(
         width, height, mip_count, target['block_bytes'])
     pixels_hash = source_pixels_hash or hashlib.sha256(base_pixels).hexdigest().upper()
+    # The game's DDS row orientation is vertically flipped relative to Blender pixels.
+    flip_y = True
     key = _texture_compression_cache_key(
-        pixels_hash, width, height, mipmaps, source_format, color_space, texconv)
+        pixels_hash, width, height, mipmaps, source_format, color_space, texconv,
+        flip_y=flip_y)
     cached = _read_texture_compression_cache(key, expected_size)
     if cached is not None:
         return dict(pixels=cached, format=target['name'], formatId=target['unity'],
                     width=width, height=height, mipCount=mip_count)
     converted = texture_compression.compress_rgba(
         base_pixels, width, height, mipmaps, source_format, color_space,
-        texconv, flip_y=True)
+        texconv, flip_y=flip_y)
     if len(converted.get('pixels', b'')) == expected_size:
         _write_texture_compression_cache(key, converted['pixels'])
     return converted

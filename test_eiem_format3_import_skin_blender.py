@@ -30,16 +30,19 @@ before = {
 
 try:
     root = mod_root.resolve()
+    values = addon.eiem_blender_addon.parse_ini(root)
+    expected_sections = {section for section in values.sections()
+                         if section.lower().startswith('mesh') and values.get(section, 'path', fallback='')}
     imported = addon.eiem_blender_addon.import_package(
         root, clean=False, include_physics=False)
     objects = [obj for obj in set(bpy.data.objects) - before['objects']
                if obj.type == 'MESH' and
                obj.get('eiem_author_package') == str(root)]
-    assert imported == len(objects) == 19, (imported, len(objects))
+    assert expected_sections and imported == len(objects) == len(expected_sections), (imported, len(objects))
+    assert {obj.data.get('eiem_section', '') for obj in objects} == expected_sections
 
     for obj in objects:
         section = obj.data.get('eiem_section', '')
-        values = addon.eiem_blender_addon.parse_ini(root)
         mesh_path = values[section]['path']
         payload = addon.eiem_blender_addon.format_io.read_format3_mesh_resource(
             root / mesh_path)

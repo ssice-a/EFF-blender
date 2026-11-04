@@ -469,6 +469,46 @@ def read_format3_material_resource(path, expected_id=None, expected_file=None):
     return values
 
 
+def read_package_material(root, section, declaration, kind):
+    """Adapt source snapshots and Mod deltas to the same authoring values.
+
+    Package identity selects the decoder; a source .mat is not an old Mod.
+    Keep Mod deltas sparse so later export cannot mistake edits for defaults.
+    """
+    path = safe_path(root, declaration["path"])
+    if kind == "source":
+        values = read_effmat_source(path.read_bytes())
+        values.pop("format", None)
+        values.pop("version", None)
+        values["target.path"] = values["source"]
+        values["target.asset"] = values.get("name", section)
+    elif kind == "format3":
+        values = read_format3_material_resource(path, section, declaration["path"])
+        source_asset = values.pop("_source_asset")
+        values.pop("_author_hash", None)
+        values["target.path"] = declaration.get("source.path", values["source"])
+        values["target.asset"] = declaration.get("source.asset", source_asset)
+    else:
+        raise ValueError("Material input is neither EFFSOURCE nor a Format 3 Mod")
+    return values
+
+
+def package_texture_path(root, section, declaration, kind):
+    """Resolve author images from EFFSOURCE and explicit DDS from runtime Mods."""
+    if kind not in ("source", "format3"):
+        raise ValueError("Texture input is neither EFFSOURCE nor a Format 3 Mod")
+    field = "path" if kind == "source" else "dds"
+    relative = declaration.get(field, "")
+    if not relative:
+        raise ValueError("Texture %s has no %s image file" % (section, field))
+    path = safe_path(root, relative)
+    if kind == "format3" and path.suffix.lower() != ".dds":
+        raise ValueError("Format 3 Texture DDS is invalid: " + str(path))
+    if not path.is_file():
+        raise ValueError("Texture image is missing: " + str(path))
+    return path
+
+
 def encode_format3_physics_snapshot(document, skeleton):
     """Bundle the editable Physics document with the skeleton it references."""
     document, skeleton = bytes(document), bytes(skeleton)
