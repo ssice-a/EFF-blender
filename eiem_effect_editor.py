@@ -247,21 +247,25 @@ def refresh_fields(root):
     for obj in objects(root):
         ids=json.loads(obj.get('eff_effect_components','[]'))
         if ids:populate(obj,edit,ids)
-def import_source(context,source):
-    return import_workspace(context, document.load_source(source))
+def import_source(context,source,preserve_source=False):
+    return import_workspace(context, document.load_source(source),preserve_source=preserve_source)
 
-def import_workspace(context,state):
+def import_workspace(context,state,preserve_source=False):
     edit=document.Editor(state)
     # The visible particle module is authoritative for a newly authored effect.
     # The original source and other components are preserved. Advanced users
     # may explicitly re-enable this one known automatic scaling rule.
-    edit.use_particle_emission()
+    if not preserve_source:edit.use_particle_emission()
     collection=bpy.data.collections.new(Path(state['catalog']['prefab']).stem);context.scene.collection.children.link(collection)
     nodes={}
     for node in state['catalog']['hierarchy']:
         obj=bpy.data.objects.new(node['name'] or 'unknown',None);obj.empty_display_type='PLAIN_AXES';obj.empty_display_size=.15
         collection.objects.link(obj);obj['eff_effect_node']=node['identity'];nodes[node['identity']]=obj
     root=nodes[state['catalog']['root']];root['eff_effect_document']=document.dumps(state);root['eff_effect_id']=uuid.uuid4().hex
+    if preserve_source:
+        root.eff_effect.source_animation=True
+        clips=preview.playback.clip_items(root,edit)
+        if len(clips)==2:root.eff_effect.preview_clip=clips[1][0]
     compiler=Path(__file__).resolve().parent.parent/'AnimeStudio/AnimeStudio.GUI/bin/Debug/net9.0-windows/AnimeStudio.GUI.exe'
     if compiler.is_file():root.eff_effect.compiler=str(compiler)
     root['eff_effect_collection']=collection.name
@@ -312,7 +316,15 @@ class EFF_PG_effect_key(bpy.types.PropertyGroup):
 class EFF_PG_effect_object(bpy.types.PropertyGroup):
     enabled:BoolProperty(name='随 Mod 导出',default=True)
     preview:BoolProperty(name='离线粒子预览',default=True)
+    preview_particles:BoolProperty(name='预览粒子',default=True,description='关闭后可单独研究静态水网格和 VAT，减少预览开销')
+    trail_preview:BoolProperty(name='预览 Trail / Ribbon',default=True,description='有限时间采样重建拖尾，支持倒退；自定义脚本带状网格不在此范围')
     show_shape:BoolProperty(name='显示发射范围',default=True)
+    source_animation:BoolProperty(name='播放来源动画',default=False,
+        description='只采样原始 AnimationClip，Transform 和材质动画只作用于预览副本，不写回作者参数')
+    preview_clip:EnumProperty(name='来源片段',items=lambda self,context:preview.playback.clip_items(self.id_data,editor(self.id_data)) if self.id_data.get('eff_effect_document') else [('NONE','无来源片段','')])
+    clip_loop:BoolProperty(name='循环所选片段',default=False,description='研究时手动循环；不表示原 Animator 会这样切换')
+    vat_preview:BoolProperty(name='Softbody VAT 网格变形',default=True,
+        description='从原生浮点数据纹理和 UV1 查找坐标重放；不把 PNG 当作顶点数据')
     all_lods:BoolProperty(name='覆盖全部 LOD',default=True,
         description='跟随挂载部件的全部模型 LOD；导出的特效不因原生距离或质量 LOD 降级关闭。关闭则保留来源特效的降级设置')
     owner:PointerProperty(name='挂载目标 Mesh',type=bpy.types.Object,poll=lambda self,obj:obj.type=='MESH' and not obj.get('eff_preview'))
@@ -328,6 +340,7 @@ class EFF_PG_effect_object(bpy.types.PropertyGroup):
 
 class EFF_PG_effect_texture(bpy.types.PropertyGroup):
     source_name:StringProperty(name='来源贴图')
+    source_metadata:StringProperty(options={'HIDDEN'})
     image:PointerProperty(name='替换图片',type=bpy.types.Image,description='留空保留来源；指定图片随特效打包，支持绘制后和打包图片')
     linear:BoolProperty(name='线性数据',default=False,description='遮罩/法线等数据图开启；普通颜色图关闭')
     mipmaps:BoolProperty(name='生成 Mipmap',default=True)
@@ -336,10 +349,27 @@ class EFF_PG_effect_texture(bpy.types.PropertyGroup):
 class EFF_OT_effect_import(bpy.types.Operator,ImportHelper):
     bl_idname='eiem.effect_import';bl_label='导入 EFF 特效为空物体';bl_options={'UNDO'}
     filter_glob:StringProperty(default='effect.json',options={'HIDDEN'})
+    preserve_source:BoolProperty(name='研究原版：保留来源控制',default=False,
+        description='保留自动数量组件并启用来源动画预览；不自动推测技能状态机或脚本时序')
     def execute(self,context):
         try:
-            path=Path(self.filepath);import_source(context,path if path.is_dir() else path.parent);return {'FINISHED'}
+            path=Path(self.filepath);import_source(context,path if path.is_dir() else path.parent,preserve_source=self.preserve_source);return {'FINISHED'}
         except Exception as e:self.report({'ERROR'},str(e));return {'CANCELLED'}
+
+
+class EFF_OT_effect_research_report(bpy.types.Operator):
+    bl_idname='eiem.effect_research_report';bl_label='生成原始资源 / 动画报告'
+    bl_description='把各材质参数、贴图逻辑路径、原生流位置和 AnimationClip 绑定写入 Blender 文本块'
+    def execute(self,context):
+        try:
+            root=active(context);document.require(root,'请选择特效根或发射器')
+            report=preview.playback.research_report(root,synchronize(root))
+            name='EFF 来源报告 · '+root.name
+            text=bpy.data.texts.get(name) or bpy.data.texts.new(name)
+            text.clear();text.write(json.dumps(report,ensure_ascii=False,indent=2))
+            self.report({'INFO'},'报告已写入文本编辑器：'+name)
+            return {'FINISHED'}
+        except Exception as error:self.report({'ERROR'},str(error));return {'CANCELLED'}
 def module_items(self,context):
     root=active(context)
     if not root:return []
@@ -958,10 +988,17 @@ class EFF_PT_effect_object(bpy.types.Panel):
                 cfg=root.eff_effect
                 row=layout.row(align=True);row.prop(cfg,'preview');row.prop(cfg,'show_shape')
                 if root.get('预览错误'):layout.label(text=str(root['预览错误'])[:150],icon='ERROR')
-                for key,title in (('mount','挂载与显隐'),('export','构建工具'),('diagnostics','预览支持与来源信息')):
+                for key,title in (('timeline','原始动画 / VAT'),('mount','挂载与显隐'),('export','构建工具'),('diagnostics','预览支持与来源信息')):
                     header,body=layout.panel('eff_'+key,default_closed=True);header.label(text=title)
                     if not body:continue
-                    if key=='mount':
+                    if key=='timeline':
+                        body.prop(cfg,'source_animation');body.prop(cfg,'preview_clip');body.prop(cfg,'clip_loop');body.prop(cfg,'vat_preview');body.prop(cfg,'preview_particles');body.prop(cfg,'trail_preview')
+                        clip=preview.playback.session(edit).clips(edit).clips.get(cfg.preview_clip)
+                        if clip:body.label(text='%.3f s · %g fps · %d 标量轨道'%(clip.stop-clip.start,clip.rate,clip.total))
+                        body.operator('eiem.effect_research_report',icon='TEXT')
+                        effect_ui.hint(body,'使用 Blender 时间轴；片段覆盖只作用于预览，不会写回作者参数。')
+                        effect_ui.hint(body,'独立片段不代表完整技能；Animator 状态切换、游戏脚本和原像素 Shader 仍需核对。')
+                    elif key=='mount':
                         body.prop(cfg,'enabled');body.prop(cfg,'all_lods');body.prop(cfg,'owner')
                         if cfg.all_lods:effect_ui.hint(body,'导出时解除来源特效的距离/画质降级；同骨架的模型 LOD 共用一次播放。')
                         rig=preview.mount_rig(cfg.owner)
@@ -1028,7 +1065,7 @@ def upgrade_loaded(*_):
         if root.get('eff_effect_ui_version',0)>=2:continue
         # Migrate the old raw-only UI in memory, retaining pending native edits.
         edit=synchronize(root);store(root,edit);refresh_fields(root);root['eff_effect_ui_version']=2
-CLASSES=(EFF_PG_effect_choice,EFF_PG_effect_angle,EFF_PG_effect_key,EFF_PG_effect_object,EFF_PG_effect_texture,EFF_OT_effect_import,EFF_OT_effect_block,EFF_OT_effect_array,EFF_OT_effect_use_particle_emission,EFF_OT_effect_continuous,EFF_OT_effect_emitter_add,EFF_OT_effect_emitter_remove,EFF_OT_effect_pointer,EFF_OT_effect_resource,EFF_OT_effect_select,EFF_OT_effect_key,EFF_OT_effect_texture_open,EFF_OT_effect_mesh_edit,EFF_OT_effect_assets_expand,EFF_OT_effect_export,EFF_OT_effect_build,EFF_OT_effect_preview,EFF_PT_effect_object)
+CLASSES=(EFF_PG_effect_choice,EFF_PG_effect_angle,EFF_PG_effect_key,EFF_PG_effect_object,EFF_PG_effect_texture,EFF_OT_effect_import,EFF_OT_effect_research_report,EFF_OT_effect_block,EFF_OT_effect_array,EFF_OT_effect_use_particle_emission,EFF_OT_effect_continuous,EFF_OT_effect_emitter_add,EFF_OT_effect_emitter_remove,EFF_OT_effect_pointer,EFF_OT_effect_resource,EFF_OT_effect_select,EFF_OT_effect_key,EFF_OT_effect_texture_open,EFF_OT_effect_mesh_edit,EFF_OT_effect_assets_expand,EFF_OT_effect_export,EFF_OT_effect_build,EFF_OT_effect_preview,EFF_PT_effect_object)
 def menu_import(self,context):self.layout.operator('eiem.effect_import',text='EFF 特效（空物体）')
 def menu_add(self,context):self.layout.operator('eiem.effect_import',text='EFF 特效来源',icon='EMPTY_AXIS')
 def register():

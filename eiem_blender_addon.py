@@ -4235,7 +4235,8 @@ def draw_update_status(layout):
     if prefs is not None:
         layout.prop(prefs, 'update_channel', text='更新来源')
     row = layout.row(align=True)
-    row.enabled = _update_state["status"] not in ('checking', 'downloading', 'prepared')
+    row.enabled = (_update_state["status"] not in ('checking', 'downloading', 'prepared') and
+                   _shared_tools_check_state['status'] != 'checking')
     row.operator("eiem.check_update", text="检查更新", icon="FILE_REFRESH")
     status = _update_state["status"]
     if status == "checking":
@@ -4258,6 +4259,42 @@ def draw_update_status(layout):
     elif status == 'prepared':
         layout.label(text='更新已校验，保存工程后关闭全部 Blender')
         layout.label(text='关闭后自动安装并备份，下次启动生效')
+    draw_shared_tools_update_status(layout)
+
+
+def draw_shared_tools_update_status(layout, include_path=False):
+    state = _shared_tools_check_state
+    status = state['status']
+    if status == 'checking':
+        layout.label(text='正在检查共享工具更新…', icon='TIME')
+    elif status == 'latest':
+        label = '共享工具已是最新'
+        if state.get('release'):
+            label += '：' + state['release']
+        layout.label(text=label, icon='CHECKMARK')
+    elif status == 'available':
+        label = '发现新的共享工具'
+        if state.get('release'):
+            label += '：' + state['release']
+        layout.label(text=label, icon='IMPORT')
+        layout.operator(EFF_OT_prepare_shared_tools.bl_idname,
+                        text='下载并更新共享工具', icon='IMPORT')
+    elif status == 'unconfigured':
+        layout.label(text='尚未配置共享工具存储目录', icon='INFO')
+        layout.operator(EFF_OT_choose_resource_root.bl_idname,
+                        text='选择工具存储目录', icon='FILEBROWSER')
+    elif status == 'unknown':
+        layout.label(text='无法确认共享工具是否最新', icon='ERROR')
+        layout.operator(EFF_OT_prepare_shared_tools.bl_idname,
+                        text='重新检查并准备工具', icon='FILE_REFRESH')
+    elif status == 'error':
+        layout.label(text='共享工具检查失败：' + state.get('message', ''), icon='ERROR')
+    elif status == 'ready':
+        layout.label(text='共享工具已准备：' + state.get('release', ''), icon='CHECKMARK')
+    elif status == 'idle':
+        layout.label(text='共享工具更新状态尚未检查', icon='INFO')
+    if include_path and state.get('path'):
+        layout.label(text=state['path'], icon='FILE_FOLDER')
 
 
 class EFF_PT_updates(bpy.types.Panel):
@@ -4287,18 +4324,18 @@ class EFF_PT_shared_tools(bpy.types.Panel):
         layout.label(text=str(root) if root else '尚未选择存储目录', icon='FILE_FOLDER')
         row = layout.row(align=True)
         row.operator(EFF_OT_choose_resource_root.bl_idname, icon='FILEBROWSER')
-        busy = bool(_shared_tools_worker and _shared_tools_worker.is_alive())
+        busy = bool((_shared_tools_worker and _shared_tools_worker.is_alive()) or
+                    (_shared_tools_check_worker and _shared_tools_check_worker.is_alive()))
         prepare = row.operator(EFF_OT_prepare_shared_tools.bl_idname,
                                text='准备工具', icon='IMPORT')
         row.enabled = not busy
-        if installed:
-            layout.label(text='工具已就绪：' + str(installed), icon='CHECKMARK')
-        elif _shared_tools_state['status'] == 'downloading':
+        if _shared_tools_state['status'] == 'downloading':
             layout.label(text='正在下载并校验共享工具…', icon='TIME')
         elif _shared_tools_state['status'] == 'error':
             layout.label(text=_shared_tools_state['message'], icon='ERROR')
-        elif root:
+        elif root and not installed:
             layout.label(text='此目录尚无可用工具，点击“准备工具”下载。')
+        draw_shared_tools_update_status(layout, include_path=True)
 
 
 def operator_lod_levels(operator, meshes):
@@ -4475,6 +4512,8 @@ _update_state = {"status": "idle", "tag": "", "url": "", "message": ""}
 _update_worker = None
 _shared_tools_state = {'status': 'idle', 'message': ''}
 _shared_tools_worker = None
+_shared_tools_check_state = {'status': 'idle', 'message': ''}
+_shared_tools_check_worker = None
 
 
 def _addon_preferences(context):
@@ -4515,20 +4554,24 @@ class EFF_OT_prepare_shared_tools(bpy.types.Operator):
 
     def execute(self, context):
         global _shared_tools_worker
-        if _shared_tools_worker and _shared_tools_worker.is_alive():
+        if ((_shared_tools_worker and _shared_tools_worker.is_alive()) or
+                (_shared_tools_check_worker and _shared_tools_check_worker.is_alive())):
             return {'CANCELLED'}
         if shared_resources.resource_root() is None:
             self.report({'ERROR'}, '请先选择工具存储目录')
             return {'CANCELLED'}
 
         _shared_tools_state.update(status='downloading', message='')
+        _shared_tools_check_state.update(status='checking', message='', release='', path='')
 
         def work():
             try:
                 path = shared_resources.ensure_native_tools()
                 _shared_tools_state.update(status='ready', message=str(path))
+                _shared_tools_check_state.update(shared_resources.check_native_tools())
             except Exception as error:
                 _shared_tools_state.update(status='error', message=str(error)[:180])
+                _shared_tools_check_state.update(status='error', message=str(error)[:160])
 
         _shared_tools_worker = threading.Thread(
             target=work, name='EFF shared tools download', daemon=True)
@@ -4571,8 +4614,10 @@ class EFF_OT_check_update(bpy.types.Operator):
     force: BoolProperty(default=False)
 
     def execute(self, context):
-        global _update_worker
-        if _update_worker and _update_worker.is_alive():
+        global _update_worker, _shared_tools_check_worker
+        if ((_update_worker and _update_worker.is_alive()) or
+                (_shared_tools_check_worker and _shared_tools_check_worker.is_alive()) or
+                (_shared_tools_worker and _shared_tools_worker.is_alive())):
             return {'CANCELLED'}
         prefs = _addon_preferences(context)
         ignored = prefs.ignored_release_tag if prefs else ""
@@ -4580,6 +4625,7 @@ class EFF_OT_check_update(bpy.types.Operator):
         channel = prefs.update_channel if prefs else 'MAIN'
         directory = Path(__file__).resolve().parent
         _update_state.update(status="checking", tag="", url="", message="", label='', feed=None, channel=channel)
+        _shared_tools_check_state.update(status='checking', message='', release='', path='')
 
         def work():
             try:
@@ -4591,11 +4637,22 @@ class EFF_OT_check_update(bpy.types.Operator):
             except Exception as error:
                 _update_state.update(status="error", message=str(error)[:120])
 
+        def check_tools():
+            try:
+                result = shared_resources.check_native_tools()
+                _shared_tools_check_state.update(result)
+            except Exception as error:
+                _shared_tools_check_state.update(status='error', message=str(error)[:160])
+
         _update_worker = threading.Thread(target=work, name="EFF release check", daemon=True)
         _update_worker.start()
+        _shared_tools_check_worker = threading.Thread(
+            target=check_tools, name="EFF shared-tools update check", daemon=True)
+        _shared_tools_check_worker.start()
 
         def redraw_when_done():
-            if _update_worker and _update_worker.is_alive():
+            if ((_update_worker and _update_worker.is_alive()) or
+                    (_shared_tools_check_worker and _shared_tools_check_worker.is_alive())):
                 return 0.1
             for window in bpy.context.window_manager.windows:
                 for area in window.screen.areas:

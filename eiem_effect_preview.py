@@ -9,6 +9,7 @@ from mathutils import Matrix,Quaternion,Vector
 if __package__:
     from . import eiem_effect_simulation as sim
     from . import eiem_effect_assets as assets
+    from . import eiem_effect_playback as playback
 else:
     import eiem_effect_simulation as sim
     import eiem_effect_assets as assets
@@ -41,30 +42,63 @@ def _target(edit,identity,path):
         if o['native']['cab'].lower()==own for r in o['references'] if r['fileId']==ptr.get('m_FileID') and r.get('cab')),None)
     return (cab+':'+str(ptr.get('m_PathID'))) if cab and ptr.get('m_PathID') else None
 
-def _texture_coordinates(nodes,links,texture,settings):
+def _texture_coordinates(nodes,links,texture,settings,slot=''):
     uv=nodes.new('ShaderNodeTexCoord');mapping=nodes.new('ShaderNodeVectorMath');mapping.operation='MULTIPLY_ADD'
+    mapping['eff_uv_slot']=slot
     scale=settings.get('m_Scale',{});offset=settings.get('m_Offset',{})
     links.new(uv.outputs['UV'],mapping.inputs[0]);mapping.inputs[1].default_value=(scale.get('x',1),scale.get('y',1),1);mapping.inputs[2].default_value=(offset.get('x',0),offset.get('y',0),0)
     links.new(mapping.outputs['Vector'],texture.inputs['Vector'])
+
+def _material_values(mat,edit,mid):
+    if not mat.use_nodes or mid not in edit.state['values']:return
+    fields=edit.value(mid).get('m_SavedProperties',{})
+    floats={r['first']:r['second'] for r in fields.get('m_Floats',[])}
+    colors={r['first']:r['second'] for r in fields.get('m_Colors',[])}
+    textures={r['first']:r['second'] for r in fields.get('m_TexEnvs',[])}
+    scene=bpy.context.scene;time=(scene.frame_current+scene.frame_subframe-scene.frame_start)/(scene.render.fps/scene.render.fps_base)
+    nodes=mat.node_tree.nodes
+    for node in nodes:
+        slot=node.get('eff_uv_slot')
+        if slot and slot in textures:
+            settings=textures[slot];scale=settings.get('m_Scale',{});offset=settings.get('m_Offset',{})
+            prefix=slot[:-3] if slot.endswith('Tex') else slot
+            speed=colors.get(slot+'UVSpeed',colors.get(prefix+'UVSpeed',{}))
+            node.inputs[1].default_value=(scale.get('x',1),scale.get('y',1),1)
+            node.inputs[2].default_value=(offset.get('x',0)+speed.get('r',0)*time,offset.get('y',0)+speed.get('g',0)*time,0)
+    tint=colors.get('_TintColor',colors.get('_BaseColor',colors.get('_Color',dict(r=1,g=1,b=1,a=1))))
+    if nodes.get('EFF Tint'):nodes['EFF Tint'].inputs[2].default_value=tuple(tint.get(k,1) for k in 'rgba')
+    if nodes.get('EFF Alpha'):nodes['EFF Alpha'].inputs[1].default_value=tint.get('a',1)*floats.get('_TintColorAlpha',1)*floats.get('_ProcedureAlpha',1)
+    if nodes.get('EFF Shader'):nodes['EFF Shader'].inputs['Emission Strength'].default_value=floats.get('_TintColorIntensity',1)*floats.get('_ExpIntensity',1)
+    if nodes.get('EFF Dissolve'):nodes['EFF Dissolve'].inputs[1].default_value=floats.get('_DissolveScheduleOffset',0)
 def _material(root,edit,renderer,resources):
     mid=assets.renderer_material(root,edit,renderer) if edit.value(renderer).get('m_Materials') else None
     return _material_asset(root,edit,mid,resources)
 
-def _material_asset(root,edit,mid,resources):
+def _material_asset(root,edit,mid,resources,instance=''):
     from . import eiem_effect_material as material_bridge
-    matname='EFF preview '+root['eff_effect_id']+' '+str(mid)
+    matname='EFF preview '+root['eff_effect_id']+' '+str(mid)+(' '+instance if instance else '')
     author=assets.material_object(root,mid)
-    mat=next((m for m in bpy.data.materials if author and m.eff_effect_author==author),None) or bpy.data.materials.get(matname)
-    if mat and author:mat.eff_effect_author=author
+    if instance:
+        mat=next((m for m in bpy.data.materials if m.get('eff_preview_instance')==root['eff_effect_id']+instance and m.get('eff_preview_material')==str(mid)),None)
+    else:
+        mat=next((m for m in bpy.data.materials if author and m.eff_effect_author==author and not m.get('eff_preview_instance')),None) or bpy.data.materials.get(matname)
+    if mat and author and not instance:mat.eff_effect_author=author
     if mat and mat.name.startswith('EFF preview ') and edit.objects.get(mid,{}).get('name'):mat.name=edit.objects[mid]['name']
     if not mat:mat=bpy.data.materials.new(edit.objects.get(mid,{}).get('name') or matname)
-    if author:mat.eff_effect_author=author
-    if author:material_bridge.setup(mat,root,edit,mid)
-    signature=hashlib.sha256((json.dumps(edit.state['values'].get(mid,{}),sort_keys=True)+str(assets.texture_signature(root,mid))+str(material_bridge.signature(author))).encode()).hexdigest()
-    if mat.get('eff_source_signature')==signature:return mat
+    if author and not instance:mat.eff_effect_author=author
+    if author and not instance:material_bridge.setup(mat,root,edit,mid)
+    if instance:
+        mat['eff_preview_instance']=root['eff_effect_id']+instance;mat['eff_preview_material']=str(mid)
+        source=material_bridge.material_for(author) if author else None
+        if source:mat['eiem_shader']=source.get('eiem_shader','')
+    base_values=edit.state.get('_preview_base_values',edit.state['values'])
+    signature=hashlib.sha256((json.dumps(base_values.get(mid,{}),sort_keys=True)+str(assets.texture_signature(root,mid))+str(material_bridge.signature(author))+'preview-v2').encode()).hexdigest()
+    if mat.get('eff_source_signature')==signature:
+        _material_values(mat,edit,mid);return mat
     mat['eff_source_signature']=signature;mat.use_nodes=True
     nodes=mat.node_tree.nodes;nodes.clear();links=mat.node_tree.links
     output=nodes.new('ShaderNodeOutputMaterial');shader=nodes.new('ShaderNodeBsdfPrincipled')
+    shader.name='EFF Shader'
     shader.inputs['Roughness'].default_value=.7;shader.inputs['Emission Strength'].default_value=1
     links.new(shader.outputs['BSDF'],output.inputs['Surface'])
     attr=nodes.new('ShaderNodeVertexColor');attr.layer_name='EFFColor'
@@ -74,9 +108,11 @@ def _material_asset(root,edit,mid,resources):
         floats={r['first']:r['second'] for r in fields.get('m_Floats',[])};tints={r['first']:r['second'] for r in fields.get('m_Colors',[])}
         tint=tints.get('_TintColor',tints.get('_BaseColor',tints.get('_Color',dict(r=1,g=1,b=1,a=1))))
         rgb=nodes.new('ShaderNodeMixRGB');rgb.blend_type='MULTIPLY';rgb.inputs[0].default_value=1
+        rgb.name='EFF Tint'
         links.new(attr.outputs['Color'],rgb.inputs[1]);rgb.inputs[2].default_value=tuple(tint.get(k,1) for k in ('r','g','b','a'))
         color_socket=rgb.outputs[0];alpha_socket=attr.outputs['Alpha']
         alpha_factor=nodes.new('ShaderNodeMath');alpha_factor.operation='MULTIPLY';links.new(alpha_socket,alpha_factor.inputs[0]);alpha_factor.inputs[1].default_value=tint.get('a',1)*floats.get('_TintColorAlpha',1)*floats.get('_ProcedureAlpha',1);alpha_socket=alpha_factor.outputs[0]
+        alpha_factor.name='EFF Alpha'
         strength=floats.get('_TintColorIntensity',1)*floats.get('_ExpIntensity',1)
         shader.inputs['Emission Strength'].default_value=strength
         # Favor the material's actual main image rather than an arbitrary dependency.
@@ -88,7 +124,7 @@ def _material_asset(root,edit,mid,resources):
             image=assets.image_for_slot(root,edit,mid,index,resources)
             if not image:continue
             root['预览贴图槽']=row['first']+' → '+image.name
-            tex=nodes.new('ShaderNodeTexImage');tex.image=image;_texture_coordinates(nodes,links,tex,row['second'])
+            tex=nodes.new('ShaderNodeTexImage');tex.image=image;_texture_coordinates(nodes,links,tex,row['second'],row['first'])
             mult=nodes.new('ShaderNodeMixRGB');mult.blend_type='MULTIPLY';mult.inputs[0].default_value=1
             links.new(tex.outputs['Color'],mult.inputs[1]);links.new(color_socket,mult.inputs[2]);color_socket=mult.outputs[0]
             alpha=nodes.new('ShaderNodeMath');alpha.operation='MULTIPLY';links.new(tex.outputs['Alpha'],alpha.inputs[0]);links.new(alpha_socket,alpha.inputs[1]);alpha_socket=alpha.outputs[0]
@@ -99,13 +135,30 @@ def _material_asset(root,edit,mid,resources):
                 tid=_target(edit,mid,['m_SavedProperties','m_TexEnvs',index,'second','m_Texture'])
                 image=assets.image_for_slot(root,edit,mid,index,resources)
                 if not image:continue
-                tex=nodes.new('ShaderNodeTexImage');tex.image=image;_texture_coordinates(nodes,links,tex,row['second']);channels=nodes.new('ShaderNodeSeparateColor');links.new(tex.outputs['Color'],channels.inputs['Color'])
+                tex=nodes.new('ShaderNodeTexImage');tex.image=image;_texture_coordinates(nodes,links,tex,row['second'],row['first']);channels=nodes.new('ShaderNodeSeparateColor');links.new(tex.outputs['Color'],channels.inputs['Color'])
                 alpha=nodes.new('ShaderNodeMath');alpha.operation='MULTIPLY';links.new(alpha_socket,alpha.inputs[0]);links.new(channels.outputs['Red'],alpha.inputs[1]);alpha_socket=alpha.outputs[0]
                 root['预览遮罩槽']='_MaskTex → '+image.name
+        keywords=edit.value(mid).get('m_ValidKeywords',edit.value(mid).get('m_ShaderKeywords','').split())
+        for index,row in enumerate(textures):
+            if row['first']=='_NormalMap' and ('_NORMAL_MAP' in keywords or floats.get('_EnableNormalMap')):
+                image=assets.image_for_slot(root,edit,mid,index,resources)
+                if image:
+                    tex=nodes.new('ShaderNodeTexImage');tex.image=image;_texture_coordinates(nodes,links,tex,row['second'],row['first'])
+                    normal=nodes.new('ShaderNodeNormalMap');normal.inputs['Strength'].default_value=floats.get('_NormalScale',1)
+                    links.new(tex.outputs['Color'],normal.inputs['Color']);links.new(normal.outputs['Normal'],shader.inputs['Normal'])
+            if row['first']=='_DissolveTex' and ('_USE_DISSOLVE' in keywords or floats.get('_UseDissolve')):
+                image=assets.image_for_slot(root,edit,mid,index,resources)
+                if image:
+                    tex=nodes.new('ShaderNodeTexImage');tex.image=image;_texture_coordinates(nodes,links,tex,row['second'],row['first'])
+                    subtract=nodes.new('ShaderNodeMath');subtract.name='EFF Dissolve';subtract.operation='SUBTRACT';links.new(tex.outputs['Color'],subtract.inputs[0])
+                    edge=nodes.new('ShaderNodeMath');edge.operation='MULTIPLY';edge.use_clamp=True;edge.inputs[1].default_value=floats.get('_DissolveEdgeSharp',1);links.new(subtract.outputs[0],edge.inputs[0])
+                    alpha=nodes.new('ShaderNodeMath');alpha.operation='MULTIPLY';links.new(alpha_socket,alpha.inputs[0]);links.new(edge.outputs[0],alpha.inputs[1]);alpha_socket=alpha.outputs[0]
+        shader.inputs['Roughness'].default_value=max(0,min(1,floats.get('_Roughness',.7)))
         links.new(color_socket,shader.inputs['Base Color']);links.new(color_socket,shader.inputs['Emission Color']);links.new(alpha_socket,shader.inputs['Alpha'])
     try:mat.surface_render_method='DITHERED'
     except (AttributeError,TypeError):pass
     mat.use_backface_culling=False
+    _material_values(mat,edit,mid)
     return mat
 def _mesh_template(root,edit,renderer,resources):
     node=next((o for o in [root]+list(root.children_recursive)
@@ -258,10 +311,12 @@ def effective_particle_data(edit,node,data,placement):
     return data
 
 
-def birth_matrices(node,sampled,scene,data,root=None):
+def birth_matrices(node,sampled,scene,data,root=None,source_frame=None):
     if data.get('moveWithTransform',0)!=1:return {}
     fps=scene.render.fps/scene.render.fps_base;speed=data.get('simulationSpeed',1) or 1
     delay=sim.scalar(data.get('startDelay',{}));frames={round(scene.frame_start+(p['born']+delay)/speed*fps,4) for p in sampled}
+    if source_frame and source_frame.transforms:
+        return {f:source_frame.at(node,(f-scene.frame_start)/fps) for f in frames}
     # Static hierarchies need no timeline evaluation. Animation is sampled at
     # birth, including arbitrary seeks, rather than borrowing today's transform.
     chain=[];parent=node
@@ -280,6 +335,9 @@ def birth_matrices(node,sampled,scene,data,root=None):
 def update(root,edit,scene,changed_nodes=None):
     time=(scene.frame_current+scene.frame_subframe-scene.frame_start)/(scene.render.fps/scene.render.fps_base)
     resources=_resources(root,edit);diagnostics=set()
+    source_frame=playback.Frame(root,edit,time)
+    diagnostics.update(source_frame.warnings)
+    playback.static_renderers(source_frame,resources,diagnostics)
     for node in list(root.children_recursive)+[root]:
         if node.get('eff_preview'):continue
         if changed_nodes is not None and node.as_pointer() not in changed_nodes:continue
@@ -287,18 +345,23 @@ def update(root,edit,scene,changed_nodes=None):
         renderer=next((i for i in ids if edit.objects[i]['classId']==199),None)
         for identity in ids:
             if edit.objects[identity]['classId']!=198 or not renderer:continue
-            placement=emitter_matrix(root,node);data=effective_particle_data(edit,node,edit.value(identity),placement)
+            placement=source_frame.placement(node);data=effective_particle_data(edit,node,edit.value(identity),placement)
+            playback.trails(source_frame,node,identity,renderer,data,resources,diagnostics)
             _shape(root,node,identity,data);obj=_preview_object(root,node,identity)
             shape_key=root['eff_effect_id']+identity+'shape'
             bounds=next((o for o in _collection(root).objects if o.get('eff_preview_key')==shape_key),None)
             if bounds:bounds.matrix_basis=node.matrix_world.inverted()@placement
-            visible=root.eff_effect.preview and bool(edit.value(renderer).get('m_Enabled',True))
+            visible=root.eff_effect.preview and root.eff_effect.preview_particles and source_frame.visible(node) and bool(edit.value(renderer).get('m_Enabled',True))
             obj.hide_viewport=not visible;obj.hide_render=not visible
             if not visible:continue
             sampled=sim.particles(data,time,seed=int(root['eff_effect_id'][:8],16))
-            matrices=birth_matrices(node,sampled,scene,data,root);inverse=node.matrix_world.inverted()
-            vertices,faces,uv,is_mesh=_mesh_template(root,edit,renderer,resources)
-            mat=_material(root,edit,renderer,resources)
+            matrices=birth_matrices(node,sampled,scene,data,root,source_frame);inverse=node.matrix_world.inverted_safe()
+            try:vertices,faces,uv,is_mesh=_mesh_template(root,edit,renderer,resources)
+            except (ValueError,KeyError) as error:
+                obj.hide_viewport=obj.hide_render=True;diagnostics.add(node.name+'：'+str(error));continue
+            current=source_frame.renderer_edit(renderer)
+            mat=(_material_asset(root,current,assets.renderer_material(root,current,renderer),resources,instance=renderer+'/particles')
+                 if renderer in source_frame.renderers else _material(root,current,renderer,resources))
             out=[];polygons=[];colors=[];uvs=[]
             # Camera-facing billboards use the actual scene camera, or the active viewport orientation.
             camera=scene.camera
@@ -344,7 +407,14 @@ def update(root,edit,scene,changed_nodes=None):
             color.data.foreach_set('color',[v for tint in colors for v in tint])
             obj['预览粒子数']=len(sampled)
             unsupported=[k for k,v in data.items() if k.endswith('Module') and isinstance(v,dict) and v.get('enabled') and k not in ('InitialModule','ShapeModule','EmissionModule','SizeModule','RotationModule','ColorModule','VelocityModule','NoiseModule')]
-            unsupported=[k for k in unsupported if k!='UVModule']
+            unsupported=[k for k in unsupported if k not in ('UVModule','TrailModule')]
+            mid=assets.renderer_material(root,current,renderer) if current.value(renderer).get('m_Materials') else None
+            if mid:
+                material_data=current.value(mid)
+                keywords=material_data.get('m_ValidKeywords',material_data.get('m_ShaderKeywords','').split())
+                material_floats={r['first']:r['second'] for r in material_data.get('m_SavedProperties',{}).get('m_Floats',[])}
+                if any(k.startswith('_VAT_') for k in keywords) or material_floats.get('_EnableHoudiniVAT',0):
+                    unsupported.append('粒子网格 / 自定义顶点流 VAT（尚未回放）')
             if data.get('NoiseModule',{}).get('enabled'):unsupported.append('NoiseModule（近似摆动）')
             velocity=data.get('VelocityModule',{})
             if velocity.get('enabled') and any(sim.scalar(velocity.get(k,{})) for k in ('orbitalX','orbitalY','orbitalZ','radial')):unsupported.append('轨道 / 径向速度（暂未还原）')
@@ -391,7 +461,8 @@ def author_signature(root):
         signature[obj.as_pointer()]=(tuple(obj.matrix_world[i][j] for i in range(4) for j in range(4)),tuple((k,tuple(obj[k]) if k.startswith('fxv_') else obj[k]) for k in obj.keys() if k.startswith(('fx_','fxv_','fxu_'))),mesh_signature,
             tuple((s.name,s.image.as_pointer() if s.image else 0,s.linear,s.mipmaps,s.wrap,s.filter) for s in obj.eff_effect_textures),gradient_editor.signature(obj))
     signature['config']=(root.eff_effect.preview,root.eff_effect.show_shape,root['eff_effect_document'],
-        root.eff_effect.owner.as_pointer() if root.eff_effect.owner else 0,root.eff_effect.bone,tuple(v for row in mount_matrix(root) for v in row))
+        root.eff_effect.owner.as_pointer() if root.eff_effect.owner else 0,root.eff_effect.bone,tuple(v for row in mount_matrix(root) for v in row),
+        root.eff_effect.source_animation,root.eff_effect.preview_clip,root.eff_effect.clip_loop,root.eff_effect.vat_preview,root.eff_effect.preview_particles,root.eff_effect.trail_preview)
     signature['materials']=tuple(material_bridge.signature(o) for o in root.children_recursive if o.get('eff_effect_resource'))
     return signature
 
@@ -448,6 +519,7 @@ def register(sync,root_of):
 
 def clear_cache():
     _history.clear();_templates.clear();_signatures.clear();_shapes.clear();_node_signatures.clear();_asset_revisions.clear()
+    playback.clear_cache()
 def unregister():
     global _sync,_root_of
     if frame in bpy.app.handlers.frame_change_post:bpy.app.handlers.frame_change_post.remove(frame)

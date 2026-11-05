@@ -290,6 +290,7 @@ def particles(data, time, seed=1):
                 local_position[i]+=math.sin(age*frequency*math.tau+rr*50+i*2)*amplitude*.15
         position=[a+b for a,b in zip(local_position,world_offset)]
         size=scalar(initial.get('startSize',{}),emitter_phase,rr,fallback=1)
+        initial_size=size
         sizes=[size,scalar(initial.get('startSizeY',{}),emitter_phase,rr,fallback=1),scalar(initial.get('startSizeZ',{}),emitter_phase,rr,fallback=1)] if initial.get('size3D') else [size]*3
         sm=data.get('SizeModule',{})
         if sm.get('enabled'):
@@ -306,5 +307,5 @@ def particles(data, time, seed=1):
             if rm.get('separateAxes'):rotations=[a+life*integrate(rm.get(k,{}),phase,rr) for a,k in zip(rotations,('x','y','curve'))]
             else:rotations[2]+=life*integrate(rm.get('curve',{}),phase,rr)
         result.append(dict(id=identity,born=born-prewarm,age=age,phase=phase,position=position,local_position=local_position,world_offset=world_offset,
-            origin=pos,size=size,sizes=sizes,color=tint,rotation=rotations[2],rotations=rotations,random=rr))
+            origin=pos,size=size,initial_size=initial_size,sizes=sizes,color=tint,rotation=rotations[2],rotations=rotations,random=rr))
     return sorted(result,key=lambda p:p['born'])

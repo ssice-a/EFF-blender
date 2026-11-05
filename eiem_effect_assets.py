@@ -71,6 +71,9 @@ def expand_meshes(context, root, edit):
         preview._collection(root).children.link(collection)
         root['eff_effect_assets_collection'] = collection.name
     meshes = source_meshes(root)
+    imported = []
+    from .eiem_effect_native import Reader
+    native_reader = Reader(edit)
     for identity, resource in resources.items():
         if resource.get('kind') != 'Mesh' or identity in meshes:
             continue
@@ -93,6 +96,28 @@ def expand_meshes(context, root, edit):
             mesh.normals_split_custom_set_from_vertices([BASIS @ Vector(normals[i:i + 3]) for i in range(0, len(normals), 3)])
         color = mesh.color_attributes.new(name='EFFColor', type='FLOAT_COLOR', domain='POINT')
         color.data.foreach_set('color', [1.] * (len(vertices) * 4))
+        # v1 display JSON omitted UV1 (the VAT lookup), colors and submeshes.
+        # Read only this Mesh's native extent, never the complete CAB in memory.
+        try:
+            native_mesh = native_reader.mesh(identity)
+            if len(native_mesh['vertices']) == len(vertices):
+                for slot, values in native_mesh['uvs'].items():
+                    layer = mesh.uv_layers.get('UV' + str(slot)) or mesh.uv_layers.new(name='UV' + str(slot))
+                    layer.data.foreach_set('uv', [float(v) for loop in mesh.loops for v in values[loop.vertex_index, :2]])
+                mesh.uv_layers.active_index = 0
+                if native_mesh['colors'] is not None:
+                    import numpy as np
+                    values = native_mesh['colors']
+                    if values.shape[1] == 3:
+                        values = np.column_stack((values, np.ones(len(values))))
+                    color.data.foreach_set('color', values.ravel())
+                first = 0
+                for slot, submesh in enumerate(native_mesh['submeshes']):
+                    for poly in list(mesh.polygons)[first:first + len(submesh)]:
+                        poly.material_index = slot
+                    first += len(submesh)
+        except (ValueError, KeyError) as error:
+            mesh['eff_source_stream_warning'] = str(error)
         obj = bpy.data.objects.new(name, mesh)
         collection.objects.link(obj)
         obj.parent = root
@@ -100,9 +125,7 @@ def expand_meshes(context, root, edit):
         obj['eff_particle_template'] = True
         obj['eff_effect_mesh_source'] = identity
         meshes[identity] = obj
-        # Importing and exporting without edits must retain the native source.
-        if mesh.uv_layers.active and mesh.polygons:
-            obj['eff_effect_mesh_baseline'] = snapshot_digest(mesh_snapshot(obj))
+        imported.append(obj)
         obj.hide_set(True)
     bindings = {}
     for node in [root] + list(root.children_recursive):
@@ -125,6 +148,7 @@ def expand_meshes(context, root, edit):
                 variant['eff_effect_mesh_variant'] = True
                 variant.hide_set(True)
                 mesh = variant
+                imported.append(variant)
             mesh.data.materials.clear()
             for mid in mids:
                 if mid in edit.state['values']:
@@ -132,11 +156,58 @@ def expand_meshes(context, root, edit):
             bindings[key] = mesh
         if not node.eff_effect.particle_mesh:
             node.eff_effect.particle_mesh = bindings[key]
+    # Bind materials and flush RNA stream writes before evaluating the baseline.
+    # A half-configured/evaluation-cached Mesh is not its final imported state.
+    for obj in imported:obj.data.update()
+    context.view_layer.update()
+    for obj in imported:obj['eff_effect_mesh_fingerprint'] = mesh_fingerprint(obj)
     root['eff_effect_assets_version'] = 1
 
 
 def snapshot_digest(snapshot):
     return hashlib.sha256(repr(snapshot).encode('utf-8')).hexdigest()
+
+
+def mesh_fingerprint(obj):
+    """Compare author geometry without invoking the native Mesh encoder.
+
+    A lossless source need not be regeneratable from its display approximation
+    (e.g. degenerate UVs or VAT normals). Only edited geometry needs export
+    validation. Evaluate modifiers, but exclude placement and material names:
+    the Renderer owns bindings, and template translation is not exported.
+    """
+    import numpy as np
+    evaluated, mesh = evaluated_mesh(obj, bpy.context.evaluated_depsgraph_get())
+    try:
+        digest = hashlib.sha256()
+        def values(label, collection, prop, width, dtype='<f4'):
+            digest.update((label + ':' + str(len(collection))).encode())
+            data = np.empty(len(collection) * width, dtype=dtype)
+            collection.foreach_get(prop, data)
+            digest.update(data.tobytes())
+        digest.update(b'EFF_EFFECT_MESH_FINGERPRINT_1')
+        digest.update(np.asarray(obj.matrix_basis.to_3x3(), dtype='<f4').tobytes())
+        values('positions', mesh.vertices, 'co', 3)
+        values('loops', mesh.loops, 'vertex_index', 1, '<i4')
+        for prop in ('loop_start', 'loop_total', 'material_index', 'use_smooth'):
+            values(prop, mesh.polygons, prop, 1, '<i4' if prop != 'use_smooth' else '?')
+        values('normals', mesh.corner_normals, 'vector', 3)
+        types = {'FLOAT': ('value', 1, '<f4'), 'INT': ('value', 1, '<i4'),
+                 'BOOLEAN': ('value', 1, '?'), 'FLOAT_VECTOR': ('vector', 3, '<f4'),
+                 'FLOAT2': ('vector', 2, '<f4'), 'FLOAT_COLOR': ('color', 4, '<f4'),
+                 'BYTE_COLOR': ('color', 4, '<f4')}
+        for attr in sorted(mesh.attributes, key=lambda a: a.name):
+            if attr.name.startswith('.') or attr.data_type not in types:
+                continue
+            prop, width, dtype = types[attr.data_type]
+            values(attr.name + ':' + attr.domain + ':' + attr.data_type,
+                   attr.data, prop, width, dtype)
+        for key in ('eiem_coordinate_space', 'author_uv_slots_json', 'eff_uv_slots_json'):
+            digest.update((key + ':' + str(mesh.get(key, ''))).encode())
+        digest.update(('active_uv:' + str(mesh.uv_layers.active_index)).encode())
+        return digest.hexdigest()
+    finally:
+        evaluated.to_mesh_clear()
 
 
 def texture_slot(root, identity, prop):
@@ -150,9 +221,11 @@ def setup_textures(root, edit, obj, identity):
     resources = preview._resources(root, edit)
     native = None
     for index, row in enumerate(edit.value(identity).get('m_SavedProperties', {}).get('m_TexEnvs', [])):
-        if obj.eff_effect_textures.get(row['first']):
+        slot = obj.eff_effect_textures.get(row['first'])
+        if slot and slot.source_metadata:
             continue
-        slot = obj.eff_effect_textures.add()
+        created = slot is None
+        if created:slot = obj.eff_effect_textures.add()
         slot.name = row['first']
         tid = preview._target(edit, identity, ['m_SavedProperties', 'm_TexEnvs', index, 'second', 'm_Texture'])
         resource = resources.get(tid)
@@ -161,11 +234,21 @@ def setup_textures(root, edit, obj, identity):
         if tid and edit.objects[tid]['classId'] == 28:
             if native is None:native = NativeAssets(edit, root['eff_effect_id'])
             tree, _ = native.tree(tid)
-            slot.linear = tree['m_ColorSpace'].data == 0
-            slot.mipmaps = tree['m_MipCount'].data > 1
+            if created:
+                slot.linear = tree['m_ColorSpace'].data == 0
+                slot.mipmaps = tree['m_MipCount'].data > 1
             settings = tree['m_TextureSettings']
-            slot.wrap = str(settings['m_WrapU'].data)
-            slot.filter = str(settings['m_FilterMode'].data)
+            if created:
+                slot.wrap = str(settings['m_WrapU'].data)
+                slot.filter = str(settings['m_FilterMode'].data)
+            slot.source_metadata = document.dumps(dict(identity=tid, name=tree['m_Name'].data,
+                logicalPaths=[r['path'] for r in edit.objects[tid].get('logicalPaths') or []],
+                preview=str(Path(edit.state['source']) / resource['file']) if resource else None,
+                width=tree['m_Width'].data,height=tree['m_Height'].data,format=tree['m_TextureFormat'].data,
+                colorSpace=tree['m_ColorSpace'].data,mipCount=tree['m_MipCount'].data,
+                stream={k:tree['m_StreamData'][k].data for k in ('path','offset','size')}))
+        else:
+            slot.source_metadata = document.dumps(dict(identity=tid, name=slot.source_name, logicalPaths=[]))
         # Loading every image on import is unnecessary; the preview loads the
         # main/mask images. An empty replacement means retain the source.
 
@@ -189,7 +272,10 @@ def image_for_slot(root, edit, identity, index, resources):
         return replacement.image
     target = preview._target(edit, identity, ['m_SavedProperties', 'm_TexEnvs', index, 'second', 'm_Texture'])
     resource = resources.get(target)
-    return bpy.data.images.load(str(Path(edit.state['source']) / resource['file']), check_existing=True) if resource else None
+    if not resource:return None
+    image = bpy.data.images.load(str(Path(edit.state['source']) / resource['file']), check_existing=True)
+    if replacement and replacement.linear:image.colorspace_settings.name='Non-Color'
+    return image
 
 
 def evaluated_mesh(obj, depsgraph):
@@ -268,24 +354,17 @@ class NativeAssets:
         self.manifest = json.loads((self.source / 'source/manifest.json').read_bytes())
         self.receipt = json.loads((self.source / 'source/generated-files.json').read_bytes())['files']
         self.files, self.rows, self.additions = {}, {}, []
+        from .eiem_effect_native import Reader
+        self.reader = Reader(edit)
 
     def tree(self, identity):
         spec = self.edit.objects[identity]
         if spec.get('template'):spec = self.edit.objects[spec['template']]
         cab = spec['native']['cab']
-        if cab not in self.files:
+        if cab not in self.rows:
             row = next(r for r in self.manifest['serializedFiles'] if r['cab'].lower() == cab.lower())
-            raw = document.safe_path(self.source, row['snapshot']['file']).read_bytes()
-            document.require(document.digest(raw) == row['snapshot']['sha256'].upper(), '原生底稿摘要不匹配')
-            self.files[cab], self.rows[cab] = raw, row
-        schema_raw = document.safe_path(self.source, spec['schema']).read_bytes()
-        document.require(document.digest(schema_raw) == self.receipt[spec['schema']].upper(), '资源结构摘要不匹配')
-        schema = self.codec.Schema.compile(json.loads(schema_raw)['nodes'])
-        row = next(r for r in self.rows[cab]['objects'] if r['pathId'] == spec['native']['pathId'])
-        raw = self.files[cab][row['offset']:row['offset'] + row['size']]
-        tree = self.codec.decode(schema, raw)
-        document.require(self.codec.encode(tree) == raw, '原生资源未修改往返失败')
-        return tree, raw
+            self.rows[cab] = row
+        return self.reader.tree(identity)
 
     def add(self, template, label, tree):
         spec = self.edit.objects[template]
@@ -372,9 +451,14 @@ def export_document(root, edit):
     material_clones = {}
     mesh_clones = {}
     snapshots = {}
+    fingerprints = {}
     imported_meshes = source_meshes(root)
     def mesh_target(template, selected):
         key = selected.as_pointer()
+        if key not in fingerprints:fingerprints[key] = mesh_fingerprint(selected)
+        if (selected.get('eff_effect_mesh_source') == template and
+                selected.get('eff_effect_mesh_fingerprint') == fingerprints[key]):
+            return None
         if key not in snapshots:
             snapshot = mesh_snapshot(selected)
             snapshots[key] = snapshot, snapshot_digest(snapshot)

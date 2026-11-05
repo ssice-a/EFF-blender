@@ -54,7 +54,7 @@ assert panel.poll(context)
 assert not hasattr(bpy.types, 'EFF_PT_effect_material'), 'effect created a duplicate material panel'
 layout = Layout()
 panel.draw(type('Panel', (), {'layout': layout})(), context)
-assert '原始参数' in layout.props and '特效主图' in layout.labels
+assert '原始参数' in layout.props and '特效主图' in layout.labels, (layout.props,layout.labels,mat.get('eiem_shader'))
 assert 'eiem.material_texture_file' in layout.operators and 'eiem.effect_texture_open' not in layout.operators
 assert 'eiem.import_material' not in layout.operators, 'effect binding showed the unrelated character .mat import'
 ordinary = bpy.data.materials.new('普通材质入口测试')

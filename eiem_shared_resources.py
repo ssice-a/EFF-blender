@@ -214,6 +214,61 @@ def find_native_tools():
     return _installed_tools(root) if root is not None else None
 
 
+def check_native_tools():
+    """Check the selected shared-tool cache against the latest release.
+
+    This deliberately does not download anything.  ``ensure_native_tools``
+    remains the explicit prepare/update operation used by the UI button.
+    """
+    root = resource_root()
+    if root is None:
+        return {
+            'status': 'unconfigured',
+            'message': 'Shared tool storage is not configured',
+        }
+
+    installed = _installed_tools(root)
+    try:
+        manifest = _latest_tools_manifest()
+    except (OSError, ValueError) as error:
+        if installed is not None:
+            return {
+                'status': 'unknown',
+                'message': 'Unable to check the latest shared tools: ' + str(error),
+                'path': str(installed),
+            }
+        raise
+
+    release = manifest.get('release') or manifest.get('framework') or ''
+    if installed is None:
+        return {
+            'status': 'available',
+            'message': 'Shared tools are not installed',
+            'release': release,
+        }
+
+    try:
+        receipt = json.loads((root / 'tools' / 'current.json').read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError, TypeError):
+        receipt = {}
+    current = str(receipt.get('sha256', '')).casefold()
+    latest = str(manifest.get('sha256', '')).casefold()
+    if current == latest:
+        return {
+            'status': 'latest',
+            'message': 'Shared tools are up to date',
+            'release': release or receipt.get('release', ''),
+            'path': str(installed),
+        }
+    return {
+        'status': 'available',
+        'message': 'A newer shared-tool package is available',
+        'release': release,
+        'currentRelease': receipt.get('release', ''),
+        'path': str(installed),
+    }
+
+
 @contextmanager
 def _native_tools_install_lock(path):
     """Use the same exclusive Windows file-share lock as the .NET clients."""

@@ -579,6 +579,9 @@ def draw(layout, material):
                 _draw_feature(layout, material, item, ownership)
         _draw_remaining(layout, material, ownership)
     _draw_info(layout, material)
+    if getattr(material,'eff_effect_author',None):
+        from . import eiem_effect_material
+        eiem_effect_material.draw_sources(layout,material)
 
 
 CLASSES = (EFF_PG_material_value, EFF_PG_material_feature, EFF_PG_material_group,

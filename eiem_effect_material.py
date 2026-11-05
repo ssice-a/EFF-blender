@@ -19,6 +19,7 @@ PREFIXES = ('eiem_float.', 'eiem_int.', 'eiem_value4.', 'eiem_color.',
 
 
 def material_for(author):
+    if author is None:return None
     return next((m for m in bpy.data.materials if m.eff_effect_author == author), None)
 
 
@@ -28,7 +29,7 @@ def _text(value):
 
 def _source(edit, identity):
     spec = edit.objects.get(identity, {})
-    return next((r['path'] for r in spec.get('logicalPaths', []) if r.get('path')), '')
+    return next((r['path'] for r in spec.get('logicalPaths') or [] if r.get('path')), '')
 
 
 def properties(edit, identity):
@@ -194,3 +195,31 @@ def draw(layout, author):
         layout.label(text='材质尚未初始化，请重新加载特效资源', icon='ERROR')
         return
     material_editor.draw(layout, material)
+
+
+def draw_sources(layout, material):
+    author = material.eff_effect_author
+    if not author:return
+    from . import eiem_effect_ui as ui
+    header, body = layout.panel('eff_texture_provenance_' + material.get('eiem_section', ''), default_closed=True)
+    header.label(text='特效贴图来源 / 用途',icon='TEXTURE')
+    if body is None:return
+    roles={'_PositionTexture':'VAT 位置 / 偏移数据（浮点；含义取决于原 Shader）',
+           '_RotationTexture':'VAT 旋转 / 朝向数据', '_NormalMap':'表面法线；可随 UV 速度流动',
+           '_MaskTex':'透明度 / 覆盖范围遮罩', '_DissolveTex':'溶解形状与边缘',
+           '_MainTex':'主颜色 / 透明度', '_DisturbTex':'UV 扰动数据'}
+    for slot in author.eff_effect_textures:
+        data=json.loads(slot.source_metadata or '{}')
+        if not data.get('identity'):continue
+        box=body.box()
+        from . import eiem_material_features as features
+        box.label(text=features.label('eiem_texture.'+slot.name))
+        box.label(text=slot.name+' → '+data.get('name',''))
+        ui.hint(box,roles.get(slot.name,'按原 Shader 采样；具体通道用途请结合原参数核对'))
+        if 'width' in data:
+            box.label(text='%d × %d · TextureFormat %d · %s · %d mip'%(data['width'],data['height'],data['format'],
+                'Linear' if data['colorSpace']==0 else 'sRGB',data['mipCount']))
+        for path in data.get('logicalPaths',[]):ui.hint(box,'游戏逻辑路径：'+path)
+        if not data.get('logicalPaths'):ui.hint(box,'来源未记录逻辑路径；使用报告中的 CAB / PathID，不能按名称猜路径。')
+        if data.get('preview'):ui.hint(box,'显示用预览：'+data['preview'])
+        if data.get('format') in (17,20):ui.hint(box,'PNG 仅供查看；VAT 预览从原生浮点流读取。',icon='INFO')

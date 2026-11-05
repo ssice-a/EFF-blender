@@ -117,6 +117,76 @@ class SharedResourceTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, '检查并准备工具'):
                         shared.native_tool_file('eff_author_assets.dll')
 
+    def test_check_native_tools_reports_unconfigured_storage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.dict(os.environ, {'LOCALAPPDATA': str(Path(temporary) / 'local')}, clear=True):
+                self.assertEqual(shared.check_native_tools()['status'], 'unconfigured')
+
+    def test_check_native_tools_reports_available_when_not_installed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.dict(os.environ, {'LOCALAPPDATA': str(root / 'local')}, clear=True):
+                shared.set_resource_root(root)
+                with patch.object(shared, '_latest_tools_manifest', return_value={
+                        'sha256': 'a' * 64, 'framework': 'v-current'}):
+                    result = shared.check_native_tools()
+            self.assertEqual(result['status'], 'available')
+            self.assertEqual(result['release'], 'v-current')
+
+    def test_check_native_tools_reports_latest_cache_without_download(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            digest = 'a' * 64
+            install = root / 'tools' / digest
+            native = install / 'nativepack'
+            native.mkdir(parents=True)
+            for name in ('eff_author_assets.dll', 'eff_author_core.dll', 'texconv.exe', 'THIRD_PARTY_NOTICES'):
+                (native / name).touch()
+            vendor = install / 'vendor' / 'PIL'
+            vendor.mkdir(parents=True)
+            for name in shared.PIL_REQUIRED_FILES:
+                (install / 'vendor' / name).touch()
+            (root / 'tools' / 'current.json').write_text(json.dumps({
+                'format': shared.TOOLS_INSTALL_FORMAT,
+                'sha256': digest,
+                'release': 'v-current',
+            }), encoding='utf-8')
+            manifest = {'sha256': digest, 'framework': 'v-current'}
+            with patch.dict(os.environ, {'LOCALAPPDATA': str(root / 'local')}, clear=True):
+                shared.set_resource_root(root)
+                with patch.object(shared, '_latest_tools_manifest', return_value=manifest), \
+                        patch.object(shared, 'urlopen', side_effect=AssertionError('check downloaded tools')):
+                    result = shared.check_native_tools()
+            self.assertEqual(result['status'], 'latest')
+            self.assertEqual(result['release'], 'v-current')
+
+    def test_check_native_tools_reports_newer_release(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old_digest = 'a' * 64
+            install = root / 'tools' / old_digest
+            native = install / 'nativepack'
+            native.mkdir(parents=True)
+            for name in ('eff_author_assets.dll', 'eff_author_core.dll', 'texconv.exe', 'THIRD_PARTY_NOTICES'):
+                (native / name).touch()
+            vendor = install / 'vendor' / 'PIL'
+            vendor.mkdir(parents=True)
+            for name in shared.PIL_REQUIRED_FILES:
+                (install / 'vendor' / name).touch()
+            (root / 'tools' / 'current.json').write_text(json.dumps({
+                'format': shared.TOOLS_INSTALL_FORMAT,
+                'sha256': old_digest,
+                'release': 'v-old',
+            }), encoding='utf-8')
+            with patch.dict(os.environ, {'LOCALAPPDATA': str(root / 'local')}, clear=True):
+                shared.set_resource_root(root)
+                with patch.object(shared, '_latest_tools_manifest', return_value={
+                        'sha256': 'b' * 64, 'release': 'v-new'}):
+                    result = shared.check_native_tools()
+            self.assertEqual(result['status'], 'available')
+            self.assertEqual(result['currentRelease'], 'v-old')
+            self.assertEqual(result['release'], 'v-new')
+
     def test_prepare_checks_release_but_reuses_matching_shared_cache(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
