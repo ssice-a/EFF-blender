@@ -409,5 +409,23 @@ class Format3PublicationTests(unittest.TestCase):
             read_format3_directory(self.root)
 
 
+class LogicalMeshRouteTests(unittest.TestCase):
+    def test_dependency_only_routes_use_full_logical_identity(self):
+        target = dict(level=0, sourcePath="assets/weapons/sword.fbx", sourceAsset="Sword")
+        rules = [dict(targets=[target], hidden=False)]
+        source = types.SimpleNamespace(manifest={"resources": [
+            dict(type="Mesh", logicalPath=target["sourcePath"], name="Sword",
+                 sourceBundle="Bundles/Windows/main/sword.ab"),
+            dict(type="Mesh", logicalPath="assets/other.fbx", name="Sword",
+                 sourceBundle="Bundles/Windows/main/other.ab")]})
+        routes = author_format3.resolve_target_bundles([source], rules)
+        self.assertEqual(routes, {("assets/weapons/sword.fbx", "Sword"):
+                                  "bundles/windows/main/sword.ab"})
+        conflicting = types.SimpleNamespace(manifest={"resources": [dict(
+            source.manifest["resources"][0], sourceBundle="Bundles/Windows/main/other.ab")]})
+        with self.assertRaisesRegex(ValueError, "conflicting logical Mesh Bundle routes"):
+            author_format3.resolve_target_bundles([source, conflicting], rules)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1374,7 +1374,9 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
         modules['author_format3'].write_format3_directory(
             format3_staging, token(destination.name), parts, materials,
             list(textures.values()), rules, switches, material_clips, effects,
-            physics=physics_resources, author_files=author_files)
+            physics=physics_resources, author_files=author_files,
+            target_bundles=modules['author_format3'].resolve_target_bundles(
+                source_packages.values(), rules))
         detail['writeAuthor'] = (time.perf_counter() - phase) * 1000
         tool = shared_resources.native_tool_file('eff_author_assets.dll')
         try:
