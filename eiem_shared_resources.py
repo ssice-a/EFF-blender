@@ -24,6 +24,14 @@ PIL_REQUIRED_FILES = (
     'PIL/_imaging.cp311-win_amd64.pyd',
     'PIL/_imaging.cp313-win_amd64.pyd',
 )
+# PIL imports these modules before an image can be opened.  The archive carries
+# the complete package, but these markers also let us reject an older cache
+# that was extracted with only the native extensions.
+PIL_IMPORT_FILES = (
+    'PIL/_version.py',
+    'PIL/Image.py',
+)
+PIL_INSTALL_FILES = PIL_REQUIRED_FILES + PIL_IMPORT_FILES
 
 
 def metadata_root():
@@ -151,7 +159,7 @@ def _extract_tools(archive, destination):
         'nativepack/eff_author_core.dll',
         'nativepack/texconv.exe',
         'nativepack/THIRD_PARTY_NOTICES',
-        *('vendor/' + name for name in PIL_REQUIRED_FILES),
+        *('vendor/' + name for name in PIL_INSTALL_FILES),
     }
     found = set()
     with zipfile.ZipFile(archive) as package:
@@ -170,13 +178,18 @@ def _extract_tools(archive, destination):
             if member.is_dir():
                 continue
             relative_name = '/'.join(parts)
-            if relative_name not in required:
+            # Pillow is a Python package, not just the two native extensions.
+            # Keep every member under vendor/PIL so Image.py can import its
+            # helpers and format plugins at runtime.
+            is_pillow_member = relative_name.startswith('vendor/PIL/')
+            if not is_pillow_member and relative_name not in required:
                 continue
             target = destination.joinpath(*parts)
             target.parent.mkdir(parents=True, exist_ok=True)
             with package.open(member) as source, target.open('wb') as output:
                 shutil.copyfileobj(source, output, 1024 * 1024)
-            found.add(relative_name)
+            if relative_name in required:
+                found.add(relative_name)
     missing = required - found
     if missing:
         raise ValueError('EFF 共享工具包缺少文件：' + ', '.join(sorted(missing)))
@@ -194,7 +207,7 @@ def _installed_tools(root):
         nativepack = directory / 'nativepack'
         vendor = directory / 'vendor'
         if (all((nativepack / name).is_file() for name in required)
-                and all((vendor / name).is_file() for name in PIL_REQUIRED_FILES)):
+                and all((vendor / name).is_file() for name in PIL_INSTALL_FILES)):
             return directory
     except (OSError, KeyError, ValueError, TypeError):
         return None
@@ -369,7 +382,7 @@ def _install_native_tools(root):
             _extract_tools(archive, payload)
         except ValueError as error:
             if (installed is not None
-                    and any(name in str(error) for name in PIL_REQUIRED_FILES[1:])):
+                    and any(name in str(error) for name in PIL_INSTALL_FILES[1:])):
                 return installed
             raise
         if destination.exists():

@@ -11,8 +11,9 @@ from pathlib import Path
 import bpy
 
 addon_path, source_root, destination = sys.argv[sys.argv.index('--') + 1:]
-sys.path.insert(0, str(Path(addon_path).resolve().parent))
-addon = importlib.import_module(Path(addon_path).name)
+addon_file = Path(addon_path).resolve()
+sys.path.insert(0, str(addon_file.parent.parent))
+addon = importlib.import_module(addon_file.parent.name)
 addon.register()
 editor = addon.eiem_blender_addon.effect_editor
 scene = bpy.context.scene
@@ -66,12 +67,16 @@ for root in roots:
     stats['preview'] = measure(lambda: editor.preview.refresh(root, editor.editor(root)))
     key = editor.field_key(identity, ['InitialModule','startSpeed','scalar'])
     original = node[key]
+    update = type('Update', (), {'id': node})()
+    depsgraph = type('Depsgraph', (), {'updates': [update]})()
     def drag():
         node[key] = float(node[key]) + .001
+        editor.preview.asset_changed(scene, depsgraph)
         editor.preview.live_update()
     stats['drag_timer'] = measure(drag)
     node[key] = original
     editor.synchronize(root)
+    editor.preview.prime_signature(root)
     stats['particles'] = sum(o.get('预览粒子数', 0) for o in root.children_recursive)
 results['idle_timer'] = measure(editor.preview.live_update)
 profile.disable()

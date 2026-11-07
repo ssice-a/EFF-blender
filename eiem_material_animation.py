@@ -95,7 +95,7 @@ def export_clips(material,mid,addon,include_hotkeys=True):
             samples=[float(curve.evaluate(c.start+(c.end-c.start)*i/(count-1))) for i in range(count)]
             if not all(math.isfinite(v) and abs(v)<=3.402823466e38 for v in samples):raise ValueError(c.label+' 存在无效数值')
             tracks.append(dict(variable='$'+cid+'_'+str(component),material=mid,property=c.property,kind=c.kind,component=component,samples=samples))
-        result.append(dict(id=cid,label=c.label,key=c.hotkey if include_hotkeys else '',duration=(c.end-c.start)/fps,speed=c.speed,loop=c.loop,autoplay=c.autoplay,targets=tracks))
+        result.append(dict(id=cid,label=c.label,key=c.hotkey if include_hotkeys else '',duration=(c.end-c.start)/fps,speed=c.speed,loop=c.loop,autoplay=c.autoplay,sample_rate=c.sample_rate,targets=tracks))
     return result
 
 class EFF_PT_material_animation(bpy.types.Panel):

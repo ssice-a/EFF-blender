@@ -5,6 +5,7 @@ properties. Legacy snapshots omit the Shader name, so recognise their full
 characteristic field/texture signature; an explicit different Shader wins.
 Opening the UI never applies a preset or changes an authored field.
 """
+import json
 
 
 def field(material, name, kind='float', default=''):
@@ -16,6 +17,66 @@ def truth(value):
         return float(value) != 0
     except (TypeError, ValueError):
         return str(value).lower() == 'true'
+
+
+def actual_render_queue(material, baseline=None):
+    """Resolve a numeric Unity queue without emitting the Shader-default sentinel."""
+    if baseline is None:
+        try:
+            baseline = json.loads(material.get('eiem_baseline_json', '{}'))
+        except (TypeError, ValueError):
+            baseline = {}
+    if not isinstance(baseline, dict):
+        baseline = {}
+
+    def queue_value(value):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not numeric.is_integer():
+            return None
+        value = int(numeric)
+        return value if 0 <= value <= 5000 else None
+
+    authored = queue_value(material.get('eiem_render_queue'))
+    if authored is not None:
+        return authored
+
+    def source_field(name, kind='float'):
+        key = 'eiem_' + kind + '.' + name
+        if key in material:
+            return material.get(key, '')
+        return baseline.get(kind + '.' + name, '')
+
+    surface_known = ('eiem_float._SurfaceType' in material or
+                     'float._SurfaceType' in baseline)
+    clip_known = ('eiem_float._EnableAlphaTest' in material or
+                  'float._EnableAlphaTest' in baseline or
+                  'eiem_keyword._ALPHATEST_ON' in material or
+                  'keyword._ALPHATEST_ON' in baseline)
+    if surface_known or clip_known:
+        transparent = truth(source_field('_SurfaceType'))
+        clipped = (truth(source_field('_EnableAlphaTest')) or
+                   truth(material.get('eiem_keyword._ALPHATEST_ON',
+                                      baseline.get('keyword._ALPHATEST_ON', '0'))))
+        if transparent:
+            return 3000
+        if clipped:
+            return 2450
+        return 2000
+
+    for key in ('render_queue', 'm_CustomRenderQueue', 'eiem_render_queue'):
+        value = queue_value(baseline.get(key))
+        if value is not None:
+            return value
+    render_type = str(material.get('eiem_tag.RenderType',
+                                   baseline.get('tag.RenderType', ''))).strip().lower()
+    if render_type == 'transparent':
+        return 3000
+    if render_type in ('transparentcutout', 'alphatest'):
+        return 2450
+    return 2000
 
 
 def texture_slots(material):

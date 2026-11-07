@@ -3,6 +3,7 @@ import json
 import hashlib
 import math
 import copy
+import time
 from pathlib import Path
 import bpy
 from mathutils import Matrix,Quaternion,Vector
@@ -18,11 +19,17 @@ _root_of=None
 _busy=False
 _history={}
 _templates={}
+_author_mesh_templates={}
 _signatures={}
+_pending_updates={}
 _shapes={}
 _node_signatures={}
 _asset_revisions={}
-POLL_INTERVAL=.1
+_asset_roots={}
+_root_assets={}
+_effect_roots={}
+POLL_INTERVAL=.15
+PREVIEW_DEBOUNCE=.25
 BASIS=Matrix(((-1,0,0),(0,0,-1),(0,1,0)))
 
 def _collection(root):
@@ -160,11 +167,45 @@ def _material_asset(root,edit,mid,resources,instance=''):
     mat.use_backface_culling=False
     _material_values(mat,edit,mid)
     return mat
+def _mesh_evaluation_signature(custom,scene):
+    def property_signature(value):
+        if isinstance(value,bpy.types.Object):
+            data=value.data
+            return (value.as_pointer(),data.as_pointer() if data else 0,
+                _asset_revisions.get(data.as_pointer(),0) if data else 0,
+                tuple(v for row in value.matrix_world for v in row))
+        if isinstance(value,bpy.types.ID):return (value.as_pointer(),_asset_revisions.get(value.as_pointer(),0))
+        if isinstance(value,(str,int,float,bool,type(None))):return value
+        try:return tuple(value)
+        except TypeError:return str(value)
+    dependencies=[]
+    for modifier in custom.modifiers:
+        settings=tuple((prop.identifier,property_signature(getattr(modifier,prop.identifier)))
+            for prop in modifier.bl_rna.properties if prop.identifier not in {'rna_type','name'} and not prop.is_readonly)
+        targets=[]
+        for name in ('object','target','node_group'):
+            target=getattr(modifier,name,None)
+            if not isinstance(target,bpy.types.ID):continue
+            target_data=getattr(target,'data',None)
+            transform=tuple(v for row in target.matrix_world for v in row) if isinstance(target,bpy.types.Object) else ()
+            targets.append((name,target.as_pointer(),_asset_revisions.get(target.as_pointer(),0),
+                target_data.as_pointer() if target_data else 0,
+                _asset_revisions.get(target_data.as_pointer(),0) if target_data else 0,transform))
+        dependencies.append((settings,tuple(targets)))
+    return (custom.as_pointer(),custom.data.as_pointer(),_asset_revisions.get(custom.data.as_pointer(),0),custom.mode,
+        tuple(v for row in custom.matrix_basis for v in row),tuple(dependencies),scene.frame_current,scene.frame_subframe)
+
+
 def _mesh_template(root,edit,renderer,resources):
     node=next((o for o in [root]+list(root.children_recursive)
                if renderer in json.loads(o.get('eff_effect_components','[]'))),None)
     if node and node.eff_effect.particle_mesh and edit.value(renderer).get('m_RenderMode')==4:
-        return assets.preview_mesh(node.eff_effect.particle_mesh)
+        custom=node.eff_effect.particle_mesh;scene=bpy.context.scene
+        key=_mesh_evaluation_signature(custom,scene)
+        if key not in _author_mesh_templates:
+            _author_mesh_templates[key]=assets.preview_mesh(custom)
+            while len(_author_mesh_templates)>16:_author_mesh_templates.pop(next(iter(_author_mesh_templates)))
+        return _author_mesh_templates[key]
     mid=_target(edit,renderer,['m_Mesh']) if 'm_Mesh' in edit.value(renderer) else None
     if edit.value(renderer).get('m_RenderMode')==4 and mid in resources:
         file=str(Path(edit.state['source'])/resources[mid]['file'])
@@ -337,7 +378,8 @@ def update(root,edit,scene,changed_nodes=None):
     resources=_resources(root,edit);diagnostics=set()
     source_frame=playback.Frame(root,edit,time)
     diagnostics.update(source_frame.warnings)
-    playback.static_renderers(source_frame,resources,diagnostics)
+    if changed_nodes is None:
+        playback.static_renderers(source_frame,resources,diagnostics)
     for node in list(root.children_recursive)+[root]:
         if node.get('eff_preview'):continue
         if changed_nodes is not None and node.as_pointer() not in changed_nodes:continue
@@ -443,13 +485,78 @@ def refresh(root,edit,changed_nodes=None):
 @bpy.app.handlers.persistent
 def asset_changed(scene,depsgraph):
     if _busy:return
+    roots={}
     for update in depsgraph.updates:
-        item=update.id.original;key=item.as_pointer()
+        item=getattr(update.id,'original',update.id);key=item.as_pointer()
         if key in _asset_revisions:_asset_revisions[key]+=1
+        if isinstance(item,bpy.types.Object):
+            if item.get('eff_preview'):continue
+            root=_root_of(item) if _root_of else None
+            if root:
+                root_key=root.as_pointer();entry=roots.get(root_key)
+                if entry is None:entry=[root,set()];roots[root_key]=entry
+                if entry[1] is not None:entry[1].add(key)
+                continue
+        elif isinstance(item,bpy.types.Material) and item.get('eff_preview_instance'):
+            continue
+        for root_key in _asset_roots.get(key,()):
+            root=_effect_roots.get(root_key)
+            if root:
+                entry=roots.get(root_key)
+                if entry is None:roots[root_key]=[root,None]
+                else:entry[1]=None
+    for root,changed in roots.values():schedule_refresh(root,changed)
+
+
+def _track_assets(root):
+    key=root.as_pointer();_effect_roots[key]=root
+    current=set()
+    def track(item):
+        if item is None:return
+        pointer=item.as_pointer();current.add(pointer);_asset_revisions.setdefault(pointer,0)
+    for obj in [root]+list(root.children_recursive):
+        if obj.get('eff_preview'):continue
+        track(obj)
+        if obj.type=='MESH':track(obj.data)
+        custom=obj.eff_effect.particle_mesh
+        if custom:
+            track(custom);track(custom.data)
+            for modifier in custom.modifiers:
+                for name in ('object','target','node_group'):
+                    dependency=getattr(modifier,name,None)
+                    if dependency:track(dependency)
+                    if isinstance(dependency,bpy.types.Object) and dependency.type=='MESH':track(dependency.data)
+        for slot in obj.eff_effect_textures:track(slot.image)
+    if _root_of:
+        for material in bpy.data.materials:
+            author=getattr(material,'eff_effect_author',None)
+            if author and _root_of(author)==root:track(material)
+    previous=_root_assets.get(key,set())
+    for pointer in previous-current:
+        roots=_asset_roots.get(pointer)
+        if roots:
+            roots.discard(key)
+            if not roots:del _asset_roots[pointer]
+    for pointer in current-previous:_asset_roots.setdefault(pointer,set()).add(key)
+    _root_assets[key]=current
+
+
+def schedule_refresh(root,changed_nodes=None):
+    if not root:return
+    key=root.as_pointer();_effect_roots[key]=root
+    pending=_pending_updates.get(key)
+    changed=set(changed_nodes) if changed_nodes is not None else None
+    if pending:
+        previous=pending[1]
+        changed=None if previous is None or changed is None else previous|changed
+    _pending_updates[key]=(time.monotonic(),changed)
+    if not bpy.app.timers.is_registered(live_update):
+        bpy.app.timers.register(live_update,first_interval=POLL_INTERVAL,persistent=True)
 
 def author_signature(root):
     from . import eiem_effect_material as material_bridge
     from . import eiem_effect_gradient_editor as gradient_editor
+    _track_assets(root)
     signature={}
     for obj in [root]+list(root.children_recursive):
         if obj.get('eff_preview'):continue
@@ -457,9 +564,12 @@ def author_signature(root):
         if custom:
             _asset_revisions.setdefault(custom.data.as_pointer(),0)
             _asset_revisions.setdefault(custom.as_pointer(),0)
-        mesh_signature=(custom.as_pointer(),custom.data.as_pointer(),_asset_revisions.get(custom.data.as_pointer(),0),_asset_revisions.get(custom.as_pointer(),0),tuple(v for row in custom.matrix_basis for v in row)) if custom else None
+        source_mesh_signature=(obj.as_pointer(),_asset_revisions.get(obj.as_pointer(),0),obj.data.as_pointer(),
+            _asset_revisions.get(obj.data.as_pointer(),0)) if obj.type=='MESH' else None
+        custom_signature=_mesh_evaluation_signature(custom,bpy.context.scene) if custom else None
+        mesh_signature=(custom_signature,source_mesh_signature)
         signature[obj.as_pointer()]=(tuple(obj.matrix_world[i][j] for i in range(4) for j in range(4)),tuple((k,tuple(obj[k]) if k.startswith('fxv_') else obj[k]) for k in obj.keys() if k.startswith(('fx_','fxv_','fxu_'))),mesh_signature,
-            tuple((s.name,s.image.as_pointer() if s.image else 0,s.linear,s.mipmaps,s.wrap,s.filter) for s in obj.eff_effect_textures),gradient_editor.signature(obj))
+            tuple((s.name,s.image.as_pointer() if s.image else 0,_asset_revisions.get(s.image.as_pointer(),0) if s.image else 0,s.linear,s.mipmaps,s.wrap,s.filter) for s in obj.eff_effect_textures),gradient_editor.signature(obj))
     signature['config']=(root.eff_effect.preview,root.eff_effect.show_shape,root['eff_effect_document'],
         root.eff_effect.owner.as_pointer() if root.eff_effect.owner else 0,root.eff_effect.bone,tuple(v for row in mount_matrix(root) for v in row),
         root.eff_effect.source_animation,root.eff_effect.preview_clip,root.eff_effect.clip_loop,root.eff_effect.vat_preview,root.eff_effect.preview_particles,root.eff_effect.trail_preview)
@@ -467,10 +577,18 @@ def author_signature(root):
     return signature
 
 
+def prime_signature(root):
+    """Record the state already represented by an import-time preview."""
+    key=root.as_pointer()
+    _signatures[key]=author_signature(root)
+    _pending_updates.pop(key,None)
+
+
 def curve_refreshed(root,nodes):
     """A curve refresh already covered these emitters, but no unrelated edits."""
     previous=_signatures.get(root.as_pointer())
     if previous is None:return
+    _pending_updates.pop(root.as_pointer(),None)
     current=author_signature(root)
     previous['config']=previous['config'][:2]+(current['config'][2],)+previous['config'][3:]
     for node in nodes:
@@ -480,23 +598,47 @@ def curve_refreshed(root,nodes):
 def live_update():
     if not _sync:return None
     if _busy or bpy.context.screen and bpy.context.screen.is_animation_playing:return POLL_INTERVAL
-    for root in list(bpy.context.scene.objects):
-        if not root.get('eff_effect_document'):continue
+    now=time.monotonic()
+    for key,(scheduled,requested_nodes) in list(_pending_updates.items()):
+        root=_effect_roots.get(key)
+        if not root:
+            _pending_updates.pop(key,None)
+            continue
+        if now-scheduled<PREVIEW_DEBOUNCE:continue
+        pending=(scheduled,requested_nodes)
         signature=author_signature(root)
-        key=root.as_pointer()
         previous=_signatures.get(key)
-        if previous==signature:continue
+        if previous==signature:
+            if pending is None or now-pending[0]<PREVIEW_DEBOUNCE:continue
+            del _pending_updates[key]
+            if pending[1] is None:continue
+            try:
+                refresh(root,_sync(root),pending[1])
+                if '预览错误' in root:del root['预览错误']
+            except Exception as error:root['预览错误']=str(error)
+            continue
         changed={k for k,v in signature.items() if previous is None or previous.get(k)!=v}
         # A resource or ancestor change can affect every emitter. Scalar edits
         # on an emitter only resimulate that emitter.
         if 'config' in changed or 'materials' in changed:changed=None
         elif any(o.as_pointer() in changed and (o==root or o.get('eff_effect_resource') or any(not c.get('eff_preview') for c in o.children)) for o in [root]+list(root.children_recursive)):changed=None
         _signatures[key]=signature
-        try:
-            refresh(root,_sync(root),changed)
-            if '预览错误' in root:del root['预览错误']
-        except Exception as error:root['预览错误']=str(error)
-    return POLL_INTERVAL
+        combined=changed
+        if pending is not None:
+            combined=None if pending[1] is None or changed is None else pending[1] | changed
+        _pending_updates.pop(key,None)
+        if previous is None:
+            _pending_updates.pop(key,None)
+            try:
+                refresh(root,_sync(root),None)
+                if '预览错误' in root:del root['预览错误']
+            except Exception as error:root['预览错误']=str(error)
+        else:
+            try:
+                refresh(root,_sync(root),combined)
+                if '预览错误' in root:del root['预览错误']
+            except Exception as error:root['预览错误']=str(error)
+    return POLL_INTERVAL if _pending_updates else None
 @bpy.app.handlers.persistent
 def frame(scene,*_):
     global _busy
@@ -515,10 +657,8 @@ def register(sync,root_of):
     _sync=sync;_root_of=root_of
     if frame not in bpy.app.handlers.frame_change_post:bpy.app.handlers.frame_change_post.append(frame)
     if asset_changed not in bpy.app.handlers.depsgraph_update_post:bpy.app.handlers.depsgraph_update_post.append(asset_changed)
-    if not bpy.app.timers.is_registered(live_update):bpy.app.timers.register(live_update,first_interval=POLL_INTERVAL,persistent=True)
-
 def clear_cache():
-    _history.clear();_templates.clear();_signatures.clear();_shapes.clear();_node_signatures.clear();_asset_revisions.clear()
+    _history.clear();_templates.clear();_author_mesh_templates.clear();_signatures.clear();_pending_updates.clear();_shapes.clear();_node_signatures.clear();_asset_revisions.clear();_asset_roots.clear();_root_assets.clear();_effect_roots.clear()
     playback.clear_cache()
 def unregister():
     global _sync,_root_of

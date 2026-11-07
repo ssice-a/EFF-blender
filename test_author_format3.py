@@ -21,6 +21,10 @@ if CORE_NAME not in sys.modules:
 author_format3 = importlib.import_module(CORE_NAME + ".author_format3")
 HEADER, MAGIC = author_format3.HEADER, author_format3.MAGIC
 read_format3_directory = author_format3.read_format3_directory
+bone_spec = importlib.util.spec_from_file_location(
+    "eiem_author_bone_codec_test", Path(__file__).with_name("eiem_bone_animation.py"))
+bone_codec = importlib.util.module_from_spec(bone_spec)
+bone_spec.loader.exec_module(bone_codec)
 
 
 def _effres(metadata, payload=b"P" * 64, kind=3):
@@ -186,6 +190,174 @@ class Format3PublicationTests(unittest.TestCase):
         self.assertEqual(validated["modId"], "DirectSmoke")
         self.assertIn("controls.effres", validated["_files"])
         self.assertIn("[ResourceControls]", (output / "mod.ini").read_text("utf-8"))
+
+    def test_meshes_share_and_select_distinct_author_skeletons(self):
+        output = self.root / "multi-skeleton"
+        output.mkdir()
+        skeletons = [
+            dict(id="weapon_a", data=bone_codec.encode_skeleton([
+                ("WeaponA", -1, (0, 0, 0), (0, 0, 0, 1), (1, 1, 1)),
+                ("WeaponA/FxAnchor", 0, (0, 0, 0), (0, 0, 0, 1), (1, 1, 1)),
+            ])),
+            dict(id="weapon_b", data=bone_codec.encode_skeleton([
+                ("WeaponB", -1, (0, 0, 0), (0, 0, 0, 1), (1, 1, 1)),
+            ])),
+        ]
+        clips = [
+            dict(id="weapon_a_spin", skeleton="weapon_a", data=bone_codec.encode_animation({
+                "id": "weapon_a_spin", "skeleton": "weapon_a", "duration": 1.0,
+                "sample_rate": 30, "loop": True,
+                "tracks": [{"path": "WeaponA/FxAnchor", "samples": [
+                    (0, 0, 0, 0, 0, 0, 1, 1, 1, 1),
+                    (0, 0, 0, 0, 0, 0.3826834, 0.9238795, 1, 1, 1),
+                ]}],
+            })),
+            dict(id="weapon_b_pulse", skeleton="weapon_b", data=bone_codec.encode_animation({
+                "id": "weapon_b_pulse", "skeleton": "weapon_b", "duration": 1.0,
+                "sample_rate": 30, "loop": True,
+                "tracks": [{"path": "WeaponB", "samples": [
+                    (0, 0, 0, 0, 0, 0, 1, 1, 1, 1),
+                    (0, 0.1, 0, 0, 0, 0, 1, 1, 1, 1),
+                ]}],
+            })),
+        ]
+        parts = [
+            dict(partId=name, object=name, skeleton=skeleton_id,
+                 visibilityExpression=("number", 1.0, "", None, None))
+            for name, skeleton_id in (("Blade", "weapon_a"),
+                                      ("Guard", "weapon_a"),
+                                      ("Staff", "weapon_b"))
+        ]
+        author_format3.write_format3_directory(
+            output, "MultiSkeleton", parts, {}, [], [], [], [], [],
+            skeletons=skeletons, bone_animations=clips)
+        (output / "meshes").mkdir()
+        for name in ("Blade", "Guard", "Staff"):
+            (output / "meshes" / ("Part" + name + ".effres")).write_bytes(
+                author_format3.encode_resource_file(1, b"mesh metadata", b"mesh"))
+
+        manifest = (output / "mod.ini").read_text("utf-8")
+        self.assertIn("skeleton=weapon_a", manifest)
+        self.assertIn("skeleton=weapon_b", manifest)
+        self.assertIn("[ShapeAnimationweapon_a_spin]", manifest)
+        self.assertIn("[ShapeAnimationweapon_b_pulse]", manifest)
+        self.assertNotIn("[BoneAnimation", manifest)
+        self.assertEqual(read_format3_directory(output)["format"], 3)
+
+    def test_unanimated_author_skeleton_can_be_referenced_by_mesh(self):
+        output = self.root / "unanimated-skeleton"
+        output.mkdir()
+        skeleton = dict(id="weapon_rig", data=bone_codec.encode_skeleton([
+            ("WeaponRoot", -1, (0, 0, 0), (0, 0, 0, 1), (1, 1, 1)),
+            ("WeaponRoot/FxAnchor", 0, (0, 0, 0), (0, 0, 0, 1), (1, 1, 1)),
+        ]))
+        part = dict(partId="Blade", object="Blade", skeleton="weapon_rig",
+            bonePaths=["WeaponRoot/FxAnchor"],
+            visibilityExpression=("number", 1.0, "", None, None))
+        author_format3.write_format3_directory(
+            output, "UnanimatedSkeleton", [part], {}, [], [], [], [], [],
+            skeletons=[skeleton])
+        mesh_path = output / "meshes" / "PartBlade.effres"
+        mesh_path.parent.mkdir(parents=True, exist_ok=True)
+        mesh_path.write_bytes(author_format3.encode_resource_file(
+            1, b"mesh metadata", b"mesh"))
+
+        manifest = (output / "mod.ini").read_text("utf-8")
+        self.assertIn("[Skeletonweapon_rig]", manifest)
+        self.assertIn("skeleton=weapon_rig", manifest)
+        self.assertNotIn("[ShapeAnimation", manifest)
+        self.assertEqual(read_format3_directory(output)["format"], 3)
+
+    def test_shape_and_bone_tracks_share_one_animation_clip_and_timeline(self):
+        output = self.root / "mixed-animation"
+        output.mkdir()
+        skeleton = dict(id="weapon_rig", data=bone_codec.encode_skeleton([
+            ("WeaponRoot", -1, (0, 0, 0), (0, 0, 0, 1), (1, 1, 1)),
+        ]))
+        samples = [(0, 0, 0, 0, 0, 0, 1, 1, 1, 1)] * 3
+        bone_clip = dict(id="shared_swing", skeleton="weapon_rig", speed=1.0,
+            sample_rate=2,
+            key="F6", autoplay=False, data=bone_codec.encode_animation({
+                "id": "shared_swing", "skeleton": "weapon_rig", "duration": 1.0,
+                "sample_rate": 2, "loop": True,
+                "tracks": [{"path": "WeaponRoot", "samples": samples}],
+            }))
+        part = dict(partId="Blade", object="Blade", skeleton="weapon_rig",
+            visibilityBindings=[],
+            visibilityExpression=("number", 1.0, "", None, None),
+            shapeControls=[dict(enabled=True, identity="smile", shape="Smile",
+                variable="$smile", label="Smile", default=0.0, minimum=0.0,
+                maximum=1.0, hotkey_increase="", hotkey_decrease="",
+                hotkey_speed=1.0)],
+            shapeAnimations=[dict(id="shared_swing", label="Swing", key="F6",
+                duration=1.0, speed=1.0, loop=True, autoplay=False, sample_rate=2,
+                channels={"Smile": [0.0, 1.0, 0.0]})])
+        author_format3.write_format3_directory(
+            output, "MixedAnimation", [part], {}, [], [], [], [], [],
+            skeletons=[skeleton], bone_animations=[bone_clip])
+        manifest = (output / "mod.ini").read_text("utf-8")
+        self.assertIn("[ShapeAnimationshared_swing]", manifest)
+        self.assertNotIn("[BoneAnimationshared_swing]", manifest)
+
+        invalid = dict(bone_clip, data=bone_codec.encode_animation({
+            "id": "shared_swing", "skeleton": "weapon_rig", "duration": 1.0,
+            "sample_rate": 2, "loop": True,
+            "tracks": [{"path": "WeaponRoot", "samples": samples[:2]}],
+        }))
+        with self.assertRaisesRegex(ValueError, "share one sample timeline"):
+            author_format3._controls_resource(
+                "MixedAnimation", [part], [], [], [], bone_animations=[invalid])
+
+        invalid_rate = dict(bone_clip, data=bone_codec.encode_animation({
+            "id": "shared_swing", "skeleton": "weapon_rig", "duration": 1.0,
+            "sample_rate": 3, "loop": True,
+            "tracks": [{"path": "WeaponRoot", "samples": samples}],
+        }))
+        with self.assertRaisesRegex(ValueError, "share one sample rate"):
+            author_format3._controls_resource(
+                "MixedAnimation", [part], [], [], [], bone_animations=[invalid_rate])
+
+        second_skeleton = dict(id="shield_rig", data=bone_codec.encode_skeleton([
+            ("ShieldRoot", -1, (0, 0, 0), (0, 0, 0, 1), (1, 1, 1)),
+        ]))
+        second_clip = dict(bone_clip, skeleton="shield_rig", data=bone_codec.encode_animation({
+            "id": "shared_swing", "skeleton": "shield_rig", "duration": 1.0,
+            "sample_rate": 2, "loop": True,
+            "tracks": [{"path": "ShieldRoot", "samples": samples}],
+        }))
+        merged, _ = author_format3._controls_resource(
+            "MixedAnimation", [part], [], [], [],
+            bone_animations=[bone_clip, second_clip])
+        self.assertTrue(merged)
+
+    def test_part_can_inherit_a_runtime_renderer_material_slot(self):
+        output = self.root / "inherited-material"
+        output.mkdir()
+        part = dict(partId="Body", object="Body", materialSlot=2,
+                    vertices=3, indices=3, bonePaths=[], shapeNames=[],
+                    authorData=b"editable mesh",
+                    visibilityExpression=("number", 1.0, "", None, None))
+        rules = [
+            dict(hidden=False, parts=["Body"], targets=[dict(
+                level=0, sourcePath="assets/game/body.mesh", sourceAsset="Body")]),
+            dict(hidden=False, parts=["Body"], targets=[dict(
+                level=0, sourcePath="assets/alternate/body.mesh", sourceAsset="Body")]),
+        ]
+        written = author_format3.write_format3_directory(
+            output, "InheritedMaterial", [part], {}, [], rules, [], [], [])
+        mesh = output / "meshes" / "PartBody.effres"
+        mesh.parent.mkdir(parents=True, exist_ok=True)
+        mesh.write_bytes(author_format3.encode_resource_file(1, b"mesh metadata", b"mesh"))
+        manifest = (output / "mod.ini").read_text("utf-8")
+        self.assertIn("material_slot=2", manifest)
+        self.assertNotIn("material=", manifest)
+        replace_sections = [name for name in written["_ini"] if name.startswith("Replace")]
+        self.assertEqual(len(replace_sections), 2)
+        self.assertEqual({written["_ini"][name]["target.path"] for name in replace_sections},
+                         {"assets/game/body.mesh", "assets/alternate/body.mesh"})
+        self.assertTrue(all(written["_ini"][name]["parts"] == "PartBody"
+                            for name in replace_sections))
+        read_format3_directory(output)
 
     def test_effect_attachment_uses_declared_format3_part_id(self):
         source_part = "PartS_actor_wulfa_cloth_01_lod0_1.___8c6702d24e8fe635"

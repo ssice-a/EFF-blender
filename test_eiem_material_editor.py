@@ -22,6 +22,9 @@ mat['eiem_texture_scale._HighlightMap']='1,1'
 mat['eiem_texture_offset._HighlightMap']='0,0'
 mat['eiem_texture_scale._EmissionMap']='1,1'
 
+queue_mat=bpy.data.materials.new('Default Queue Editor Test')
+queue_mat['eiem_source']='assets/test.mat'
+
 class Layout:
     def __init__(self,fields,labels=None):
         self.fields=fields
@@ -37,6 +40,30 @@ class Layout:
     def operator(self,*args,**kwargs):return type('Operation',(),{})()
 
 try:
+    editor._prepare_material(queue_mat)
+    queue_row=queue_mat.eiem_editor_values['eiem_render_queue']
+    assert queue_row.render_queue==2000, 'an absent native queue must display its actual opaque queue'
+    fields=[];editor.draw(Layout(fields),queue_mat)
+    assert ('eiem_render_queue','render_queue') in fields, 'queue control must be visible in raw material view'
+    assert 'eiem_render_queue' not in queue_mat, 'displaying the default must not author a queue override'
+    queue_mat['eiem_shader']='HGRP/CharacterNPR'
+    editor._prepare_material(queue_mat)
+    fields=[];editor.draw(Layout(fields),queue_mat)
+    assert ('eiem_render_queue','render_queue') in fields, 'queue control must be visible in CharacterNPR view'
+    queue_property=editor.EFF_PG_material_value.bl_rna.properties['render_queue']
+    assert (queue_property.hard_min,queue_property.hard_max)==(0,5000)
+    assert 'eiem_render_queue' not in queue_mat, 'profile setup must not author a queue override'
+    payload,_=package.eiem_blender_addon.material_override_payload(queue_mat,{},force=True)
+    assert 'render_queue=2000' in payload, 'default queue was not serialized as an actual value'
+    queue_mat['eiem_float._SurfaceType']='1'
+    queue_mat['eiem_float._BlendMode']='4'
+    payload,_=package.eiem_blender_addon.material_override_payload(queue_mat,{},force=True)
+    assert 'render_queue=3000' in payload, 'transparent default queue was not inferred'
+    del queue_mat['eiem_float._SurfaceType'];del queue_mat['eiem_float._BlendMode']
+    queue_row.render_queue=2001
+    payload,_=package.eiem_blender_addon.material_override_payload(queue_mat,{},force=True)
+    assert 'render_queue=2001' in payload, 'queue control did not reach the native export payload'
+
     before = (set(mat.keys()), len(mat.eiem_editor_values), len(mat.eiem_editor_groups))
     editor.draw(Layout([]), mat)
     after = (set(mat.keys()), len(mat.eiem_editor_values), len(mat.eiem_editor_groups))
@@ -54,7 +81,7 @@ try:
     assert ('eiem_float._EmissionBrightness','scalar') in fields
     color=editor._row(mat,'eiem_value4._EmissionColor');assert color.color[0]==4, 'HDR color was clamped'
     color.color=(3,0.4,0.2,1);assert float(mat['eiem_value4._EmissionColor'].split(',')[0])==3
-    queue=editor._row(mat,'eiem_render_queue');queue.integer=2999;assert mat['eiem_render_queue']=='2999'
+    queue=editor._row(mat,'eiem_render_queue');queue.render_queue=2999;assert mat['eiem_render_queue']=='2999'
     # New imported fields must initialise without writing during draw, even
     # when the corresponding category/texture transform has never been opened.
     extra = {
@@ -178,6 +205,7 @@ try:
     finally:
         bpy.data.materials.remove(effect)
 finally:
+    bpy.data.materials.remove(queue_mat)
     bpy.data.materials.remove(mat)
     package.unregister()
 print('PASS material editor: read-only draw, deferred schema initialisation, reopen all groups, left labels, typed values, HDR, portable payload')

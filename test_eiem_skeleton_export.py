@@ -62,6 +62,21 @@ rig.data['eiem_source_bone_candidates_json']=json.dumps({
 records=addon.skeleton_author_nodes(rig)
 assert [source for b,r,source in records]==[True,True,True,False,False]
 assert [r[0] for b,r,s in records][-2:]==['Rig/Extra','Rig/Extra/Tip']
+
+# A weapon can own a complete skeleton with an authored root; it does not need
+# a source-game root bone to satisfy the Mesh/Skeleton contract.
+weapon_data=bpy.data.armatures.new('WeaponAuthorRigData')
+weapon=bpy.data.objects.new('WeaponAuthorRig',weapon_data);bpy.context.scene.collection.objects.link(weapon)
+bpy.context.view_layer.objects.active=weapon;weapon.select_set(True);bpy.ops.object.mode_set(mode='EDIT')
+weapon_root=weapon_data.edit_bones.new('WeaponRoot');weapon_root.head=(0,0,0);weapon_root.tail=(0,0,1)
+anchor=weapon_data.edit_bones.new('FxAnchor');anchor.head=(0,0,1);anchor.tail=(0,0,1.2);anchor.parent=weapon_root
+bpy.ops.object.mode_set(mode='OBJECT')
+weapon_records=addon.skeleton_author_nodes(weapon)
+assert [source for bone,record,source in weapon_records]==[False,False]
+weapon_nodes=[(record[0],record[1],record[2],record[3],record[4])
+              for bone,record,source in weapon_records]
+weapon_payload=addon.bone_animation.encode_skeleton(weapon_nodes)
+assert [node[0] for node in addon.bone_animation.decode_skeleton(weapon_payload)['nodes']]==['WeaponRoot','WeaponRoot/FxAnchor']
 native_world=[]; basis=addon.unity_transform_matrix_to_blender_basis()
 for bone,r,source in records:
     world=matrix(r) if r[1]<0 else native_world[r[1]]@matrix(r)

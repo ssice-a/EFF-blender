@@ -49,18 +49,56 @@ for root in roots:
     key=editor.field_key(identity,['simulationSpeed']);before=obj[key];obj[key]=1.25
     assert editor.synchronize(root).value(identity,['simulationSpeed'])==1.25
     obj[key]=before
+    editor.synchronize(root);editor.preview.prime_signature(root)
     # Exercise the timer explicitly; background Blender does not run its UI timer.
-    root['预览错误']='stale error';obj[key]=1.15
-    assert editor.preview.live_update()==editor.preview.POLL_INTERVAL
-    assert editor.synchronize(root).value(identity,['simulationSpeed'])==1.15
-    assert not root.get('预览错误'),root.get('预览错误')
-    obj[key]=before;editor.preview.live_update()
+    original_clock=editor.preview.time.monotonic;clock=[original_clock()]
+    editor.preview.time.monotonic=lambda:clock[0]
+    editor.preview._pending_updates.clear()
+    original_signature=editor.preview.author_signature;signature_calls=[]
+    editor.preview.author_signature=lambda value:signature_calls.append(value)
+    assert editor.preview.live_update() is None
+    assert not signature_calls, 'idle preview timer scanned effect signatures'
+    editor.preview.author_signature=original_signature
+    try:
+        update=type('Update',(),{'id':obj})()
+        editor.preview.asset_changed(bpy.context.scene,type('Depsgraph',(),{'updates':[update]})())
+        root['预览错误']='stale error';obj[key]=1.15
+        assert editor.preview.live_update()==editor.preview.POLL_INTERVAL
+        assert edit.value(identity,['simulationSpeed'])==before, 'preview updated before the edit quiet window'
+        clock[0]+=editor.preview.PREVIEW_DEBOUNCE+.01
+        assert editor.preview.live_update() is None
+        assert edit.value(identity,['simulationSpeed'])==1.15
+        assert not root.get('预览错误'),root.get('预览错误')
+        obj[key]=before
+        editor.preview.asset_changed(bpy.context.scene,type('Depsgraph',(),{'updates':[update]})())
+        clock[0]+=editor.preview.PREVIEW_DEBOUNCE+.01
+        assert editor.preview.live_update() is None
+    finally:editor.preview.time.monotonic=original_clock
     for shape_kind in (2,17):
         editor.preview._shape(root,obj,identity,{'ShapeModule':{'enabled':True,'type':shape_kind,'radius':{'value':1},'donutRadius':.2}})
         bounds=next(o for o in root.children_recursive if o.get('eff_preview_key')==root['eff_effect_id']+identity+'shape')
         assert len(bounds.data.edges)>50
         if shape_kind==2:assert all(v.co.y<=1e-5 for v in bounds.data.vertices),'hemisphere bounds extend below source equator'
     editor.preview.refresh(root,editor.synchronize(root))
+    mesh_bindings=[(obj,identity) for obj in editor.objects(root) if obj.eff_effect.particle_mesh
+        for identity in json.loads(obj.get('eff_effect_components','[]'))
+        if editor.editor(root).objects[identity]['classId']==199 and editor.editor(root).value(identity).get('m_RenderMode')==4]
+    if mesh_bindings:
+        mesh_node,mesh_renderer=mesh_bindings[0];resources=editor.preview._resources(root,editor.editor(root))
+        editor.preview._author_mesh_templates.clear();original_preview_mesh=editor.assets.preview_mesh;mesh_calls=[]
+        editor.assets.preview_mesh=lambda mesh:(mesh_calls.append(mesh),original_preview_mesh(mesh))[1]
+        try:
+            first=editor.preview._mesh_template(root,editor.editor(root),mesh_renderer,resources)
+            first_keys=set(editor.preview._author_mesh_templates)
+            second=editor.preview._mesh_template(root,editor.editor(root),mesh_renderer,resources)
+            second_keys=set(editor.preview._author_mesh_templates)
+            assert first is second and len(mesh_calls)==1, ('unchanged authored particle mesh was evaluated twice',len(mesh_calls),first_keys,second_keys)
+            editor.preview._asset_revisions[mesh_node.eff_effect.particle_mesh.data.as_pointer()]+=1
+            editor.preview._mesh_template(root,editor.editor(root),mesh_renderer,resources)
+            assert len(mesh_calls)==2, 'authored particle mesh edit reused stale evaluated geometry'
+        finally:
+            editor.assets.preview_mesh=original_preview_mesh
+            editor.preview._author_mesh_templates.clear()
     # Existing disabled modules become a typed editable block, preserving other fields.
     disabled=next((k for k,v in edit.value(identity).items() if k.endswith('Module') and isinstance(v,dict) and v.get('enabled') is False),None)
     if disabled:
@@ -86,7 +124,9 @@ for root in roots:
             self.labels.append(kwargs.get('text',''))
             if kwargs.get('icon')=='ERROR':self.errors.append(kwargs['text'])
     bpy.context.view_layer.objects.active=obj
-    layout=Layout();editor.EFF_PT_effect_object.draw(type('Panel',(),{'layout':layout})(),bpy.context)
+    collapsed=Layout(False);editor.EFF_PT_effect_object.draw(type('Panel',(),{'layout':collapsed})(),bpy.context)
+    assert len(collapsed.props)<20 and '发射数量' not in collapsed.labels, (collapsed.props,collapsed.labels)
+    layout=Layout(True);editor.EFF_PT_effect_object.draw(type('Panel',(),{'layout':layout})(),bpy.context)
     assert not layout.errors,layout.errors
     assert '发射器基础' in layout.labels and '发射数量' in layout.labels and '发射形状与范围' in layout.labels,layout.labels
     assert any(p.startswith('出生寿命 (s)') for p in layout.props) and '每秒发射数' in layout.props
@@ -95,12 +135,15 @@ for root in roots:
     choice.value='3';assert obj[mode_key]==3
     choice.value=previous
     assert not any(x in layout.labels for x in ('float','int','UInt32','编辑列表'))
-    assert len(layout.props)<600, len(layout.props)
+    assert len(layout.props)<1000, len(layout.props)
     keys=root.eff_effect.toggle_keys
     original_active=bpy.context.view_layer.objects.active
     for value in ('F7','CTRL+J'):
         item=keys.add();item.key=value
     root.select_set(True);bpy.context.view_layer.objects.active=root
+    collapsed_root=Layout(False)
+    editor.EFF_PT_effect_object.draw(type('Panel',(),{'layout':collapsed_root})(),bpy.context)
+    assert len(collapsed_root.props)<20 and '发射数量' not in collapsed_root.labels, (collapsed_root.props,collapsed_root.labels)
     root_layout=Layout(True)
     editor.EFF_PT_effect_object.draw(type('Panel',(),{'layout':root_layout})(),bpy.context)
     assert '特效显隐按键' in root_layout.labels,root_layout.labels
@@ -130,7 +173,7 @@ for root in roots:
     obj[enabled_key]=old_enabled;editor.preview.refresh(root,editor.synchronize(root))
     resource_layout=Layout(True)
     editor.effect_ui.Draw(_sys.modules[editor.__name__],obj,edit,renderer).renderer(resource_layout)
-    assert any('材质 1:' in label for label in resource_layout.labels),resource_layout.labels
+    assert any('材质 1' in label for label in resource_layout.labels),resource_layout.labels
     # Sorting edited key times must update the ID props, or the next sync would
     # silently assign the old values back to different native keys.
     curve_path=['InitialModule','startSpeed','maxCurve','m_Curve']

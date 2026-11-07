@@ -47,6 +47,30 @@ def pointer_type_matches(expected, actual):
         expected == 'Texture' and actual in {'Texture2D', 'Cubemap', 'Texture3D', 'Texture2DArray', 'CubemapArray'})
 
 
+def resolve_logical_asset(objects, expected, path, asset=''):
+    """Resolve an exact game asset identity inside this effect's source graph."""
+    require(isinstance(path, str) and path.strip(), '游戏逻辑路径不能为空')
+    normalized = path.strip().replace('\\', '/').casefold()
+    asset = asset.strip().casefold() if isinstance(asset, str) else ''
+    path_matches = {}
+    for spec in objects:
+        for row in spec.get('logicalPaths') or []:
+            candidate_path = str(row.get('path', '')).replace('\\', '/').casefold()
+            candidate_asset = str(row.get('name', '')).casefold()
+            if candidate_path == normalized:
+                path_matches[spec['identity']] = (spec, candidate_asset)
+    require(path_matches, '当前 .efffx 来源依赖图中未包含此游戏资源，现有构建器不能新增跨 Bundle 依赖：' + path)
+    matches = {identity: spec for identity, (spec, candidate_asset) in path_matches.items()
+               if not asset or candidate_asset == asset}
+    require(matches, '逻辑路径存在，但没有匹配的资产名：' + path + ((' / ' + asset) if asset else ''))
+    typed = {identity: spec for identity, spec in matches.items()
+             if pointer_type_matches(expected, spec.get('type', ''))}
+    require(typed, '逻辑路径与资产名存在，但目标类型不兼容 PPtr<' + expected + '>：' + path)
+    matches = typed
+    require(len(matches) == 1, '逻辑路径与资产名匹配到多个来源对象，请检查资产名：' + path)
+    return next(iter(matches.values()))
+
+
 def dumps(value):
     return json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
 
@@ -119,6 +143,24 @@ def load_source(directory):
                     sourceManifestSha256=digest(baseline), sourceEffectSha256=digest(raw),
                     catalog=catalog, schemas=schemas, values=values,
                     original=copy.deepcopy(values), hashes=hashes)
+
+
+def load_edit(path):
+    """Read a Blender/AnimeStudio edit document without applying it."""
+    path = Path(path).resolve()
+    try:
+        value = json.loads(path.read_text('utf-8-sig'))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError('特效编辑文档无法读取') from error
+    require(value.get('format') == 'EFF_EFFECT_EDIT' and value.get('version') == 1,
+            '特效编辑文档格式或版本不受支持')
+    require(isinstance(value.get('objects'), list) and
+            all(isinstance(row, dict) for row in value['objects']),
+            '特效编辑文档缺少对象编辑列表')
+    source = Path(value.get('source', '')).resolve()
+    require(source.is_dir(), '特效编辑文档的 .efffx 来源不存在：' + str(source))
+    value['_document_path'] = str(path)
+    return value
 
 
 class Editor:
@@ -247,6 +289,13 @@ class Editor:
             file_id = ids.pop()
         current.update(m_FileID=file_id, m_PathID=obj['native']['pathId'])
 
+    def set_pointer_by_logical(self, identity, path, logical_path, asset=''):
+        kind = self.schema(identity, path)['type']
+        require(kind.startswith('PPtr<'), '不是资源引用')
+        target = resolve_logical_asset(self.objects.values(), kind[5:-1], logical_path, asset)
+        self.set_pointer(identity, path, target['identity'])
+        return target
+
     def array_change(self, identity, path, operation, index=0):
         require(self.editable(identity, path), '此列表是只读结构信息')
         items = self.value(identity, path)
@@ -313,6 +362,37 @@ class Editor:
         operations = topology.export(self)
         if operations:result['emitters'] = operations
         return result
+
+
+def apply_edit(state, edit):
+    """Apply a validated native edit document to a loaded source workspace.
+
+    Author asset additions and emitter topology are intentionally rejected
+    until their cross-file materialization path exists; silently dropping
+    either would make a round trip appear successful while changing output.
+    """
+    require(edit.get('sourceManifestSha256', '').upper() ==
+            state.get('sourceManifestSha256', '').upper(), '特效来源 manifest 摘要不一致')
+    require(edit.get('sourceEffectSha256', '').upper() ==
+            state.get('sourceEffectSha256', '').upper(), '特效来源 effect 摘要不一致')
+    require(not edit.get('assets'), '当前导入入口不能恢复作者 Mesh/Material/Texture additions')
+    require(not edit.get('emitters'), '当前导入入口不能恢复发射器拓扑操作；请导入 Format 3 作者资源')
+    editor = Editor(state)
+    seen = set()
+    for row in edit.get('objects', []):
+        identity = row.get('identity')
+        require(identity and identity not in seen, '特效编辑文档包含重复对象')
+        seen.add(identity)
+        require(identity in editor.objects and identity in state['values'],
+                '特效编辑对象不在当前来源中：' + str(identity))
+        require(row.get('sourceDataSha256', '').upper() ==
+                state['hashes'].get(identity, '').upper(),
+                '特效编辑对象来源摘要不一致：' + str(identity))
+        require(editor.objects[identity].get('classId') in EDITABLE,
+                '特效编辑对象不可写：' + str(identity))
+        require(isinstance(row.get('data'), dict), '特效编辑对象数据不是对象：' + str(identity))
+        state['values'][identity] = copy.deepcopy(row['data'])
+    return state
 
 
 def write_edits(state, path):

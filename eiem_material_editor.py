@@ -127,6 +127,14 @@ def _put(row, value):
 
 
 def _number(row, integer=False):
+    if row.key == 'eiem_render_queue':
+        try:
+            value = int(float(_get(row)))
+            if 0 <= value <= 5000:
+                return value
+        except (TypeError, ValueError, OverflowError):
+            pass
+        return features.actual_render_queue(row.id_data)
     try:
         value = float(_get(row))
         return int(value) if integer else value
@@ -184,6 +192,9 @@ class EFF_PG_material_value(bpy.types.PropertyGroup):
     key: StringProperty()
     boolean: BoolProperty(get=lambda s: enabled(_get(s)), set=lambda s,v: _put(s, '1' if v else '0'))
     integer: IntProperty(get=lambda s: _number(s, True), set=lambda s,v: _put(s, str(v)))
+    render_queue: IntProperty(min=0, max=5000,
+                              description='对应 Unity 材质的实际 m_CustomRenderQueue',
+                              get=lambda s: _number(s, True), set=lambda s,v: _put(s, str(v)))
     scalar: FloatProperty(precision=4, get=lambda s: _number(s), set=lambda s,v: _put(s, format(v, '.9g')))
     vector2: FloatVectorProperty(size=2, precision=4, get=lambda s: _vector(s,2), set=_set_vector)
     vector4: FloatVectorProperty(size=4, precision=4, get=lambda s: _vector(s,4), set=_set_vector)
@@ -222,6 +233,7 @@ def _schema(material):
     keys = [key for key in material.keys()
             if key.startswith(_PARAMETER_PREFIXES + _TEXTURE_PREFIXES)
             or key == 'eiem_render_queue' or key in _INFO_KEYS]
+    keys = list(dict.fromkeys(keys + ['eiem_render_queue']))
     # Empty slots already declared by the source get a UI row, without adding
     # a native texture override or any material data from Panel.draw.
     keys = list(dict.fromkeys(keys + ['eiem_texture.' + slot for slot in texture_slots(material)]))
@@ -293,9 +305,11 @@ def _value_layout(layout, label):
 
 def draw_value(layout, material, key, simple=False):
     row = material.eiem_editor_values.get(key)
-    kind = property_kind(key, material[key])
+    kind = property_kind(key, material.get(key, '-1' if key == 'eiem_render_queue' else ''))
     field = {'BOOL':'boolean','INT':'integer','FLOAT':'scalar','VECTOR2':'vector2',
              'VECTOR4':'vector4','COLOR':'color','TEXT':'text'}[kind]
+    if key == 'eiem_render_queue':
+        field = 'render_queue'
     name = features.property_name(key)
     if simple and name in _CHOICES:
         field = 'choice'
@@ -377,8 +391,7 @@ def _draw_raw(layout, material):
     texture_box.operator('eiem.material_texture_add', icon='ADD').material_name = material.name
     groups = {group:[] for group,_ in GROUPS}
     for key in material.keys():
-        if (key.startswith(_PARAMETER_PREFIXES)
-            or key == 'eiem_render_queue'):
+        if key.startswith(_PARAMETER_PREFIXES):
             if not query or query in key.lower():
                 groups[group_for(key)].append(key)
     for group, label in GROUPS:
@@ -549,9 +562,15 @@ def _draw_remaining(layout, material, ownership):
             key = 'eiem_float.' + name
             if key in material and key not in remaining and _matches(material, key):
                 draw_value(box, material, key, True)
-        for key in ('eiem_render_queue', 'eiem_tag.RenderType'):
+        for key in ('eiem_tag.RenderType',):
             if key in material and key not in remaining:
                 draw_value(box, material, key, True)
+
+
+def _draw_render_queue(layout, material):
+    if _matches(material, 'eiem_render_queue'):
+        box = layout.box()
+        draw_value(box, material, 'eiem_render_queue', True)
 
 
 def draw(layout, material):
@@ -563,6 +582,7 @@ def draw(layout, material):
     header = layout.row(align=True)
     header.prop(material, 'eiem_editor_search', text='', icon='VIEWZOOM')
     header.prop(material, 'eiem_editor_advanced', text='原始参数', toggle=True)
+    _draw_render_queue(layout, material)
     if material.eiem_editor_advanced or not features.profile(material):
         if not features.profile(material):
             layout.label(text='此 Shader 使用原始参数编辑，保留来源功能')

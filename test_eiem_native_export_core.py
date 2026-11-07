@@ -260,6 +260,26 @@ class NativeExportCoreTests(unittest.TestCase):
         self.assertEqual(meshes[0]['path'], 'meshes/PartBody.effres')
         self.assertEqual(meshes[0]['targetAsset'], 'Body')
 
+    def test_typed_format3_records_allow_mesh_only_parts(self):
+        class Format3:
+            @staticmethod
+            def part_resource_id(value): return 'Part' + value.removeprefix('Mesh')
+            @staticmethod
+            def identifier(value): return value
+
+        class Source:
+            @staticmethod
+            def resolve(kind, path, asset):
+                return {'native': {'typeHash': 'TYPE-A'}}
+
+        part = dict(partId='MeshBody', nativeTypeHash='TYPE-A', vertices=3,
+                    indices=3, bonePaths=[], shapeNames=[], fieldData={},
+                    authorData=b'editable mesh')
+        rules = [dict(hidden=False, parts=['MeshBody'], targets=[dict(
+            sourcePath='assets/body.mesh', sourceAsset='Body')])]
+        meshes, _ = exporter.format3_native_records(Format3, Source(), [part], [], rules)
+        self.assertEqual(meshes[0]['material'], '')
+
     def test_dds_author_image_is_not_compressed_and_is_registered_for_passthrough(self):
         payload = bytes(range(16))
         raw_dds = dds_bc7(4, 4, payload)
@@ -624,12 +644,22 @@ class NativeExportCoreTests(unittest.TestCase):
     def test_material_render_queue_flows_from_blender_override(self):
         namespace = dict(json=json, parse_json_property=lambda material, key, default:
                          json.loads(material.get(key, json.dumps(default))))
+        namespace['material_editor'] = SimpleNamespace(features=SimpleNamespace(
+            actual_render_queue=lambda material, baseline: int(material.get('eiem_render_queue', 2000))))
         payload = addon_function('material_override_payload', namespace)
         material = Material('Inner', dict(eiem_source='assets/source.mat',
                             eiem_baseline_json=json.dumps({'source': 'assets/source.mat'}),
                             eiem_render_queue=2999))
         values, images = payload(material, {}, force=True)
         self.assertIn('render_queue=2999', values)
+        self.assertEqual(images, set())
+        unchanged = Material('Inherited', dict(eiem_source='assets/source.mat',
+            eiem_baseline_json=json.dumps({'source': 'assets/source.mat',
+                                            'float._Gloss': '.4', 'render_queue': 2999}),
+            eiem_render_queue=2999))
+        unchanged['eiem_float._Gloss'] = '.4'
+        values, images = payload(unchanged, {}, force=False)
+        self.assertIsNone(values)
         self.assertEqual(images, set())
 
     def test_native_texture_template_allows_two_material_variants(self):
@@ -743,6 +773,16 @@ class NativeExportCoreTests(unittest.TestCase):
             record = exporter.collect_material(addon, source, material, {}, {}, folder,
                                                None, texture_only=True)
         self.assertEqual(record["authorData"], ("\n".join(values) + "\n").encode("utf-8"))
+
+    def test_collect_material_omits_unchanged_inherited_source(self):
+        addon = SimpleNamespace(material_override_payload=lambda *args, **kwargs: (None, set()))
+        source = SimpleNamespace(resolve=lambda *args: self.fail(
+            "an inherited source Material must not be cloned"))
+        material = Material("MaterialBody", dict(eiem_source="assets/game/body.mat"))
+        with tempfile.TemporaryDirectory() as folder:
+            record = exporter.collect_material(addon, source, material, {}, {}, folder,
+                                               None, force=False)
+        self.assertIsNone(record)
 
     def test_format3_collect_material_skips_native_material_snapshot(self):
         values = ["format=EFFMAT", "version=1", "overrides=true",
@@ -974,6 +1014,28 @@ class NativeExportCoreTests(unittest.TestCase):
             cache = {}
             self.assertIs(exporter.material_source(primary, material, cache), primary)
             self.assertEqual(cache, {})
+
+    def test_export_material_sources_are_validated_before_publication(self):
+        calls = []
+
+        class Source:
+            package = Path('/sources/main')
+
+            def resolve(self, kind, path, asset):
+                calls.append((kind, path, asset))
+                if asset != 'ExistingMaterial':
+                    raise ValueError('missing source')
+                return object()
+
+        valid = Material('Material', dict(eiem_source='assets/game/material.mat',
+                                          eiem_name='ExistingMaterial'))
+        exporter.validate_export_material_sources(Source(), [valid], {})
+        self.assertEqual(calls, [('Material', 'assets/game/material.mat', 'ExistingMaterial')])
+
+        invalid = Material('Material', dict(eiem_source='assets/game/missing.mat',
+                                            eiem_name='MissingMaterial'))
+        with self.assertRaisesRegex(ValueError, 'complete Prefab EFFSOURCE'):
+            exporter.validate_export_material_sources(Source(), [invalid], {})
 
     def test_shared_texture_conversion_reuses_pixels_and_preserves_conflicts(self):
         from PIL import Image

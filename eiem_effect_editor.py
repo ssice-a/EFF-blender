@@ -25,6 +25,7 @@ if __package__:
     from . import eiem_effect_curve_editor as curve_editor
     from . import eiem_effect_gradient_editor as gradient_editor
     from . import eiem_effect_publish as effect_publish
+    from . import eiem_effect_clipboard as block_clipboard
 else:
     import eiem_blender_controls as switch_controls
     import eiem_effect_document as document
@@ -36,6 +37,7 @@ else:
     import eiem_effect_curve_editor as curve_editor
     import eiem_effect_gradient_editor as gradient_editor
     import eiem_effect_publish as effect_publish
+    import eiem_effect_clipboard as block_clipboard
 _CACHE={}
 _BUILD_RUNNING=False
 _EXPORT_JOB=None
@@ -250,7 +252,7 @@ def refresh_fields(root):
 def import_source(context,source,preserve_source=False):
     return import_workspace(context, document.load_source(source),preserve_source=preserve_source)
 
-def import_workspace(context,state,preserve_source=False):
+def import_workspace(context,state,preserve_source=False,effect_id=None):
     edit=document.Editor(state)
     # The visible particle module is authoritative for a newly authored effect.
     # The original source and other components are preserved. Advanced users
@@ -261,7 +263,10 @@ def import_workspace(context,state,preserve_source=False):
     for node in state['catalog']['hierarchy']:
         obj=bpy.data.objects.new(node['name'] or 'unknown',None);obj.empty_display_type='PLAIN_AXES';obj.empty_display_size=.15
         collection.objects.link(obj);obj['eff_effect_node']=node['identity'];nodes[node['identity']]=obj
-    root=nodes[state['catalog']['root']];root['eff_effect_document']=document.dumps(state);root['eff_effect_id']=uuid.uuid4().hex
+    root=nodes[state['catalog']['root']];root['eff_effect_document']=document.dumps(state)
+    # A Format 3 import can keep its validated attachment identity. Source
+    # imports still get a fresh ID unless the caller supplies one explicitly.
+    root['eff_effect_id']=str(effect_id or uuid.uuid4().hex)
     if preserve_source:
         root.eff_effect.source_animation=True
         clips=preview.playback.clip_items(root,edit)
@@ -289,7 +294,7 @@ def import_workspace(context,state,preserve_source=False):
     assets.expand_meshes(context,root,edit)
     for obj in context.selected_objects:obj.select_set(False)
     root['eff_effect_ui_version']=2
-    root.select_set(True);context.view_layer.objects.active=root;preview.refresh(root,edit)
+    root.select_set(True);context.view_layer.objects.active=root;preview.refresh(root,edit);preview.prime_signature(root)
     return root
 
 def choice_items(self,context):
@@ -356,6 +361,20 @@ class EFF_OT_effect_import(bpy.types.Operator,ImportHelper):
             path=Path(self.filepath);import_source(context,path if path.is_dir() else path.parent,preserve_source=self.preserve_source);return {'FINISHED'}
         except Exception as e:self.report({'ERROR'},str(e));return {'CANCELLED'}
 
+class EFF_OT_effect_edit_import(bpy.types.Operator,ImportHelper):
+    bl_idname='eiem.effect_edit_import';bl_label='导入 EFF 特效编辑';bl_options={'UNDO'}
+    filter_glob:StringProperty(default='*.effedit.json',options={'HIDDEN'})
+    def execute(self,context):
+        try:
+            edit=document.load_edit(self.filepath)
+            state=document.load_source(edit['source'])
+            document.apply_edit(state,edit)
+            import_workspace(context,state,preserve_source=True)
+            self.report({'INFO'},'已按来源摘要导入 EFF 特效编辑')
+            return {'FINISHED'}
+        except Exception as error:
+            self.report({'ERROR'},str(error));return {'CANCELLED'}
+
 
 class EFF_OT_effect_research_report(bpy.types.Operator):
     bl_idname='eiem.effect_research_report';bl_label='生成原始资源 / 动画报告'
@@ -415,6 +434,97 @@ class EFF_OT_effect_array(bpy.types.Operator):
             root=active(context);edit=synchronize(root);edit.array_change(self.identity,json.loads(self.path),self.operation,self.index)
             store(root,edit);refresh_fields(root);preview.refresh(root,edit);return {'FINISHED'}
         except Exception as e:self.report({'ERROR'},str(e));return {'CANCELLED'}
+
+class EFF_OT_effect_module_copy(bpy.types.Operator):
+    bl_idname='eiem.effect_module_copy';bl_label='复制特效模块块';bl_options={'REGISTER'}
+    object_name:StringProperty(options={'HIDDEN'});identity:StringProperty(options={'HIDDEN'});module:StringProperty(options={'HIDDEN'})
+    def execute(self,context):
+        try:
+            root=active(context);document.require(root,'请选择当前特效')
+            edit=synchronize(root)
+            payload=block_clipboard.copy_module(edit,self.identity,self.module)
+            encoded=block_clipboard.encode(payload)
+            document.require(len(encoded)<=8*1024*1024,'特效模块块过大，暂不支持直接放入系统剪贴板')
+            context.window_manager.clipboard=encoded
+            self.report({'INFO'},'已复制特效模块块：'+self.module)
+            return {'FINISHED'}
+        except Exception as error:self.report({'ERROR'},str(error));return {'CANCELLED'}
+
+class EFF_OT_effect_module_paste(bpy.types.Operator):
+    bl_idname='eiem.effect_module_paste';bl_label='粘贴特效模块块';bl_options={'REGISTER','UNDO'}
+    object_name:StringProperty(options={'HIDDEN'});identity:StringProperty(options={'HIDDEN'});module:StringProperty(options={'HIDDEN'})
+    def execute(self,context):
+        try:
+            root=active(context);document.require(root,'请选择当前特效')
+            payload=block_clipboard.decode(context.window_manager.clipboard)
+            document.require(payload['root']['module']==self.module,'剪贴板模块与当前模块不匹配')
+            trial=block_clipboard.paste_module(synchronize(root),self.identity,payload)
+            store(root,trial);refresh_fields(root);preview.refresh(root,trial)
+            self.report({'INFO'},'已粘贴特效模块块：'+self.module)
+            return {'FINISHED'}
+        except Exception as error:self.report({'ERROR'},str(error));return {'CANCELLED'}
+
+class EFF_OT_effect_emitter_copy(bpy.types.Operator):
+    bl_idname='eiem.effect_emitter_copy';bl_label='复制特效';bl_options={'REGISTER'}
+    object_name:StringProperty(options={'HIDDEN'});identity:StringProperty(options={'HIDDEN'})
+    def execute(self,context):
+        try:
+            root=active(context);document.require(root,'请选择当前特效')
+            payload=block_clipboard.copy_emitter(synchronize(root),self.identity)
+            encoded=block_clipboard.encode(payload)
+            document.require(len(encoded)<=8*1024*1024,'特效剪贴板数据过大，暂不支持直接放入系统剪贴板')
+            context.window_manager.clipboard=encoded
+            self.report({'INFO'},'已复制完整特效及其子发射器')
+            return {'FINISHED'}
+        except Exception as error:self.report({'ERROR'},str(error));return {'CANCELLED'}
+
+class EFF_OT_effect_emitter_paste(bpy.types.Operator):
+    bl_idname='eiem.effect_emitter_paste';bl_label='粘贴特效';bl_options={'REGISTER','UNDO'}
+    object_name:StringProperty(options={'HIDDEN'})
+    def execute(self,context):
+        created=[]
+        try:
+            root=active(context);document.require(root,'请选择当前特效')
+            payload=block_clipboard.decode(context.window_manager.clipboard)
+            document.require(payload['kind']=='emitter','剪贴板内容不是完整特效')
+            target=bpy.data.objects.get(self.object_name) if self.object_name else context.object
+            document.require(target and root_of(target)==root,'请选择目标特效节点')
+            edit=synchronize(root)
+            parent_identity=target.get('eff_effect_node') or edit.state['catalog']['root']
+            trial,nodes=block_clipboard.paste_emitter(edit,parent_identity,payload)
+            collection=preview._collection(root)
+            by_identity={o.get('eff_effect_node'):o for o in objects(root) if o.get('eff_effect_node')}
+            transform_objects={identity:obj for obj in objects(root)
+                               for identity in json.loads(obj.get('eff_effect_components','[]'))
+                               if identity in trial.objects and trial.objects[identity]['classId']==4}
+            for node in nodes:
+                obj=bpy.data.objects.new(node['name'] or '新特效',None);collection.objects.link(obj)
+                obj.empty_display_type='PLAIN_AXES';obj.empty_display_size=.15
+                obj['eff_effect_node']=node['identity'];created.append(obj);by_identity[node['identity']]=obj
+                transform_objects[node['transform']]=obj
+            for node in nodes:
+                obj=by_identity[node['identity']]
+                parent_obj=transform_objects.get(node['parent']) or by_identity.get(node['parent'])
+                document.require(parent_obj,'无法建立特效父子关系')
+                obj.parent=parent_obj
+                transform=trial.value(node['transform']);p=transform.get('m_LocalPosition',{});q=transform.get('m_LocalRotation',{});s=transform.get('m_LocalScale',{})
+                obj.matrix_basis=BASIS@Matrix.LocRotScale(Vector(tuple(p.get(k,0) for k in 'xyz')),Quaternion((q.get('w',1),q.get('x',0),q.get('y',0),q.get('z',0))),Vector(tuple(s.get(k,1) for k in 'xyz')))@BASIS.inverted()
+                obj['eff_effect_last_matrix']=[obj.matrix_basis[i][j] for i in range(4) for j in range(4)]
+                populate(obj,trial,[i for i in node['components'] if trial.objects[i]['classId']!=1])
+                renderer=next((i for i in node['components'] if trial.objects[i]['classId']==199),None)
+                if renderer:
+                    mesh=assets.source_meshes(root).get(preview._target(trial,renderer,['m_Mesh']))
+                    if mesh:obj.eff_effect.particle_mesh=mesh
+            store(root,trial);refresh_fields(root);preview.refresh(root,trial)
+            for item in context.selected_objects:item.select_set(False)
+            if created:
+                created[-1].select_set(True);context.view_layer.objects.active=created[-1]
+            self.report({'INFO'},'已粘贴完整特效及其子发射器')
+            return {'FINISHED'}
+        except Exception as error:
+            for obj in created:
+                if obj.name in bpy.data.objects:bpy.data.objects.remove(obj,do_unlink=True)
+            self.report({'ERROR'},str(error));return {'CANCELLED'}
 
 class EFF_OT_effect_use_particle_emission(bpy.types.Operator):
     bl_idname='eiem.effect_use_particle_emission';bl_label='使用粒子模块的发射数量';bl_options={'REGISTER','UNDO'}
@@ -551,26 +661,66 @@ class EFF_OT_effect_emitter_remove(bpy.types.Operator):
             except Exception as error:root['预览错误']=str(error)
             return {'FINISHED'}
         except Exception as error:self.report({'ERROR'},str(error));return {'CANCELLED'}
-def pointer_items(self,context):
-    root=active(context)
-    if not root:return [('NULL','无','')]
-    edit=editor(root);kind=edit.schema(self.identity,json.loads(self.path))['type'][5:-1]
-    _ENUM_CACHE['pointers']=[('NULL','无','')]+[(o['identity'],o.get('name') or o['type'],o['identity']) for o in edit.objects.values() if document.pointer_type_matches(kind,o['type'])]
-    return _ENUM_CACHE['pointers']
+def logical_asset_text(edit,identity):
+    spec=edit.objects.get(identity,{})
+    paths=sorted({(str(row.get('path','')),str(row.get('name','')))
+                  for row in spec.get('logicalPaths') or [] if row.get('path')})
+    if paths:
+        path,name=paths[0]
+        suffix=' (+%d)'%(len(paths)-1) if len(paths)>1 else ''
+        return path+(' · '+name if name else '')+suffix
+    return (spec.get('name') or spec.get('type') or '来源资源')+' · '+identity
+
+def draw_pointer(layout,edit,identity,path,value,title=None):
+    target=preview._target(edit,identity,path)
+    row=layout.row(align=True)
+    row.label(text=(title or label(path[-1]))+'：'+(logical_asset_text(edit,target) if target else
+        ('未解析 PPtr %s:%s'%(value.get('m_FileID',0),value.get('m_PathID',0)) if value.get('m_PathID') else '无')))
+    if not edit.editable(identity,path):return
+    op=row.operator('eiem.effect_pointer',text='',icon='EYEDROPPER')
+    op.identity=identity;op.path=document.dumps(path)
+    spec=edit.objects.get(target,{})
+    logical=next((r for r in spec.get('logicalPaths') or [] if r.get('path')),None)
+    op.logical_path=logical.get('path','') if logical else ''
+    op.asset_name=logical.get('name','') if logical else spec.get('name','')
+
 class EFF_OT_effect_pointer(bpy.types.Operator):
-    bl_idname='eiem.effect_pointer';bl_label='选择来源资源';bl_options={'UNDO'}
-    identity:StringProperty();path:StringProperty();target:EnumProperty(items=pointer_items)
-    def invoke(self,context,event):return context.window_manager.invoke_props_dialog(self,width=480)
-    def draw(self,context):self.layout.prop(self,'target')
+    bl_idname='eiem.effect_pointer';bl_label='按逻辑路径绑定资源';bl_options={'UNDO'}
+    bl_description='使用当前 .efffx 来源依赖中的游戏资源；跨 Bundle 新依赖尚未支持'
+    identity:StringProperty(options={'HIDDEN'});path:StringProperty(options={'HIDDEN'})
+    logical_path:StringProperty(name='游戏逻辑路径')
+    asset_name:StringProperty(name='资产名')
+    clear_reference:BoolProperty(name='清空引用',default=False)
+    def invoke(self,context,event):
+        if not self.logical_path:
+            root=active(context)
+            if root:
+                edit=editor(root);identity_path=json.loads(self.path)
+                target=preview._target(edit,self.identity,identity_path)
+                spec=edit.objects.get(target,{})
+                logical=next((r for r in spec.get('logicalPaths') or [] if r.get('path')),None)
+                if logical:
+                    self.logical_path=logical['path'];self.asset_name=logical.get('name','')
+        return context.window_manager.invoke_props_dialog(self,width=560)
+    def draw(self,context):
+        self.layout.prop(self,'logical_path')
+        self.layout.prop(self,'asset_name')
+        self.layout.prop(self,'clear_reference')
+        if not self.clear_reference:
+            effect_ui.hint(self.layout,'路径与资产名必须唯一命中当前 .efffx 来源依赖；图外 Bundle 资源暂不能新增为原生依赖。')
     def execute(self,context):
         try:
-            root=active(context);edit=synchronize(root);path=json.loads(self.path);edit.set_pointer(self.identity,path,None if self.target=='NULL' else self.target)
+            root=active(context);edit=synchronize(root);path=json.loads(self.path)
+            if self.clear_reference:
+                edit.set_pointer(self.identity,path,None);target=None
+            else:
+                target=edit.set_pointer_by_logical(self.identity,path,self.logical_path,self.asset_name)['identity']
             if edit.objects[self.identity]['classId']==199:
                 node=next((o for o in objects(root) if self.identity in json.loads(o.get('eff_effect_components','[]'))),None)
-                if node and path==['m_Mesh']:node.eff_effect.particle_mesh=assets.source_meshes(root).get(self.target)
+                if node and path==['m_Mesh']:node.eff_effect.particle_mesh=assets.source_meshes(root).get(target) if target else None
                 elif node and node.eff_effect.particle_mesh and len(path)==2 and path[0]=='m_Materials':
                     mesh=node.eff_effect.particle_mesh.data
-                    if path[1]<len(mesh.materials) and self.target!='NULL':mesh.materials[path[1]]=preview._material_asset(root,edit,self.target,preview._resources(root,edit))
+                    if path[1]<len(mesh.materials):mesh.materials[path[1]]=preview._material_asset(root,edit,target,preview._resources(root,edit)) if target else None
             store(root,edit);preview.refresh(root,edit);return {'FINISHED'}
         except Exception as e:self.report({'ERROR'},str(e));return {'CANCELLED'}
 class EFF_OT_effect_resource(bpy.types.Operator):
@@ -736,6 +886,26 @@ class EFF_OT_effect_build(bpy.types.Operator,ExportHelper):
     def cancel(self,context):self._cleanup(context)
 def attachment(root,part='',addon=None):
     cfg=root.eff_effect;owner=cfg.owner
+    stored = root.get('eff_effect_attachment')
+    if not owner and stored:
+        try:
+            declared=json.loads(stored) if isinstance(stored,str) else dict(stored)
+        except (TypeError, ValueError) as error:
+            raise ValueError(root.name+' attachment declaration is damaged') from error
+        for key in ('targetPath','targetAsset','targetPrefab','rendererPath'):
+            if not declared.get(key):
+                raise ValueError(root.name+' attachment declaration lacks '+key)
+        position,rotation,scale=(BASIS.inverted()@root.matrix_local@BASIS).decompose()
+        bone=str(cfg.bone or declared.get('bone',''))
+        toggle_keys=[switch_controls.validate_switch_key(item.key) for item in cfg.toggle_keys]
+        document.require(len(toggle_keys)==len(set(toggle_keys)),'effect toggle keys must be unique')
+        row=dict(declared)
+        row.update(id=root['eff_effect_id'],label=root.name,
+                   part=part or declared.get('part',''),bone=bone,autoplay=True,
+                   keys=toggle_keys,build=bpy.path.abspath(cfg.build_path),
+                   position=list(position),rotation=[rotation.x,rotation.y,rotation.z,rotation.w],
+                   scale=list(scale))
+        return row
     if not owner:raise ValueError(root.name+' 缺少挂载目标 Mesh')
     rig=preview.mount_rig(owner)
     if cfg.bone and (not rig or cfg.bone not in rig.data.bones):raise ValueError('挂载骨骼不属于目标 Mesh 的骨架')
@@ -789,7 +959,7 @@ def effect_cache():
 
 def build_request(root,payload=None):
     if payload is None:payload=assets.export_document(root,synchronize(root))
-    return effect_publish.Build(payload,bpy.path.abspath(root.eff_effect.compiler),effect_cache(),root['eff_effect_id'],effect_codec().native_build)
+    return effect_publish.Build(payload,bpy.path.abspath(root.eff_effect.compiler),effect_cache(),root['eff_effect_id'],effect_codec().read_native_build)
 
 def ensure_built(root):
     if _BUILD_RUNNING:raise ValueError('已有特效正在构建，请完成后再导出人物')
@@ -883,15 +1053,11 @@ def draw_value(layout,obj,edit,identity,path,value):
         effect_ui.Draw(sys.modules[__name__],obj,edit,identity).value(layout,path);return
     name=label(path[-1]);schema=edit.schema(identity,path)
     if schema['type'].startswith('PPtr<'):
-        target=preview._target(edit,identity,path);spec=edit.objects.get(target,{})
-        resolved=(spec.get('name') or spec.get('type') or str(value.get('m_PathID',0))) if value.get('m_PathID') else '无'
-        row=layout.row();row.label(text=name+' ['+schema['type']+'] '+resolved)
-        if edit.editable(identity,path):
-            op=row.operator('eiem.effect_pointer',text='',icon='EYEDROPPER');op.identity=identity;op.path=document.dumps(path)
+        draw_pointer(layout,edit,identity,path,value,title=name+' ['+schema['type']+']')
         return
     if isinstance(value,(dict,list)):
         if isinstance(value,dict) and value.get('encoding')=='base64':layout.label(text=name+' [原生字节，保留]');return
-        header,body=layout.panel(field_key(identity,path),default_closed=False);header.label(text=name+(' ['+str(len(value))+']' if isinstance(value,list) else ''))
+        header,body=layout.panel(field_key(identity,path),default_closed=True);header.label(text=name+(' ['+str(len(value))+']' if isinstance(value,list) else ''))
         if isinstance(value,dict) and 'enabled' in value:
             prop=field_key(identity,path+['enabled'])
             if prop in obj:header.prop(obj,'["'+prop+'"]',text='')
@@ -924,6 +1090,10 @@ def draw_structure(layout,obj,root,edit):
         op=layout.operator('eiem.effect_curve_edit',text='编辑全部曲线',icon='GRAPH');op.object_name=obj.name
     row=layout.row(align=True)
     row.operator('eiem.effect_emitter_add',text='添加发射器…',icon='ADD')
+    if is_emitter(obj):
+        op=row.operator('eiem.effect_emitter_copy',text='',icon='COPYDOWN');op.object_name=obj.name;op.identity=obj.get('eff_effect_node','')
+    if obj==root or is_emitter(obj):
+        op=row.operator('eiem.effect_emitter_paste',text='',icon='PASTEDOWN');op.object_name=obj.name
     if is_emitter(obj) and obj!=root:
         op=row.operator('eiem.effect_emitter_remove',text='删除发射器',icon='TRASH');op.object_name=obj.name
     if obj!=root:select(layout,root,'返回特效根：挂载 / 导出','EMPTY_AXIS')
@@ -1026,14 +1196,20 @@ class EFF_PT_effect_object(bpy.types.Panel):
             for target in targets:
                 target_layout=layout
                 if obj==root and target!=root:
-                    heading,target_layout=layout.panel('node_'+str(target.as_pointer()),default_closed=False);heading.label(text='发射器 · '+target.name if any(edit.objects[i]['classId']==198 for i in json.loads(target.get('eff_effect_components','[]'))) else target.name)
+                    heading,target_layout=layout.panel('node_'+str(target.as_pointer()),default_closed=True);heading.label(text='节点 · '+target.name)
                     if not target_layout:continue
                 ids=json.loads(target.get('eff_effect_components','[]'))
                 if any(edit.objects[i]['classId']==198 for i in ids):
                     op=target_layout.operator('eiem.effect_block',text='启用模块…',icon='ADD');op.object_name=target.name
                 for identity in sorted(ids,key=lambda i:edit.objects[i]['classId']==4):
                     if identity not in edit.state['values']:continue
-                    effect_ui.Draw(sys.modules[__name__],target,edit,identity).component(target_layout,edit.objects[identity])
+                    spec=edit.objects[identity]
+                    kind=(spec.get('script') or {}).get('class') or spec.get('type','组件')
+                    component_header,component_body=target_layout.panel(
+                        'component_'+field_key(identity,['_source_component']),default_closed=True)
+                    component_header.label(text=(spec.get('name') or kind)+' · '+kind)
+                    if component_body:
+                        effect_ui.Draw(sys.modules[__name__],target,edit,identity).component(component_body,spec)
         except Exception as e:layout.label(text=str(e)[:180],icon='ERROR')
 
 @bpy.app.handlers.persistent
@@ -1062,11 +1238,16 @@ def upgrade_loaded(*_):
                     assets.setup_textures(root,editor(root),obj,identity)
                     material=material_bridge.material_for(obj)
                     if material:material_bridge.setup(material,root,editor(root),identity)
-        if root.get('eff_effect_ui_version',0)>=2:continue
+        if root.get('eff_effect_ui_version',0)>=2:
+            preview.schedule_refresh(root)
+            continue
         # Migrate the old raw-only UI in memory, retaining pending native edits.
         edit=synchronize(root);store(root,edit);refresh_fields(root);root['eff_effect_ui_version']=2
-CLASSES=(EFF_PG_effect_choice,EFF_PG_effect_angle,EFF_PG_effect_key,EFF_PG_effect_object,EFF_PG_effect_texture,EFF_OT_effect_import,EFF_OT_effect_research_report,EFF_OT_effect_block,EFF_OT_effect_array,EFF_OT_effect_use_particle_emission,EFF_OT_effect_continuous,EFF_OT_effect_emitter_add,EFF_OT_effect_emitter_remove,EFF_OT_effect_pointer,EFF_OT_effect_resource,EFF_OT_effect_select,EFF_OT_effect_key,EFF_OT_effect_texture_open,EFF_OT_effect_mesh_edit,EFF_OT_effect_assets_expand,EFF_OT_effect_export,EFF_OT_effect_build,EFF_OT_effect_preview,EFF_PT_effect_object)
-def menu_import(self,context):self.layout.operator('eiem.effect_import',text='EFF 特效（空物体）')
+        preview.schedule_refresh(root)
+CLASSES=(EFF_PG_effect_choice,EFF_PG_effect_angle,EFF_PG_effect_key,EFF_PG_effect_object,EFF_PG_effect_texture,EFF_OT_effect_import,EFF_OT_effect_edit_import,EFF_OT_effect_research_report,EFF_OT_effect_block,EFF_OT_effect_array,EFF_OT_effect_module_copy,EFF_OT_effect_module_paste,EFF_OT_effect_emitter_copy,EFF_OT_effect_emitter_paste,EFF_OT_effect_use_particle_emission,EFF_OT_effect_continuous,EFF_OT_effect_emitter_add,EFF_OT_effect_emitter_remove,EFF_OT_effect_pointer,EFF_OT_effect_resource,EFF_OT_effect_select,EFF_OT_effect_key,EFF_OT_effect_texture_open,EFF_OT_effect_mesh_edit,EFF_OT_effect_assets_expand,EFF_OT_effect_export,EFF_OT_effect_build,EFF_OT_effect_preview,EFF_PT_effect_object)
+def menu_import(self,context):
+    self.layout.operator('eiem.effect_import',text='EFF 特效（空物体）')
+    self.layout.operator('eiem.effect_edit_import',text='EFF 特效编辑（.effedit.json）')
 def menu_add(self,context):self.layout.operator('eiem.effect_import',text='EFF 特效来源',icon='EMPTY_AXIS')
 def register():
     for cls in CLASSES:bpy.utils.register_class(cls)

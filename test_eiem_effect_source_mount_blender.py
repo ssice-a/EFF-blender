@@ -20,8 +20,8 @@ assert row['part']=='' and row['bone'] and row['bones'] and row['rendererPath']
 assert row['keys']==['F7','CTRL+J']
 assert row['bones']==json.loads(owner['eiem_bone_paths_json']),'source skeleton paths disagree with regular author export'
 print('MOUNT',row['targetAsset'],row['bone'],'palette',len(row['bones']),row['rendererPath'])
-modules,_=mod.native_export.pack_modules();codec=modules['runtime_controls']
-native=codec.native_build(Path(build))
+modules,_=mod.native_export.pack_modules();codec=modules['effect_native']
+native=codec.read_native_build(Path(build))
 assert native['rootName'] and native['bundles']
 report=dict(attachment=row,nativeKey=native['key'],nativeBundles=len(native['bundles']))
 Path(output).with_suffix('.attachment.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')

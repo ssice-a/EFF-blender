@@ -101,6 +101,23 @@ class MaterialFeatures(unittest.TestCase):
         ui.set_surface(material, 3)
         self.assertEqual(material, before)
 
+    def test_actual_render_queue_uses_numeric_surface_defaults_and_keeps_layer_offsets(self):
+        material = character()
+        self.assertEqual(ui.actual_render_queue(material), 2000)
+        ui.set_surface(material, 1)
+        self.assertEqual(ui.actual_render_queue(material), 2450)
+        ui.set_surface(material, 2)
+        self.assertEqual(ui.actual_render_queue(material), 3000)
+        material['eiem_render_queue'] = '3001'
+        self.assertEqual(ui.actual_render_queue(material), 3001)
+
+    def test_actual_render_queue_uses_source_baseline_when_editor_fields_are_missing(self):
+        material = {'eiem_baseline_json':
+                    '{"float._SurfaceType":"1","float._BlendMode":"4"}'}
+        self.assertEqual(ui.actual_render_queue(material), 3000)
+        material = {'eiem_baseline_json': '{"render_queue":"3020"}'}
+        self.assertEqual(ui.actual_render_queue(material), 3020)
+
     def test_dynamic_fields_and_texture_transforms_stay_with_their_feature(self):
         material = character()
         for key, owner in (('eiem_value4._EmissionMapUVSpeed', 'vfx'),

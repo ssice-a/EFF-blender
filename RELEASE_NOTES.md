@@ -1,4 +1,8 @@
-# EFF Blender v0.50.3
+# EFF Blender v0.50.6
+
+This release adds author-controlled bone animation resources, multi-skeleton export, and effect block clipboard round trips. Effect preview output now preserves VAT lookup UVs, vertex colors, tangent handedness, and native submesh metadata. The package remains Python-only and uses the shared native tools from the coordinated EFF release.
+
+## EFF Blender v0.50.5
 
 配套 EFF v2.0.6、AnimeStudio v1.9.1；Windows x64 / Blender 5.2。
 

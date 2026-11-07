@@ -880,8 +880,8 @@ def validate_skeleton_nodes(nodes, source_nodes):
             raise ValueError("invalid or duplicate skeleton path: " + path)
         seen.add(path)
         if i == 0:
-            if parent != -1 or not source_nodes[i] or "/" in path:
-                raise ValueError("skeleton root must reference the source hierarchy")
+            if parent != -1 or "/" in path:
+                raise ValueError("skeleton root must be a top-level node")
         else:
             if not 0 <= parent < i or not path or nodes[parent][0] != path.rpartition("/")[0]:
                 raise ValueError("skeleton path/parent mismatch: " + path)

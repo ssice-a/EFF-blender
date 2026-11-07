@@ -52,7 +52,6 @@ class ExportScopeTests(unittest.TestCase):
         self.assertEqual(addon.export_meshes_for_scope(
             self.context, selected, 'ALL', physics_only=True), selected)
 
-
 if __name__ == '__main__':
     result = unittest.TextTestRunner(verbosity=2).run(
         unittest.defaultTestLoader.loadTestsFromTestCase(ExportScopeTests))

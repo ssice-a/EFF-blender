@@ -77,7 +77,7 @@ class SharedResourceTests(unittest.TestCase):
                 (native / name).touch()
             vendor = install / 'vendor' / 'PIL'
             vendor.mkdir(parents=True)
-            for name in shared.PIL_REQUIRED_FILES:
+            for name in shared.PIL_INSTALL_FILES:
                 (install / 'vendor' / name).touch()
             with patch.dict(os.environ, {'LOCALAPPDATA': str(root / 'local')}, clear=True):
                 shared.set_resource_root(root)
@@ -144,7 +144,7 @@ class SharedResourceTests(unittest.TestCase):
                 (native / name).touch()
             vendor = install / 'vendor' / 'PIL'
             vendor.mkdir(parents=True)
-            for name in shared.PIL_REQUIRED_FILES:
+            for name in shared.PIL_INSTALL_FILES:
                 (install / 'vendor' / name).touch()
             (root / 'tools' / 'current.json').write_text(json.dumps({
                 'format': shared.TOOLS_INSTALL_FORMAT,
@@ -171,7 +171,7 @@ class SharedResourceTests(unittest.TestCase):
                 (native / name).touch()
             vendor = install / 'vendor' / 'PIL'
             vendor.mkdir(parents=True)
-            for name in shared.PIL_REQUIRED_FILES:
+            for name in shared.PIL_INSTALL_FILES:
                 (install / 'vendor' / name).touch()
             (root / 'tools' / 'current.json').write_text(json.dumps({
                 'format': shared.TOOLS_INSTALL_FORMAT,
@@ -198,7 +198,7 @@ class SharedResourceTests(unittest.TestCase):
                 (native / name).touch()
             vendor = install / 'vendor' / 'PIL'
             vendor.mkdir(parents=True)
-            for name in shared.PIL_REQUIRED_FILES:
+            for name in shared.PIL_INSTALL_FILES:
                 (install / 'vendor' / name).touch()
             (root / 'tools' / 'current.json').write_text(json.dumps({
                 'format': shared.TOOLS_INSTALL_FORMAT,
@@ -223,7 +223,7 @@ class SharedResourceTests(unittest.TestCase):
                 (native / name).touch()
             vendor = install / 'vendor' / 'PIL'
             vendor.mkdir(parents=True)
-            for name in shared.PIL_REQUIRED_FILES:
+            for name in shared.PIL_INSTALL_FILES:
                 (install / 'vendor' / name).touch()
             (root / 'tools' / 'current.json').write_text(json.dumps({
                 'format': shared.TOOLS_INSTALL_FORMAT,
@@ -260,8 +260,9 @@ class SharedResourceTests(unittest.TestCase):
                 for name in ('eff_author_assets.dll', 'eff_author_core.dll', 'texconv.exe', 'THIRD_PARTY_NOTICES'):
                     package.writestr('EFF_Native_Tools/nativepack/' + name, name.encode('ascii'))
                 package.writestr('EFF_Native_Tools/vendor/PIL/__init__.py', b'')
-                for name in shared.PIL_REQUIRED_FILES[1:]:
+                for name in shared.PIL_INSTALL_FILES[1:]:
                     package.writestr('EFF_Native_Tools/vendor/' + name, b'pyd')
+                package.writestr('EFF_Native_Tools/vendor/PIL/ImagePlugin.py', b'plugin')
             payload = archive.getvalue()
             new_digest = hashlib.sha256(payload).hexdigest()
             manifest = {
@@ -294,6 +295,7 @@ class SharedResourceTests(unittest.TestCase):
             receipt = json.loads((root / 'tools' / 'current.json').read_text(encoding='utf-8'))
             self.assertEqual(receipt['sha256'], new_digest)
             self.assertTrue((installed / 'nativepack' / 'THIRD_PARTY_NOTICES').is_file())
+            self.assertTrue((installed / 'vendor' / 'PIL' / 'ImagePlugin.py').is_file())
             self.assertTrue(old_install.is_dir())
 
     def test_prepare_keeps_compatible_cache_when_release_lacks_blender_52_extension(self):
@@ -307,7 +309,7 @@ class SharedResourceTests(unittest.TestCase):
                 (native / name).touch()
             pil = install / 'vendor' / 'PIL'
             pil.mkdir(parents=True)
-            for name in shared.PIL_REQUIRED_FILES:
+            for name in shared.PIL_INSTALL_FILES:
                 (install / 'vendor' / name).touch()
             (root / 'tools' / 'current.json').write_text(json.dumps({
                 'format': shared.TOOLS_INSTALL_FORMAT,

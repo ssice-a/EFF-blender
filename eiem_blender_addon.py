@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 50, 5),
+    "version": (0, 50, 6),
     "blender": (5, 2, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
@@ -238,6 +238,7 @@ if __package__:
     from . import eiem_blender_controls as controls
     from . import eiem_shape_animation as shape_animation
     from . import eiem_material_animation as material_animation
+    from . import eiem_bone_animation as bone_animation
     from . import eiem_animation as animation_io
 else:
     _release_spec = importlib.util.spec_from_file_location(
@@ -277,6 +278,10 @@ if not __package__:
     sys.modules[_shape_animation_spec.name] = shape_animation
     _shape_animation_spec.loader.exec_module(shape_animation)
     import eiem_material_animation as material_animation
+    _bone_animation_spec = importlib.util.spec_from_file_location(
+        "eiem_bone_animation", Path(__file__).with_name("eiem_bone_animation.py"))
+    bone_animation = importlib.util.module_from_spec(_bone_animation_spec)
+    _bone_animation_spec.loader.exec_module(bone_animation)
     _animation_spec = importlib.util.spec_from_file_location(
         "eiem_animation", Path(__file__).with_name("eiem_animation.py"))
     animation_io = importlib.util.module_from_spec(_animation_spec)
@@ -1514,13 +1519,26 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
     if effect_attachments or armatures_by_hierarchy:
         effect_editor = sys.modules[__package__ + ".eiem_effect_editor"] if __package__ else sys.modules["eiem_effect_editor"]
         cache_root = bpy.utils.user_resource("DATAFILES", path="eiem/effect-sources", create=True)
+        existing_effect_ids = {
+            str(obj.get("eff_effect_id")) for obj in bpy.data.objects
+            if obj.get("eff_effect_document") and obj.get("eff_effect_id")
+        }
         part_meshes = {section: meshes.get(values.get("mesh", ""))
                        for section, values in resources.items() if section.startswith("Part")}
         for section, values, author_id in effect_attachments:
             author_values = resources[author_id]
             workspace, attachment, _source = format_io.materialize_format3_effect_author_resource(
                 safe_path(root, author_values["path"]), author_id, author_values["path"], cache_root)
-            effect_root = effect_editor.import_workspace(bpy.context, workspace)
+            # Keep the source attachment identity when it is not already in
+            # this Blender scene. It makes an export/import cycle content
+            # stable while still avoiding collisions when importing a copy.
+            requested_id = str(attachment.get("id", ""))
+            effect_id = requested_id if requested_id and requested_id not in existing_effect_ids else None
+            effect_root = effect_editor.import_workspace(
+                bpy.context, workspace, preserve_source=True, effect_id=effect_id)
+            existing_effect_ids.add(str(effect_root.get("eff_effect_id")))
+            effect_root["eff_effect_attachment"] = json.dumps(
+                attachment, ensure_ascii=False, separators=(",", ":"))
             effect_root.name = attachment.get("label") or section
             effect_root.eff_effect.enabled = True
             effect_root.eff_effect.build_path = ""
@@ -2662,21 +2680,19 @@ def skeleton_author_nodes(obj):
             if max(abs(expected[r][c]-bone.matrix_local[r][c]) for r in range(4) for c in range(4)) > 1e-4:
                 raise ValueError("源骨骼绑定姿态已改变，当前仅支持增加骨骼：" + bone.name)
         else:
-            if not bone.parent:
-                raise ValueError("新增骨骼必须挂在已有共享骨架内：" + bone.name)
             if "/" in bone.name or "\\" in bone.name:
                 raise ValueError("骨骼名称不能包含路径分隔符：" + bone.name)
             # EditBone discards source axis scale. Use the preserved native
             # parent world, not its display-only Blender matrix, to derive TRS.
             basis = unity_transform_matrix_to_blender_basis()
             authored_world = basis.inverted() @ bone.matrix_local @ basis
-            local = source_world[bone.parent.name].inverted() @ authored_world
+            local = source_world[bone.parent.name].inverted() @ authored_world if bone.parent else authored_world
             position, rotation, scale = local.decompose()
             if min(scale) <= 0 or max(abs(local[r][c]-Matrix.LocRotScale(position,rotation,scale)[r][c])
                                      for r in range(4) for c in range(4)) > 1e-4:
                 raise ValueError("新增骨骼含不可表达的缩放或剪切：" + bone.name)
             p, q, s = tuple(position), (rotation.x,rotation.y,rotation.z,rotation.w), tuple(scale)
-            source_world[bone.name] = source_world[bone.parent.name] @ local
+            source_world[bone.name] = source_world[bone.parent.name] @ local if bone.parent else local
         indices[bone.name] = len(records)
         paths[bone.name] = path
         records.append((bone, (path, indices.get(bone.parent.name, -1) if bone.parent else -1,
@@ -3015,6 +3031,8 @@ def material_override_payload(material, images_by_section, force=False):
             continue
         property_name = key[5:]
         value = str(raw_value)
+        if property_name == "render_queue":
+            value = str(material_editor.features.actual_render_queue(material, baseline))
         if property_name.startswith("texture."):
             if not value.strip():
                 continue  # An empty authored slot inherits the source value.
@@ -3070,6 +3088,9 @@ def material_override_payload(material, images_by_section, force=False):
     source_changed = has_baseline and source != str(baseline.get("source", source))
     if not force and not source_changed and not overrides:
         return None, set()
+    if not any(key == "render_queue" for key, _value in overrides):
+        overrides.append(("render_queue",
+                          str(material_editor.features.actual_render_queue(material, baseline))))
 
     values = [
         "format=EFFMAT",

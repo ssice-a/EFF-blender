@@ -203,14 +203,14 @@ class Draw:
                 layout.prop(angle,'degrees',text=title)
             elif choice:layout.prop(choice,'value',text=name(path[-1]) if text is None else text)
             else:layout.prop(self.obj, '["'+key+'"]', text=name(path[-1]) if text is None else text)
-    def block(self, layout, path, title, closed=False, enabled=False):
+    def block(self, layout, path, title, closed=False, enabled=False, return_header=False):
         header, body = layout.panel(self.key(path), default_closed=closed)
         if enabled and self.key(path+['enabled']) in self.obj:
             self.prop(header, path+['enabled'], '')
         header.label(text=title)
         if enabled and not self.live(path+['enabled']):
             header.label(text='未启用')
-        return body
+        return (header, body) if return_header else body
     def array_op(self, layout, path, op, index=0, text='', icon='ADD'):
         button=layout.operator('eiem.effect_array',text=text,icon=icon)
         button.identity=self.identity;button.path=json.dumps(path);button.operation=op;button.index=index
@@ -306,10 +306,7 @@ class Draw:
             return
         schema=self.edit.schema(self.identity,path)
         if schema['type'].startswith('PPtr<'):
-            target=self.api.preview._target(self.edit,self.identity,path);spec=self.edit.objects.get(target,{})
-            row=layout.row(align=True);row.label(text=title+': '+(spec.get('name') or spec.get('type') or '无'))
-            if self.edit.editable(self.identity,path):
-                op=row.operator('eiem.effect_pointer',text='',icon='EYEDROPPER');op.identity=self.identity;op.path=json.dumps(path)
+            self.api.draw_pointer(layout,self.edit,self.identity,path,value,title=title)
             return
         if isinstance(value,list):
             layout.label(text=title+' · '+str(len(value))+' 项')
@@ -365,7 +362,12 @@ class Draw:
         self.advanced(layout,[],system+['moveWithCustomTransform']+list(MODULES))
     def module(self,layout,module):
         data=self.edit.value(self.identity,[module]);title,helptext=MODULES[module]
-        body=self.block(layout,[module],title,module not in ('InitialModule','EmissionModule','ShapeModule'),module!='InitialModule')
+        header,body=self.block(layout,[module],title,module not in ('InitialModule','EmissionModule','ShapeModule'),module!='InitialModule',return_header=True)
+        row=header.row(align=True)
+        copy_button=row.operator('eiem.effect_module_copy',text='',icon='COPYDOWN')
+        copy_button.object_name=self.obj.name;copy_button.identity=self.identity;copy_button.module=module
+        paste_button=row.operator('eiem.effect_module_paste',text='',icon='PASTEDOWN')
+        paste_button.object_name=self.obj.name;paste_button.identity=self.identity;paste_button.module=module
         if not body:return
         hint(body,helptext,icon='INFO')
         body.enabled=bool(self.live([module,'enabled']))
@@ -443,10 +445,14 @@ class Draw:
             body.label(text='支持网格/UV/静态修改器；当前每个网格一个材质。')
         for index in range(len(self.edit.value(self.identity).get('m_Materials',[]))):
             mid=self.api.assets.renderer_material(self.api.root_of(self.obj),self.edit,self.identity,index)
-            spec=self.edit.objects.get(mid,{})
-            row=body.row(align=True);row.label(text='使用材质 '+str(index+1)+'：'+(spec.get('name') or '无'))
-            if mid:
-                op=row.operator('eiem.effect_resource',text='编辑材质 / 贴图',icon='MATERIAL');op.identity=mid
+            if not mid or mid not in self.edit.state['values']:continue
+            textures=self.edit.value(mid).get('m_SavedProperties',{}).get('m_TexEnvs',[])
+            if not textures:continue
+            box=body.box();box.label(text='材质 '+str(index+1)+' · 贴图引用')
+            for texture_index,texture in enumerate(textures):
+                texture_path=['m_SavedProperties','m_TexEnvs',texture_index,'second','m_Texture']
+                self.api.draw_pointer(box,self.edit,mid,texture_path,
+                                      self.edit.value(mid,texture_path),texture.get('first','贴图'))
 
     def material(self,layout):
         self.api.material_bridge.draw(layout,self.obj)

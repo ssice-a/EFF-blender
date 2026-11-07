@@ -195,7 +195,7 @@ def format3_native_records(format3, source, parts, textures, rules):
             partId=section,
             meshId=format3.identifier('Mesh_' + section),
             path='meshes/' + section + '.effres',
-            material=format3.identifier(part['material']),
+            material=(format3.identifier(part['material']) if part.get('material') else ''),
             targetPath=target_path,
             targetAsset=target_asset,
             vertices=part['vertices'],
@@ -315,6 +315,11 @@ def mesh_part_id(name, slot, split_count):
     return identifier if split_count == 1 else identifier + '_mat' + str(slot)
 
 
+def author_skeleton_id(rig):
+    identity='\0'.join((str(rig.name_full),str(rig.data.name_full)))
+    return 'skel_'+hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16]
+
+
 def baseline_for(objects, configured, physics_objects=()):
     if configured:
         path = Path(configured).resolve()
@@ -348,6 +353,32 @@ def material_source(primary, material, cache):
     if package not in cache:
         cache[package] = type(primary)(package, primary.core)
     return cache[package]
+
+
+def validate_export_material_sources(primary, materials, cache):
+    """Reject material identities that cannot be resolved before publishing.
+
+    Format 3 stores sparse material edits, so scalar-only edits previously
+    skipped the native lookup in ``collect_material``.  That allowed an
+    invalid ``source.path``/``source.asset`` pair to reach the game, where
+    Prefab preparation had to fall back to the untouched native resource.
+    """
+    for material in materials:
+        path = str(material.get('eiem_target_path', '') or
+                   material.get('eiem_source', '')).strip()
+        asset = str(material.get('eiem_target_asset', '') or
+                    material.get('eiem_name', material.name)).strip()
+        if not path or not asset:
+            raise ValueError(
+                'Material export is missing its source logical path or asset; '
+                're-import the material from a complete EFFSOURCE package')
+        try:
+            material_source(primary, material, cache).resolve('Material', path, asset)
+        except Exception as error:
+            raise ValueError(
+                'Material source is not present in the selected EFFSOURCE: '
+                + path + '#' + asset +
+                '; re-import from the complete Prefab EFFSOURCE') from error
 
 
 def split_material(author):
@@ -740,12 +771,14 @@ def _texture_resource_id(section, image, color_space, target, width, height,
 def collect_material(addon, source, mat, images, textures, temporary, encode,
                      existing=None, texture_only=False, mid=None,
                      texture_cache=None, include_native_fields=True,
-                     texture_inputs=None):
+                     texture_inputs=None, force=True):
     texture_cache = texture_cache if texture_cache is not None else {}
     mid = mid or material_id(mat)
     matpath = str(mat.get('eiem_target_path', '') or mat.get('eiem_source', ''))
     matasset = str(mat.get('eiem_target_asset', '') or mat.get('eiem_name', mat.name))
-    values, _ = addon.material_override_payload(mat, images, force=True)
+    values, _ = addon.material_override_payload(mat, images, force=force)
+    if values is None:
+        return None
     props = dict(line.split('=', 1) for line in values if '=' in line)
     overrides = {k: v for k, v in props.items() if k not in
                  ('format', 'version', 'overrides', 'source', 'name', 'shader')}
@@ -1166,6 +1199,7 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
     texture_inputs = {}
     texture_cache = {}
     material_sources = {}
+    validate_export_material_sources(source, selected_materials, material_sources)
     snapshots, part_cache, snapshot_rigs = {}, {}, {}
     skin_cache = {}
     switches = [dict(variable=var, label=group.name, key=key, stateCount=len(states),
@@ -1179,9 +1213,31 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
     clips_by_object = {}
     originals = {addon.mesh_export_template(view) for view in plan['objects']
                  if view not in plan['hidden']}
-    addon.shape_animation.validate_export_members(originals)
+    armatures={next((modifier.object for modifier in original.modifiers
+                     if modifier.type=='ARMATURE' and modifier.object),None)
+               for original in originals}
+    armatures.discard(None)
+    addon.shape_animation.validate_export_members(originals,armatures)
     clips_by_object = {original.as_pointer(): addon.shape_animation.export_clips(
         original, addon, include_switches) for original in originals}
+    skeleton_records_by_rig={}
+    skeleton_id_by_rig={}
+    for rig in armatures:
+        has_animation=any(clip.enabled for clip in getattr(rig,'eiem_bone_animations',()))
+        records=addon.skeleton_author_nodes(rig)
+        skeleton_records_by_rig[rig]=records
+        has_author_bones=any(not source_node for _bone,_record,source_node in records)
+        if has_animation or has_author_bones:
+            skeleton_id_by_rig[rig]=author_skeleton_id(rig)
+    skeletons=[];bone_animations=[]
+    for rig,skeleton_id in sorted(skeleton_id_by_rig.items(),key=lambda row:row[0].name_full):
+        records=skeleton_records_by_rig[rig]
+        nodes=[(record[0],record[1],record[2],record[3],record[4])
+               for bone,record,source_node in records]
+        skeletons.append(dict(id=skeleton_id,data=addon.bone_animation.encode_skeleton(nodes)))
+        if any(clip.enabled for clip in getattr(rig,'eiem_bone_animations',())):
+            bone_animations.extend(addon.shape_animation.export_bone_clips(
+                rig,addon,skeleton_id,include_switches))
     _, _, hotkeys = addon.plan_shape_controls(list(originals),
                                              include_hotkeys=include_switches)
     controls_by_object = {original.as_pointer(): shape_controls(addon, original, include_switches)
@@ -1220,11 +1276,17 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
                             mid = material_sections[variant.as_pointer()]
                             if mid not in materials:
                                 phase = time.perf_counter()
-                                materials[mid] = collect_material(
+                                material_animated = any(
+                                    clip.enabled for clip in
+                                    getattr(variant, 'eiem_material_animations', ()))
+                                record = collect_material(
                                     addon, material_source(source, variant, material_sources), variant,
                                     images, textures, temporary, encode, mid=mid,
                                     texture_cache=texture_cache,
-                                    include_native_fields=False, texture_inputs=texture_inputs)
+                                    include_native_fields=False, texture_inputs=texture_inputs,
+                                    force=bool(switch or material_animated))
+                                if record is not None:
+                                    materials[mid] = record
                                 detail['materialTexture'] += (time.perf_counter()-phase)*1000
                         phase = time.perf_counter()
                         fields = native_mesh_fields(modules, source, target, author,
@@ -1238,20 +1300,28 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
                                       shapeOwner=str(original.data.get('eiem_control_id', '')),
                                       shapeAnimations=clips_by_object.get(identity, []),
                                       nativeTypeHash=target['native']['typeHash'],fieldData=fields)
+                        rig=snapshot_rigs[identity]
+                        if rig in skeleton_id_by_rig:common['skeleton']=skeleton_id_by_rig[rig]
                         bindings = list(plan['bindings'].get(view,[]))
                         if switch and include_switches:
                             for option_index, variant in enumerate(variants):
                                 variant_id = pid + '_switch_' + switch['identity'] + '_' + str(option_index)
                                 mid = material_sections[variant.as_pointer()]
-                                parts.append(dict(common,partId=variant_id,material=mid,
+                                part = dict(common,partId=variant_id,
                                     authorData=addon.format_io.encode_mesh(author),
-                                    visibilityBindings=bindings+[dict(variable=switch['variable'],visible=[option_index])]))
+                                    visibilityBindings=bindings+[dict(variable=switch['variable'],visible=[option_index])],
+                                    materialSlot=slot)
+                                if mid in materials:part['material']=mid
+                                parts.append(part)
                                 cache.append(variant_id)
                         else:
                             selected_material=variants[0] if switch else mat
-                            parts.append(dict(common,partId=pid,material=material_sections[selected_material.as_pointer()],
-                                              authorData=addon.format_io.encode_mesh(author),
-                                              visibilityBindings=bindings))
+                            mid=material_sections[selected_material.as_pointer()]
+                            part=dict(common,partId=pid,
+                                      authorData=addon.format_io.encode_mesh(author),
+                                      visibilityBindings=bindings,materialSlot=slot)
+                            if mid in materials:part['material']=mid
+                            parts.append(part)
                             cache.append(pid)
                     part_cache[identity]=cache
                 members.extend(part_cache[identity])
@@ -1376,7 +1446,8 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
             list(textures.values()), rules, switches, material_clips, effects,
             physics=physics_resources, author_files=author_files,
             target_bundles=modules['author_format3'].resolve_target_bundles(
-                source_packages.values(), rules))
+                source_packages.values(), rules),
+            skeletons=skeletons,bone_animations=bone_animations)
         detail['writeAuthor'] = (time.perf_counter() - phase) * 1000
         tool = shared_resources.native_tool_file('eff_author_assets.dll')
         try:

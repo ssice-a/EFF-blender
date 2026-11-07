@@ -136,6 +136,42 @@ bpy.context.view_layer.objects.active=obj;obj.select_set(True)
 assert not obj.data.eiem_shape_animations and not second.data.eiem_shape_animations
 module.create_group([obj,second]);assert bpy.ops.eiem.shape_animation(remove=True)=={'FINISHED'}
 assert not obj.data.eiem_shape_animations and not second.data.eiem_shape_animations
+
+# One clip may combine Shape Key and Armature Action contributions. Both
+# owners share identity, timing/settings, samples and the preview clock.
+rig_data=bpy.data.armatures.new('Mixed animation rig data')
+rig=bpy.data.objects.new('Mixed animation rig',rig_data);bpy.context.collection.objects.link(rig)
+bpy.context.view_layer.objects.active=rig;rig.select_set(True);bpy.ops.object.mode_set(mode='EDIT')
+root=rig_data.edit_bones.new('WeaponRoot');root.head=(0,0,0);root.tail=(0,0,1)
+tip=rig_data.edit_bones.new('FxAnchor');tip.head=(0,0,1);tip.tail=(0,0,1.2);tip.parent=root
+bpy.ops.object.mode_set(mode='OBJECT');rig.pose.bones['FxAnchor'].rotation_mode='QUATERNION'
+for frame,value in [(1,0),(16,0.5),(31,0)]:
+    rig.pose.bones['FxAnchor'].location.x=value
+    rig.pose.bones['FxAnchor'].keyframe_insert(data_path='location',frame=frame)
+mixed=module.create_group([obj,rig]);mixed_id=mixed.identity
+module.set_active_group(bpy.context,mixed_id)
+bone_clip=module.bone_member_clip(mixed_id,rig)
+assert bone_clip and module.member_clip(mixed_id,obj)
+assert bone_clip.start==mixed.start and bone_clip.end==mixed.end
+for field,value in [('start',1),('end',31),('speed',2),('sample_rate',30),('loop',False),('autoplay',True),('hotkey','F7')]:
+    setattr(mixed,field,value);assert getattr(bone_clip,field)==value
+bone_rows=module.export_bone_clips(rig,addon,'skel_fixture')
+decoded=addon.bone_animation.decode_animation(bone_rows[0]['data'])
+assert bone_rows[0]['id']==mixed_id and decoded['skeleton']=='skel_fixture'
+assert decoded['tracks'][0]['path']=='WeaponRoot/FxAnchor' and len(decoded['tracks'][0]['samples'])==31
+shape_rows=module.export_clips(obj,addon)
+assert shape_rows[0]['id']==bone_rows[0]['id'] and shape_rows[0]['duration']==bone_rows[0]['duration']
+module.validate_export_members([obj],[rig])
+try:module.validate_export_members([obj]);raise AssertionError('Missing unified Armature member accepted')
+except ValueError:pass
+old_rig_action=rig.animation_data.action;old_rig_slot=rig.animation_data.action_slot
+assert bpy.ops.eiem.animation_preview()=={'FINISHED'}
+assert rig.animation_data.action!=old_rig_action and rig.animation_data.action_slot.target_id_type=='OBJECT'
+assert bpy.ops.eiem.animation_preview(stop=True)=={'FINISHED'}
+assert rig.animation_data.action==old_rig_action and rig.animation_data.action_slot==old_rig_slot
+module.remove_group(mixed_id)
+assert not obj.data.eiem_shape_animations and not rig.eiem_bone_animations
+print('PASS mixed animation group: Shape Key and authored Skeleton Action share identity, settings, sample timeline, export and preview restoration')
 print('PASS multi-mesh group: atomic creation, separate KEY slots, shared playback settings, membership, complete-export validation, synchronized preview and restoration')
 print('PASS unified animation manager without active mesh, per-member inline Action/channel editing and multiple groups sharing one mesh/channel')
 addon.unregister()
