@@ -55,6 +55,32 @@ def active(context):
     material=getattr(context,'material',None)
     return root or (root_of(material.eff_effect_author) if material and material.eff_effect_author else None)
 
+MESH_ATTACHMENT='MESH_ATTACHMENT'
+REPLACE_GAME_PREFAB='REPLACE_GAME_PREFAB'
+
+def validate_replacement_prefab_path(value):
+    path=str(value or '').strip()
+    pieces=path.split('/')
+    if (not path.startswith('assets/') or not path.endswith('.prefab') or
+            '\\' in path or any(piece in ('','.','..') for piece in pieces)):
+        raise ValueError('目标游戏 Prefab 必须是规范的 assets/.../*.prefab 逻辑路径')
+    return path
+
+def effect_usage_updated(cfg,context):
+    if cfg.usage!=REPLACE_GAME_PREFAB or cfg.replacement_prefab.strip():return
+    root=cfg.id_data
+    try:
+        state=json.loads(root.get('eff_effect_document','{}'))
+        path=validate_replacement_prefab_path(state.get('catalog',{}).get('prefab',''))
+        cfg.replacement_prefab=path
+    except (TypeError,ValueError):
+        pass
+
+def require_publishable_effect_usage(root):
+    cfg=root.eff_effect
+    if cfg.usage==REPLACE_GAME_PREFAB:
+        validate_replacement_prefab_path(cfg.replacement_prefab)
+
 def export_roots(selected=(),meshes=(),addon=None):
     """Resolve selection once; emitters/resources select their entire effect."""
     roots={root_of(obj) for obj in selected}
@@ -63,6 +89,7 @@ def export_roots(selected=(),meshes=(),addon=None):
         owners={addon.mesh_export_template(obj) for obj in meshes}
         roots.update(root for root in bpy.context.scene.objects
             if root.get('eff_effect_document') and root.eff_effect.enabled
+            and root.eff_effect.usage==MESH_ATTACHMENT
             and root.eff_effect.owner in owners)
     result=sorted(roots,key=lambda root:root.name)
     identities=[root.get('eff_effect_id') for root in result]
@@ -97,7 +124,7 @@ def native_fields(edit,identity,path=()):
     value=edit.value(identity,path);schema=edit.schema(identity,path)
     if schema['type'].startswith('PPtr<') or schema['type']=='TypelessData':return
     if isinstance(value,dict):
-        if value.get('encoding')=='base64':return
+        if value.get('encoding') in ('base64','author-payload'):return
         for key in value:yield from native_fields(edit,identity,tuple(path)+(key,))
     elif isinstance(value,list):
         for i in range(len(value)):yield from native_fields(edit,identity,tuple(path)+(i,))
@@ -332,6 +359,11 @@ class EFF_PG_effect_object(bpy.types.PropertyGroup):
         description='从原生浮点数据纹理和 UV1 查找坐标重放；不把 PNG 当作顶点数据')
     all_lods:BoolProperty(name='覆盖全部 LOD',default=True,
         description='跟随挂载部件的全部模型 LOD；导出的特效不因原生距离或质量 LOD 降级关闭。关闭则保留来源特效的降级设置')
+    usage:EnumProperty(name='特效用途',items=[
+        (MESH_ATTACHMENT,'挂载到 Mesh','Mesh 命中时，在该模型实例上挂载特效；不会替换游戏原特效'),
+        (REPLACE_GAME_PREFAB,'替换游戏特效','按游戏逻辑 Prefab 替换资源；该 Prefab 的所有调用都会受影响')],
+        default=MESH_ATTACHMENT,update=effect_usage_updated)
+    replacement_prefab:StringProperty(name='目标游戏 Prefab',description='游戏中特效 Prefab 的规范逻辑路径，例如 assets/.../effect.prefab')
     owner:PointerProperty(name='挂载目标 Mesh',type=bpy.types.Object,poll=lambda self,obj:obj.type=='MESH' and not obj.get('eff_preview'))
     bone:StringProperty(name='挂载骨骼',description='留空时挂到目标 Mesh 的 Renderer Transform；事件触发暂不支持')
     toggle_keys:CollectionProperty(type=EFF_PG_effect_key)
@@ -360,6 +392,63 @@ class EFF_OT_effect_import(bpy.types.Operator,ImportHelper):
         try:
             path=Path(self.filepath);import_source(context,path if path.is_dir() else path.parent,preserve_source=self.preserve_source);return {'FINISHED'}
         except Exception as e:self.report({'ERROR'},str(e));return {'CANCELLED'}
+
+class EFF_OT_effect_create_blank(bpy.types.Operator,ImportHelper):
+    bl_idname='eiem.effect_create_blank';bl_label='从空白创建 EFF 特效';bl_options={'UNDO'}
+    filter_glob:StringProperty(default='effect.json',options={'HIDDEN'})
+    target_mesh_name:StringProperty(name='挂载目标 Mesh',description='选择具有游戏来源证明的 Mesh 对象')
+    root_name:StringProperty(name='特效根名称',default='New Effect')
+    output_directory:StringProperty(name='输出目录',subtype='DIR_PATH')
+    def invoke(self,context,event):
+        if context.active_object and context.active_object.type=='MESH':self.target_mesh_name=context.active_object.name
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+    def draw(self,context):
+        self.layout.prop_search(self,'target_mesh_name',bpy.data,'objects',text='挂载目标 Mesh')
+        self.layout.prop(self,'root_name')
+        self.layout.prop(self,'output_directory')
+    def execute(self,context):
+        try:
+            owner=bpy.data.objects.get(self.target_mesh_name)
+            document.require(owner and owner.type=='MESH' and not owner.get('eff_preview'),
+                'Select an imported game Mesh with source proof as the mount target')
+            path=str(owner.data.get('eiem_target_path','') or owner.data.get('eiem_source',''))
+            asset=str(owner.data.get('eiem_target_asset','') or owner.data.get('eiem_asset',''))
+            document.require(path and asset,'Mount target Mesh has no game logical path/asset identity')
+            proof_path=Path(owner.get('eiem_author_package',''))/'source/manifest.json'
+            document.require(proof_path.is_file(),'Mount target Mesh has no EFF source proof')
+            proof=json.loads(proof_path.read_text('utf-8-sig'))
+            source=next((row for row in proof.get('resources',[]) if row.get('type')=='Mesh' and
+                row.get('logicalPath')==path and row.get('name')==asset),None)
+            uses=[row for row in proof.get('rendererUses',[]) if source and
+                row.get('mesh',{}).get('identity')==source['identity']]
+            document.require(uses,'Source manifest has no Renderer proof for this Mesh')
+            owner_path=str(owner.get('eiem_source_owner_path',''))
+            document.require(any(row.get('ownerPath')==owner_path for row in uses) or len(uses)==1,
+                'Mount target Mesh has ambiguous source Renderers')
+            target_prefab=str(proof.get('prefab',''))
+            document.require(target_prefab.startswith('assets/') and target_prefab.endswith('.prefab') and '..' not in target_prefab,
+                'Mount target source manifest has an invalid Prefab path')
+            donor=Path(self.filepath).resolve()
+            if donor.is_file():donor=donor.parent
+            document.load_source(donor)
+            compiler=Path(__file__).resolve().parent.parent/'AnimeStudio/AnimeStudio.GUI/bin/Debug/net9.0-windows'
+            executable=compiler/'AnimeStudio.GUI.exe';assembly=compiler/'AnimeStudio.GUI.dll'
+            command=[str(executable)] if executable.is_file() else (['dotnet',str(assembly)] if assembly.is_file() else None)
+            document.require(command is not None,'请先构建 AnimeStudio GUI 命令行工具')
+            slug=''.join(c if c.isalnum() or c in ('-','_') else '_' for c in self.root_name).strip('_') or 'New_Effect'
+            folder=Path(bpy.path.abspath(self.output_directory)).resolve() if self.output_directory else donor.parent/'created-effects'
+            package=folder/(slug+'.efffx')
+            result=subprocess.run(command+['--create-eff-effect',str(donor),target_prefab,str(package),self.root_name],
+                capture_output=True,text=True,encoding='utf-8',errors='replace',creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+            document.require(result.returncode==0,(result.stderr or result.stdout)[-1600:] or 'AnimeStudio 创建失败')
+            root=import_source(context,package)
+            root.eff_effect.owner=owner
+            attachment(root)
+            self.report({'INFO'},'已创建空白作者特效：'+str(package))
+            return {'FINISHED'}
+        except Exception as error:
+            self.report({'ERROR'},str(error));return {'CANCELLED'}
 
 class EFF_OT_effect_edit_import(bpy.types.Operator,ImportHelper):
     bl_idname='eiem.effect_edit_import';bl_label='导入 EFF 特效编辑';bl_options={'UNDO'}
@@ -887,6 +976,16 @@ class EFF_OT_effect_build(bpy.types.Operator,ExportHelper):
 def attachment(root,part='',addon=None):
     cfg=root.eff_effect;owner=cfg.owner
     stored = root.get('eff_effect_attachment')
+    if cfg.usage==REPLACE_GAME_PREFAB:
+        target=validate_replacement_prefab_path(cfg.replacement_prefab)
+        position,rotation,scale=(BASIS.inverted()@root.matrix_local@BASIS).decompose()
+        toggle_keys=[switch_controls.validate_switch_key(item.key) for item in cfg.toggle_keys]
+        document.require(len(toggle_keys)==len(set(toggle_keys)),'effect toggle keys must be unique')
+        return dict(id=root['eff_effect_id'],label=root.name,mode='replace_game_prefab',
+                    replacementPrefab=target,targetPrefab=target,rendererPath='',
+                    targetPath='',targetAsset='',bones=[],part='',bone='',autoplay=True,keys=toggle_keys,
+                    build=bpy.path.abspath(cfg.build_path),position=list(position),
+                    rotation=[rotation.x,rotation.y,rotation.z,rotation.w],scale=list(scale))
     if not owner and stored:
         try:
             declared=json.loads(stored) if isinstance(stored,str) else dict(stored)
@@ -901,7 +1000,7 @@ def attachment(root,part='',addon=None):
         document.require(len(toggle_keys)==len(set(toggle_keys)),'effect toggle keys must be unique')
         row=dict(declared)
         row.update(id=root['eff_effect_id'],label=root.name,
-                   part=part or declared.get('part',''),bone=bone,autoplay=True,
+                   mode='mesh_attachment',part=part or declared.get('part',''),bone=bone,autoplay=True,
                    keys=toggle_keys,build=bpy.path.abspath(cfg.build_path),
                    position=list(position),rotation=[rotation.x,rotation.y,rotation.z,rotation.w],
                    scale=list(scale))
@@ -934,11 +1033,12 @@ def attachment(root,part='',addon=None):
         raise ValueError('骨骼挂载需要目标 Mesh 的完整骨架调色板')
     toggle_keys=[switch_controls.validate_switch_key(item.key) for item in cfg.toggle_keys]
     document.require(len(toggle_keys)==len(set(toggle_keys)),'特效显隐按键不能重复')
-    return dict(id=root['eff_effect_id'],label=root.name,part=part,bone=bone,autoplay=True,keys=toggle_keys,build=bpy.path.abspath(cfg.build_path),position=list(position),rotation=[rotation.x,rotation.y,rotation.z,rotation.w],scale=list(scale),targetPath=path,targetAsset=asset,bones=palette,targetPrefab=proof['prefab'],rendererPath=use['ownerPath'])
+    return dict(id=root['eff_effect_id'],label=root.name,mode='mesh_attachment',part=part,bone=bone,autoplay=True,keys=toggle_keys,build=bpy.path.abspath(cfg.build_path),position=list(position),rotation=[rotation.x,rotation.y,rotation.z,rotation.w],scale=list(scale),targetPath=path,targetAsset=asset,bones=palette,targetPrefab=proof['prefab'],rendererPath=use['ownerPath'])
 def export_attachments(meshes,parts,addon,effect_roots=()):
     selected={addon.mesh_export_template(obj) for obj in meshes};result=[]
     declared={part['partId'] for part in parts}
     for root in export_roots(effect_roots,meshes,addon):
+        require_publishable_effect_usage(root)
         owner=root.eff_effect.owner;part=''
         if owner in selected:
             splits=list(addon.native_export.split_material(addon.native_export._cached_mesh_snapshot(addon,owner)[0]))
@@ -973,16 +1073,18 @@ class ExportBatch:
     """One selection, one destination, one publication for all effect roots."""
     def __init__(self,roots,destination):
         self.roots=export_roots(roots);self.destination=Path(destination).resolve()
-        self.requests=[];self.index=0;self.current=None;self.stats=None;self.owns_build=False
+        self.requests=[];self.states=[];self.index=0;self.current=None;self.stats=None;self.owns_build=False
         self.started=time.perf_counter()
         self.costs=dict(author=0.,compile=0.,publish=0.);self.compile_started=0.
         document.require(self.roots,'请选择 EFF 网格或特效根 / 发射器')
         document.require(not _BUILD_RUNNING,'已有特效正在构建')
-        raise ValueError('独立特效写回尚未接入 Format 3；请使用完整 Format 3 导出。')
         for root in self.roots:
+            require_publishable_effect_usage(root)
             attachment(root)
             edit=synchronize(root);store(root,edit)
-            self.requests.append(build_request(root))
+            payload=assets.export_document(root,edit)
+            self.states.append(copy.deepcopy(edit.state))
+            self.requests.append(build_request(root,payload))
         self.costs['author']=(time.perf_counter()-self.started)*1000
 
     def poll(self):
@@ -1000,18 +1102,23 @@ class ExportBatch:
             self.current=request;self.compile_started=time.perf_counter();request.start();return False
         phase=time.perf_counter()
         rows=[]
-        for root,request in zip(self.roots,self.requests):
+        from . import eiem_effect_export, eiem_format
+        effect_baselines={}
+        for root,request,state in zip(self.roots,self.requests,self.states):
             current=document.dumps(assets.export_document(root,synchronize(root))).encode('utf-8')
             document.require(current==request.author,'构建期间特效有修改，请再次导出；上一 Mod 保留')
-            row=attachment(root);row['build']=str(request.output)
-            from . import eiem_native_export
-            owner=root.eff_effect.owner
-            candidates=[eiem_native_export.mesh_part_id(owner.name,0,1)]
-            candidates.extend(eiem_native_export.mesh_part_id(owner.name,i,2) for i in range(len(owner.data.materials)))
-            row['_partCandidates']=['Part'+value.removeprefix('Mesh') for value in candidates]
+            document.require(effect_publish.inputs_signature(request.payload,request.compiler)==request.inputs,
+                             '构建后特效来源或 AnimeStudio 已改变，请重新导出；上一 Mod 保留')
+            row=attachment(root);row['part']='';row['build']=str(request.output)
+            row['_native']=effect_codec().read_native_build(request.output)
+            row['_source']=state['source']
+            source=state['source']
+            if source not in effect_baselines:
+                effect_baselines[source]=document.load_source(source)
+            row['_authorData']=eiem_format.encode_format3_effect_author(
+                source,effect_baselines[source],row,request.payload)
             rows.append(row)
         self.costs['author']+=(time.perf_counter()-phase)*1000
-        from . import eiem_effect_export
         phase=time.perf_counter()
         character_update=eiem_effect_export.publish(self.destination,rows)
         self.costs['publish']=(time.perf_counter()-phase)*1000
@@ -1056,7 +1163,8 @@ def draw_value(layout,obj,edit,identity,path,value):
         draw_pointer(layout,edit,identity,path,value,title=name+' ['+schema['type']+']')
         return
     if isinstance(value,(dict,list)):
-        if isinstance(value,dict) and value.get('encoding')=='base64':layout.label(text=name+' [原生字节，保留]');return
+        if isinstance(value,dict) and value.get('encoding') in ('base64','author-payload'):
+            layout.label(text=name+' [原生字节，保留]');return
         header,body=layout.panel(field_key(identity,path),default_closed=True);header.label(text=name+(' ['+str(len(value))+']' if isinstance(value,list) else ''))
         if isinstance(value,dict) and 'enabled' in value:
             prop=field_key(identity,path+['enabled'])
@@ -1158,7 +1266,7 @@ class EFF_PT_effect_object(bpy.types.Panel):
                 cfg=root.eff_effect
                 row=layout.row(align=True);row.prop(cfg,'preview');row.prop(cfg,'show_shape')
                 if root.get('预览错误'):layout.label(text=str(root['预览错误'])[:150],icon='ERROR')
-                for key,title in (('timeline','原始动画 / VAT'),('mount','挂载与显隐'),('export','构建工具'),('diagnostics','预览支持与来源信息')):
+                for key,title in (('timeline','原始动画 / VAT'),('mount','用途与挂载'),('export','构建工具'),('diagnostics','预览支持与来源信息')):
                     header,body=layout.panel('eff_'+key,default_closed=True);header.label(text=title)
                     if not body:continue
                     if key=='timeline':
@@ -1169,19 +1277,25 @@ class EFF_PT_effect_object(bpy.types.Panel):
                         effect_ui.hint(body,'使用 Blender 时间轴；片段覆盖只作用于预览，不会写回作者参数。')
                         effect_ui.hint(body,'独立片段不代表完整技能；Animator 状态切换、游戏脚本和原像素 Shader 仍需核对。')
                     elif key=='mount':
-                        body.prop(cfg,'enabled');body.prop(cfg,'all_lods');body.prop(cfg,'owner')
-                        if cfg.all_lods:effect_ui.hint(body,'导出时解除来源特效的距离/画质降级；同骨架的模型 LOD 共用一次播放。')
-                        rig=preview.mount_rig(cfg.owner)
-                        if rig:body.prop_search(cfg,'bone',rig.data,'bones',text='挂载骨骼 (留空为 Renderer)')
-                        else:body.prop(cfg,'bone',text='挂载骨骼 (留空为 Renderer)')
-                        body.label(text='随挂载 Mesh 显隐；触发事件暂不支持')
-                        effect_ui.hint(body,'预览跟随 Renderer Transform 或所选骨骼；根物体变换作为挂载点局部偏移。')
-                        key_box=body.box();key_header=key_box.row(align=True);key_header.label(text='特效显隐按键')
-                        op=key_header.operator('eiem.effect_key',text='录制按键',icon='REC');op.action='ADD';op.root_name=root.name
-                        for index,item in enumerate(cfg.toggle_keys):
-                            row=key_box.row(align=True);row.label(text=item.key,icon='EVENT_F')
-                            op=row.operator('eiem.effect_key',text='',icon='X');op.action='REMOVE';op.root_name=root.name;op.index=index
-                        if not cfg.toggle_keys:effect_ui.hint(key_box,'未设置时默认随挂载 Mesh 显示；录制多个按键后，任一按键都会切换此特效。')
+                        body.prop(cfg,'usage',text='特效用途')
+                        if cfg.usage==MESH_ATTACHMENT:
+                            body.prop(cfg,'enabled');body.prop(cfg,'all_lods');body.prop(cfg,'owner')
+                            if cfg.all_lods:effect_ui.hint(body,'导出时解除来源特效的距离/画质降级；同骨架的模型 LOD 共用一次播放。')
+                            rig=preview.mount_rig(cfg.owner)
+                            if rig:body.prop_search(cfg,'bone',rig.data,'bones',text='挂载骨骼 (留空为 Renderer)')
+                            else:body.prop(cfg,'bone',text='挂载骨骼 (留空为 Renderer)')
+                            body.label(text='仅在命中该 Mesh 时挂载；不会替换游戏原特效')
+                            effect_ui.hint(body,'预览跟随 Renderer Transform 或所选骨骼；根物体变换作为挂载点局部偏移。')
+                            key_box=body.box();key_header=key_box.row(align=True);key_header.label(text='特效显隐按键')
+                            op=key_header.operator('eiem.effect_key',text='录制按键',icon='REC');op.action='ADD';op.root_name=root.name
+                            for index,item in enumerate(cfg.toggle_keys):
+                                row=key_box.row(align=True);row.label(text=item.key,icon='EVENT_F')
+                                op=row.operator('eiem.effect_key',text='',icon='X');op.action='REMOVE';op.root_name=root.name;op.index=index
+                            if not cfg.toggle_keys:effect_ui.hint(key_box,'未设置时默认随挂载 Mesh 显示；录制多个按键后，任一按键都会切换此特效。')
+                        else:
+                            body.prop(cfg,'replacement_prefab',text='目标游戏 Prefab')
+                            body.label(text='会影响该逻辑 Prefab 的所有调用',icon='INFO')
+                            body.label(text='当前 DLL 尚未接入此替换路由，暂不能导出',icon='ERROR')
                     elif key=='export':
                         effect_ui.hint(body,'选中一个或多个特效，用“文件 → 导出 → EFF Mod 包”统一导出。')
                         advanced,settings=body.panel('eff_export_advanced',default_closed=True);advanced.label(text='编译器 / 编辑数据')
@@ -1244,8 +1358,9 @@ def upgrade_loaded(*_):
         # Migrate the old raw-only UI in memory, retaining pending native edits.
         edit=synchronize(root);store(root,edit);refresh_fields(root);root['eff_effect_ui_version']=2
         preview.schedule_refresh(root)
-CLASSES=(EFF_PG_effect_choice,EFF_PG_effect_angle,EFF_PG_effect_key,EFF_PG_effect_object,EFF_PG_effect_texture,EFF_OT_effect_import,EFF_OT_effect_edit_import,EFF_OT_effect_research_report,EFF_OT_effect_block,EFF_OT_effect_array,EFF_OT_effect_module_copy,EFF_OT_effect_module_paste,EFF_OT_effect_emitter_copy,EFF_OT_effect_emitter_paste,EFF_OT_effect_use_particle_emission,EFF_OT_effect_continuous,EFF_OT_effect_emitter_add,EFF_OT_effect_emitter_remove,EFF_OT_effect_pointer,EFF_OT_effect_resource,EFF_OT_effect_select,EFF_OT_effect_key,EFF_OT_effect_texture_open,EFF_OT_effect_mesh_edit,EFF_OT_effect_assets_expand,EFF_OT_effect_export,EFF_OT_effect_build,EFF_OT_effect_preview,EFF_PT_effect_object)
+CLASSES=(EFF_PG_effect_choice,EFF_PG_effect_angle,EFF_PG_effect_key,EFF_PG_effect_object,EFF_PG_effect_texture,EFF_OT_effect_import,EFF_OT_effect_create_blank,EFF_OT_effect_edit_import,EFF_OT_effect_research_report,EFF_OT_effect_block,EFF_OT_effect_array,EFF_OT_effect_module_copy,EFF_OT_effect_module_paste,EFF_OT_effect_emitter_copy,EFF_OT_effect_emitter_paste,EFF_OT_effect_use_particle_emission,EFF_OT_effect_continuous,EFF_OT_effect_emitter_add,EFF_OT_effect_emitter_remove,EFF_OT_effect_pointer,EFF_OT_effect_resource,EFF_OT_effect_select,EFF_OT_effect_key,EFF_OT_effect_texture_open,EFF_OT_effect_mesh_edit,EFF_OT_effect_assets_expand,EFF_OT_effect_export,EFF_OT_effect_build,EFF_OT_effect_preview,EFF_PT_effect_object)
 def menu_import(self,context):
+    self.layout.operator('eiem.effect_create_blank',text='EFF 特效：从空白创建',icon='PARTICLES')
     self.layout.operator('eiem.effect_import',text='EFF 特效（空物体）')
     self.layout.operator('eiem.effect_edit_import',text='EFF 特效编辑（.effedit.json）')
 def menu_add(self,context):self.layout.operator('eiem.effect_import',text='EFF 特效来源',icon='EMPTY_AXIS')

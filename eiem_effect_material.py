@@ -4,14 +4,22 @@ The Material's eiem_* author properties are the editing surface, just as for
 ordinary .mat imports. Empty fields remain only for saved-project migration.
 """
 import json
+import importlib
 from pathlib import Path
 
 import bpy
 
-from . import eiem_effect_document as document
-from . import eiem_material_editor as material_editor
-from . import eiem_native_export as native_export
-from .nativepack import type_tree
+_MODULE_PREFIX = (__package__ + ".") if __package__ else ""
+
+
+def _module(name):
+    return importlib.import_module(_MODULE_PREFIX + name)
+
+
+document = _module("eiem_effect_document")
+material_editor = _module("eiem_material_editor")
+native_export = _module("eiem_native_export")
+type_tree = _module("nativepack.type_tree")
 
 _SCHEMAS = {}
 PREFIXES = ('eiem_float.', 'eiem_int.', 'eiem_value4.', 'eiem_color.',
@@ -34,7 +42,7 @@ def _source(edit, identity):
 
 def properties(edit, identity):
     """Same portable property names used by load_material and .mat export."""
-    from . import eiem_effect_preview as preview
+    preview = _module("eiem_effect_preview")
     data = edit.value(identity)
     result = {}
     for group, kind in (('m_Floats', 'float'), ('m_Ints', 'int'), ('m_Colors', 'value4')):
@@ -56,8 +64,8 @@ def properties(edit, identity):
 
 def setup(material, root, edit, identity):
     if material.get('eff_material_editor_version') == 1:return
-    from . import eiem_effect_assets as assets
-    from . import eiem_effect_preview as preview
+    assets = _module("eiem_effect_assets")
+    preview = _module("eiem_effect_preview")
     values = properties(edit, identity)
     # Preserve legacy selected images, including packed/painted buffers. They
     # remain an export fallback; new editing always uses the ordinary path UI.
@@ -156,7 +164,7 @@ def synchronize(root, edit, api):
 
 
 def texture_path(root, identity, slot):
-    from . import eiem_effect_assets as assets
+    assets = _module("eiem_effect_assets")
     material = material_for(assets.material_object(root, identity))
     if not material:return None
     key = 'eiem_texture.' + slot
@@ -200,7 +208,7 @@ def draw(layout, author):
 def draw_sources(layout, material):
     author = material.eff_effect_author
     if not author:return
-    from . import eiem_effect_ui as ui
+    ui = _module("eiem_effect_ui")
     header, body = layout.panel('eff_texture_provenance_' + material.get('eiem_section', ''), default_closed=True)
     header.label(text='特效贴图来源 / 用途',icon='TEXTURE')
     if body is None:return
@@ -212,7 +220,7 @@ def draw_sources(layout, material):
         data=json.loads(slot.source_metadata or '{}')
         if not data.get('identity'):continue
         box=body.box()
-        from . import eiem_material_features as features
+        features = _module("eiem_material_features")
         box.label(text=features.label('eiem_texture.'+slot.name))
         box.label(text=slot.name+' → '+data.get('name',''))
         ui.hint(box,roles.get(slot.name,'按原 Shader 采样；具体通道用途请结合原参数核对'))

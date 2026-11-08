@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 50, 6),
+    "version": (0, 50, 7),
     "blender": (5, 2, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
@@ -1542,12 +1542,18 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
             effect_root.name = attachment.get("label") or section
             effect_root.eff_effect.enabled = True
             effect_root.eff_effect.build_path = ""
+            effect_root.eff_effect.usage = (
+                effect_editor.REPLACE_GAME_PREFAB
+                if attachment.get("mode") == "replace_game_prefab"
+                else effect_editor.MESH_ATTACHMENT)
+            effect_root.eff_effect.replacement_prefab = attachment.get(
+                "replacementPrefab", "")
             owner = part_meshes.get(attachment.get("part", ""))
             if owner is None:
                 owner = next((obj for obj in meshes.values()
                               if obj.get("eiem_target_path") == attachment.get("targetPath") and
                               obj.get("eiem_target_asset") == attachment.get("targetAsset")), None)
-            if owner is not None:
+            if owner is not None and effect_root.eff_effect.usage == effect_editor.MESH_ATTACHMENT:
                 effect_root.eff_effect.owner = owner
                 owner["eiem_source_owner_path"] = attachment.get("rendererPath", "")
                 rig = effect_editor.preview.mount_rig(owner)
@@ -2985,10 +2991,10 @@ def selected_export_resources(context=None):
     effects=effect_editor.export_roots(context.selected_objects,meshes,sys.modules[__name__])
     physics = selected_eiem_physics(context)
     if not meshes:
-        if effects:
-            raise ValueError('Format 3 完整导出需要选择目标 EFF Mesh；独立特效包尚未接通。')
         if physics:
             raise ValueError('Format 3 完整导出需要选择目标 EFF Mesh。')
+        if effects:
+            return meshes, rigs, effects, physics
         raise ValueError('请选择要导出的 EFF Mesh。')
     return meshes, rigs, effects, physics
 
@@ -3132,7 +3138,13 @@ def export_package(root, mesh_objects=None, armatures=None, physics_objects=None
         if physics_objects is None:
             physics_objects = selected_physics
     if not mesh_objects:
-        raise ValueError('Format 3 完整导出需要至少一个 EFF Mesh。')
+        if physics_objects:
+            raise ValueError('Format 3 Physics 导出需要至少一个 EFF Mesh。')
+        if not effect_roots:
+            raise ValueError('请选择要导出的 EFF Mesh 或特效。')
+        if bpy.context.mode != 'OBJECT':
+            raise ValueError('请回到物体模式后导出')
+        return effect_editor.ExportBatch(effect_roots, root).run()
     if not source_baseline:
         source_baseline = getattr(bpy.context.scene, 'eiem_source_baseline', '')
     if bpy.context.mode != 'OBJECT':

@@ -4,6 +4,7 @@ No game/runtime dependency. Float VAT data must never pass through the PNG
 display conversion. Native snapshots stay authoritative and are not modified.
 """
 import hashlib
+import base64
 import json
 from pathlib import Path
 
@@ -47,6 +48,15 @@ class Reader:
 
     def tree(self, identity):
         spec = self.edit.objects[identity]
+        authored = next((row for row in self.edit.state.get('author_assets', [])
+                         if row.get('identity', '').casefold() == identity.casefold()), None)
+        if authored:
+            source_tree, _ = self.tree(authored['template'])
+            payload = base64.b64decode(authored['payloadBase64'], validate=True)
+            tree = type_tree.decode(source_tree.schema, payload)
+            document.require(type_tree.encode(tree) == payload,
+                             'Authored resource payload does not round-trip')
+            return tree, payload
         if spec.get('template'):
             spec = self.edit.objects[spec['template']]
         native = spec['native']

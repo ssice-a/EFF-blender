@@ -105,6 +105,13 @@ for cycle in range(3):
     assert hasattr(bpy.types, "MATERIAL_PT_eiem_properties")
     assert not hasattr(bpy.types, "EFF_PT_effect_material")
     assert bpy.ops.eiem.effect_import.get_rna_type() is not None
+    assert bpy.ops.eiem.effect_create_blank.get_rna_type() is not None
+    blank_properties = bpy.ops.eiem.effect_create_blank.get_rna_type().properties
+    target_mesh_property = blank_properties.get('target_mesh_name')
+    assert target_mesh_property and target_mesh_property.type == 'STRING', \
+        "Blank effect creator failed to register its mount-target selector"
+    assert 'target_mesh' not in blank_properties, \
+        "Blank effect creator must not register an unsupported object pointer"
     assert bpy.ops.eiem.effect_export.get_rna_type() is not None
     assert bpy.ops.eiem.effect_build.get_rna_type() is not None
     assert bpy.ops.eiem.effect_curve_edit.get_rna_type() is not None

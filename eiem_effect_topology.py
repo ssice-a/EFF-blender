@@ -114,6 +114,7 @@ def expected_children(edit, identity):
 
 def export(edit):
     added = [dict(identity=i, template=o['template'], data=copy.deepcopy(edit.value(i)))
-             for i, o in edit.objects.items() if o.get('template')]
+             for i, o in edit.objects.items()
+             if o.get('template') and o.get('classId') in KINDS]
     removed = edit.state.get('removed_emitters', [])
     return dict(added=added, removed=removed) if added or removed else None

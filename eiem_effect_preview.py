@@ -14,6 +14,7 @@ if __package__:
 else:
     import eiem_effect_simulation as sim
     import eiem_effect_assets as assets
+    import eiem_effect_playback as playback
 _sync=None
 _root_of=None
 _busy=False
@@ -37,17 +38,20 @@ def _collection(root):
     return bpy.data.collections.get(name) or root.users_collection[0]
 def _resources(root,edit):
     return {r['identity']:r for r in edit.state['catalog'].get('preview',{}).get('resources',[]) if r.get('file')}
+def _canonical_identity(edit,identity):
+    return next((key for key in edit.objects if key.casefold()==identity.casefold()),identity) if identity else None
 def _target(edit,identity,path):
     ptr=edit.value(identity,path)
     refs=edit.objects[identity].get('references',[])
     field='$.'+'.'.join(map(str,path))
     # Resolve edited PPtr as well as unchanged original references.
     row=next((r for r in refs if r['fileId']==ptr.get('m_FileID') and r['pathId']==ptr.get('m_PathID')),None)
-    if row:return row.get('identity')
+    if row:return _canonical_identity(edit,row.get('identity'))
     own=edit.objects[identity]['native']['cab'].lower()
     cab=own if ptr.get('m_FileID')==0 else next(((r.get('cab') or '').lower() for o in edit.objects.values()
         if o['native']['cab'].lower()==own for r in o['references'] if r['fileId']==ptr.get('m_FileID') and r.get('cab')),None)
-    return (cab+':'+str(ptr.get('m_PathID'))) if cab and ptr.get('m_PathID') else None
+    target=(cab+':'+str(ptr.get('m_PathID'))) if cab and ptr.get('m_PathID') else None
+    return _canonical_identity(edit,target)
 
 def _texture_coordinates(nodes,links,texture,settings,slot=''):
     uv=nodes.new('ShaderNodeTexCoord');mapping=nodes.new('ShaderNodeVectorMath');mapping.operation='MULTIPLY_ADD'

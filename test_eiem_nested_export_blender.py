@@ -8,6 +8,7 @@ import sys
 
 addon_dir,scene,character,output=map(Path,sys.argv[sys.argv.index('--')+1:])
 sys.path.insert(0,str(addon_dir.resolve().parent))
+from nativepack import ini_reader
 package=importlib.import_module(addon_dir.name);package.register()
 addon=package.eiem_blender_addon
 bpy.ops.wm.open_mainfile(filepath=str(scene),load_ui=False,use_scripts=False)
@@ -31,11 +32,11 @@ child=parent/'petals'
 assert (child/'mod.ini').is_file()
 before={p.relative_to(child).as_posix():p.read_bytes() for p in child.rglob('*') if p.is_file()}
 modules,_=addon.native_export.pack_modules()
-assert len(modules['ini_reader'].read_package(child)['effects'])==1
+assert len(ini_reader.read_package(child)['effects'])==1
 select(root.eff_effect.owner,root);bpy.context.scene.eiem_export_mod_name=parent.name
 assert bpy.ops.eiem.export_package('EXEC_DEFAULT',directory=str(output),lod_all=False,lod0=True)=={'FINISHED'}
 assert before=={p.relative_to(child).as_posix():p.read_bytes() for p in child.rglob('*') if p.is_file()}
-read=modules['ini_reader'].read_package(parent)
+read=ini_reader.read_package(parent)
 assert read['parts'] and read['effects'] and (parent/'compiled.bin').is_file()
 assert not any(name.startswith('petals/') for name in read['_files'])
 report=dict(passed=True,nestedEffectExported=True,parentNativeReexported=True,

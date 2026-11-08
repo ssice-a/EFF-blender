@@ -10,6 +10,7 @@ import time
 
 addon_dir,scene,output=map(Path,sys.argv[sys.argv.index('--')+1:])
 sys.path.insert(0,str(addon_dir.resolve().parent))
+from nativepack import ini_reader
 package=importlib.import_module(addon_dir.name);package.register()
 addon=package.eiem_blender_addon;fx=addon.effect_editor
 bpy.ops.wm.open_mainfile(filepath=str(scene),load_ui=False,use_scripts=False)
@@ -46,7 +47,7 @@ bpy.context.scene.eiem_export_mod_name=target.name
 began=time.perf_counter()
 assert bpy.ops.eiem.export_package('EXEC_DEFAULT',directory=str(output),filepath=str(target))=={'FINISHED'}
 duration=time.perf_counter()-began
-read=modules['ini_reader'].read_package(target)
+read=ini_reader.read_package(target)
 assert len(read['effects'])==2 and not read['parts'] and not (target/'compiled.bin').exists()
 assert not any(e['part'] for e in read['effects'])
 assert {e['id'] for e in read['effects']}=={first['eff_effect_id'],second['eff_effect_id']}
@@ -62,7 +63,7 @@ assert before==hashes(target) and not (output/'different-next-export').exists()
 select(emitter)
 single=output/'single-effect';bpy.context.scene.eiem_export_mod_name=single.name
 assert bpy.ops.eiem.export_package('EXEC_DEFAULT',directory=str(output))=={'FINISHED'}
-assert [e['id'] for e in modules['ini_reader'].read_package(single)['effects']]==[second['eff_effect_id']]
+assert [e['id'] for e in ini_reader.read_package(single)['effects']]==[second['eff_effect_id']]
 # A failed second effect must preserve the entire prior package.
 select(first,second);bpy.context.scene.eiem_export_mod_name=target.name
 compiler=second.eff_effect.compiler;second.eff_effect.compiler=str(output/'missing-compiler.exe')
@@ -97,7 +98,7 @@ first_emitter[field['key']]=original_value
 empty=output/'new-empty-directory';empty.mkdir(exist_ok=True)
 bpy.context.scene.eiem_export_mod_name=empty.name
 assert bpy.ops.eiem.export_package('EXEC_DEFAULT',directory=str(output))=={'FINISHED'}
-assert len(modules['ini_reader'].read_package(empty)['effects'])==2
+assert len(ini_reader.read_package(empty)['effects'])==2
 # Explicitly selecting a disabled attachment still selects that effect.
 second.eff_effect.enabled=False
 assert second in fx.export_roots([second])
@@ -118,14 +119,15 @@ mixed=output/'character-and-effects';bpy.context.scene.eiem_export_mod_name=mixe
 began=time.perf_counter()
 assert bpy.ops.eiem.export_package('EXEC_DEFAULT',directory=str(output),lod_all=False,lod0=True)=={'FINISHED'}
 mixed_seconds=time.perf_counter()-began
-read=modules['ini_reader'].read_package(mixed)
+read=ini_reader.read_package(mixed)
 assert read['parts'] and len(read['effects'])==2 and all(e['part'] for e in read['effects'])
 assert (mixed/'compiled.bin').is_file()
-# An effect-only export merges the selection into the existing character.
+# Effect-only updates are intentionally rejected for character packages.
 before_mixed=hashes(mixed);select(first)
-assert bpy.ops.eiem.export_package('EXEC_DEFAULT',directory=str(output))=={'FINISHED'}
-assert len(modules['ini_reader'].read_package(mixed)['effects'])==2
-assert all(hashes(mixed)[name]==digest for name,digest in before_mixed.items() if name not in ('mod.ini','compiled.bin'))
+try:bpy.ops.eiem.export_package('EXEC_DEFAULT',directory=str(output))
+except RuntimeError:pass
+else:raise AssertionError('effect-only export modified a character package')
+assert hashes(mixed)==before_mixed
 # A mixed export cannot replace a dedicated effect package either.
 select(owner,first);bpy.context.scene.eiem_export_mod_name=target.name
 try:bpy.ops.eiem.export_package('EXEC_DEFAULT',directory=str(output))
@@ -135,7 +137,7 @@ assert hashes(target)==before
 report=dict(passed=True,effectOnlySeconds=duration,mixedSeconds=mixed_seconds,
     batchEffects=2,childDeduplication=True,selectionAuthoritative=True,
     quickDestinationShared=True,atomicFailurePreserved=True,statePreserved=True,
-    emptyDirectory=True,mixedNativeCompiled=True,characterEffectMerge=True,characterOverEffectRejected=True,
+    emptyDirectory=True,mixedNativeCompiled=True,characterEffectIncrementalRejected=True,characterOverEffectRejected=True,
     staleBatchRejected=True,cancellationPreserved=True)
 (output/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
 print('PASS UNIFIED EXPORT '+json.dumps(report),flush=True)

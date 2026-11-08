@@ -5,10 +5,14 @@ Native validation/reconstruction is performed by AnimeStudio --build-eff-effects
 against the preserved baseline.
 """
 import copy
+import base64
 import hashlib
 import json
 import math
 from pathlib import Path
+import re
+import struct
+import zlib
 
 EDITABLE = {4, 21, 114, 198, 199}
 LOCKED = {'m_GameObject', 'm_Script', 'm_Father', 'm_Children', 'm_ObjectHideFlags',
@@ -365,34 +369,392 @@ class Editor:
 
 
 def apply_edit(state, edit):
-    """Apply a validated native edit document to a loaded source workspace.
-
-    Author asset additions and emitter topology are intentionally rejected
-    until their cross-file materialization path exists; silently dropping
-    either would make a round trip appear successful while changing output.
-    """
+    """Apply an edit document, including authored resources and emitter topology."""
     require(edit.get('sourceManifestSha256', '').upper() ==
             state.get('sourceManifestSha256', '').upper(), '特效来源 manifest 摘要不一致')
     require(edit.get('sourceEffectSha256', '').upper() ==
             state.get('sourceEffectSha256', '').upper(), '特效来源 effect 摘要不一致')
-    require(not edit.get('assets'), '当前导入入口不能恢复作者 Mesh/Material/Texture additions')
-    require(not edit.get('emitters'), '当前导入入口不能恢复发射器拓扑操作；请导入 Format 3 作者资源')
-    editor = Editor(state)
+    require(isinstance(edit.get('objects', []), list), '特效编辑对象列表无效')
+    candidate = copy.deepcopy(state)
+    editor = Editor(candidate)
     seen = set()
     for row in edit.get('objects', []):
         identity = row.get('identity')
         require(identity and identity not in seen, '特效编辑文档包含重复对象')
         seen.add(identity)
-        require(identity in editor.objects and identity in state['values'],
+        require(identity in editor.objects and identity in candidate['values'],
                 '特效编辑对象不在当前来源中：' + str(identity))
         require(row.get('sourceDataSha256', '').upper() ==
-                state['hashes'].get(identity, '').upper(),
+                candidate['hashes'].get(identity, '').upper(),
                 '特效编辑对象来源摘要不一致：' + str(identity))
         require(editor.objects[identity].get('classId') in EDITABLE,
                 '特效编辑对象不可写：' + str(identity))
         require(isinstance(row.get('data'), dict), '特效编辑对象数据不是对象：' + str(identity))
-        state['values'][identity] = copy.deepcopy(row['data'])
+        try:
+            from .nativepack import type_tree
+        except ImportError:
+            from nativepack import type_tree
+        schema = type_tree.Schema.compile(
+            candidate['schemas'][editor.objects[identity]['schema']]['nodes'])
+        type_tree.from_data(schema, _native_input(row['data']))
+        candidate['values'][identity] = copy.deepcopy(row['data'])
+
+    _apply_authored_assets(candidate, edit.get('assets', []), editor)
+    _apply_emitter_edits(candidate, edit.get('emitters'), editor)
+    state.clear()
+    state.update(candidate)
     return state
+
+
+def _native_plain(value):
+    if isinstance(value.data, bytes):
+        return value.data
+    if value.schema.type == 'Array':
+        return [_native_plain(item) for item in value.items()]
+    if isinstance(value.data, dict):
+        if list(value.data) == ['Array']:
+            return _native_plain(value.data['Array'])
+        return {key: _native_plain(item) for key, item in value.data.items()}
+    return value.data
+
+
+def _native_input(value):
+    if isinstance(value, dict):
+        if value.get('encoding') == 'base64':
+            require(set(value) == {'encoding', 'bytes'} and isinstance(value['bytes'], str),
+                    '原生字节数组编码无效')
+            try:
+                return base64.b64decode(value['bytes'], validate=True)
+            except (ValueError, base64.binascii.Error) as error:
+                raise ValueError('原生字节数组编码无效') from error
+        return {key: _native_input(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_native_input(item) for item in value]
+    return value
+
+
+def _workspace_plain(value):
+    """Keep author bytes in the edit payload, not duplicated in Blender JSON state."""
+    if isinstance(value, bytes):
+        return {'encoding': 'author-payload', 'size': len(value)}
+    if isinstance(value, dict):
+        return {key: _workspace_plain(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_workspace_plain(item) for item in value]
+    return value
+
+
+def _identity_from_pointer(cab, pointer):
+    if not isinstance(pointer, dict):
+        return None
+    try:
+        file_id, path_id = int(pointer.get('m_FileID', 0)), int(pointer.get('m_PathID', 0))
+    except (TypeError, ValueError):
+        return None
+    return cab + ':' + str(path_id) if file_id == 0 and path_id else None
+
+
+def _json_path(value, path):
+    current = value
+    for field, index in re.findall(r'\.([^\.\[\]]+)|\[(\d+)\]', path):
+        current = current[int(index)] if index else current[field]
+    return current
+
+
+def _references_for_data(spec, data, objects):
+    """Keep source pointer metadata aligned with a cloned TypeTree value."""
+    result = []
+    for source in spec.get('references', []):
+        field = source.get('field', '')
+        try:
+            pointer = _json_path(data, field)
+            file_id, path_id = int(pointer.get('m_FileID', 0)), int(pointer.get('m_PathID', 0))
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError):
+            continue
+        cab = spec['native']['cab'] if file_id == 0 else (
+            source.get('cab') if int(source.get('fileId', -1)) == file_id else None)
+        identity = cab + ':' + str(path_id) if cab and path_id else None
+        target = next((obj for key, obj in objects.items()
+                       if identity and key.casefold() == identity.casefold()), None)
+        result.append(dict(field=field, fileId=file_id, pathId=path_id, cab=cab,
+                           isNull=not path_id or file_id < 0,
+                           resolved=bool(target), identity=target.get('identity') if target else identity,
+                           type=target.get('type') if target else source.get('type')))
+    return result
+
+
+def _decode_preview_png(row, class_id):
+    encoded = row.get('previewPngBase64')
+    if encoded is None:
+        return None
+    require(class_id == 28 and isinstance(encoded, str) and
+            len(encoded) <= 44 * 1024 * 1024,
+            '仅 Texture2D 作者资源可以携带 PNG 预览')
+    try:
+        payload = base64.b64decode(encoded, validate=True)
+    except (ValueError, base64.binascii.Error) as error:
+        raise ValueError('作者贴图 PNG 预览编码无效') from error
+    require(33 <= len(payload) <= 32 * 1024 * 1024 and
+            payload[:8] == b'\x89PNG\r\n\x1a\n' and
+            struct.unpack('>I', payload[8:12])[0] == 13 and
+            payload[12:16] == b'IHDR',
+            '作者贴图 PNG 预览头无效或超过 32 MiB')
+    width, height = struct.unpack('>II', payload[16:24])
+    require(0 < width <= 4096 and 0 < height <= 4096 and
+            width * height <= 16 * 1024 * 1024,
+            '作者贴图 PNG 预览尺寸无效')
+    offset, saw_idat, saw_iend = 8, False, False
+    while offset + 12 <= len(payload):
+        size = struct.unpack('>I', payload[offset:offset + 4])[0]
+        end = offset + 12 + size
+        require(end <= len(payload), '作者贴图 PNG 区块越界')
+        kind = payload[offset + 4:offset + 8]
+        data = payload[offset + 8:offset + 8 + size]
+        checksum = struct.unpack('>I', payload[offset + 8 + size:end])[0]
+        require(zlib.crc32(kind + data) == checksum, '作者贴图 PNG 校验值无效')
+        if kind == b'IDAT':
+            saw_idat = True
+        elif kind == b'IEND':
+            require(size == 0, '作者贴图 PNG 结束区块无效')
+            saw_iend = True
+            offset = end
+            break
+        offset = end
+    require(saw_idat and saw_iend and offset == len(payload),
+            '作者贴图 PNG 缺少图像数据或结束区块')
+    return payload
+
+
+def _apply_authored_assets(state, rows, editor):
+    require(isinstance(rows, list) and len(rows) <= 4096, '作者资源列表无效')
+    if not rows:
+        return
+    try:
+        from . import eiem_effect_native
+        from .nativepack import type_tree
+    except ImportError:
+        import eiem_effect_native
+        from nativepack import type_tree
+    reader = eiem_effect_native.Reader(editor)
+    objects = editor.objects
+    known = {identity.casefold() for identity in objects}
+    additions, total = [], 0
+    for row in rows:
+        require(isinstance(row, dict), '作者资源记录无效')
+        identity, template = row.get('identity'), row.get('template')
+        require(isinstance(identity, str) and isinstance(template, str) and
+                template in objects and identity.casefold() not in known,
+                '作者资源缺少独立身份或模板')
+        source = objects[template]
+        require(source.get('state') in ('parsed', 'raw-backed') and
+                source.get('classId') in (21, 28, 43) and
+                not source.get('template'), '作者资源模板或类型不受支持')
+        native = source['native']
+        identity_cab, separator, path_id_text = identity.rpartition(':')
+        require(separator and identity_cab.casefold() == native['cab'].casefold(),
+                '作者资源必须使用模板的源文件')
+        try:
+            path_id = int(path_id_text)
+        except (TypeError, ValueError) as error:
+            raise ValueError('作者资源 PathID 无效') from error
+        require(path_id != 0, '作者资源 PathID 无效')
+        source_file = next(file for file in reader.manifest['serializedFiles']
+                           if file['cab'].casefold() == native['cab'].casefold())
+        source_ids = {int(item['pathId']) for item in source_file.get('objects', [])}
+        require(path_id not in source_ids and
+                all(item[0]['native']['pathId'] != path_id for item in additions
+                    if item[0]['native']['cab'].casefold() == native['cab'].casefold()),
+                '作者资源 PathID 与源对象冲突')
+        tree, raw = reader.tree(template)
+        require(hashlib.sha256(raw).hexdigest().upper() ==
+                str(row.get('sourceObjectSha256', '')).upper(),
+                '作者资源模板数据摘要不一致')
+        encoded = row.get('payloadBase64')
+        require(isinstance(encoded, str) and len(encoded) <= 384 * 1024 * 1024,
+                '作者资源超过大小限制')
+        try:
+            payload = base64.b64decode(encoded, validate=True)
+        except (ValueError, base64.binascii.Error) as error:
+            raise ValueError('作者资源数据格式无效') from error
+        total += len(payload)
+        preview_png = _decode_preview_png(row, source['classId'])
+        if preview_png is not None:
+            total += len(preview_png)
+        require(total <= 256 * 1024 * 1024, '作者资源合计超过 256 MiB')
+        decoded = type_tree.decode(tree.schema, payload)
+        require(type_tree.encode(decoded) == payload, '作者资源数据无法往返')
+        data = _native_plain(decoded)
+        type_tree.from_data(tree.schema, data)
+        data = _workspace_plain(data)
+        spec = copy.deepcopy(source)
+        spec['identity'] = identity
+        spec['state'] = 'parsed'
+        spec['native'] = dict(native, pathId=path_id)
+        spec['template'] = template
+        spec['owner'] = None
+        spec['name'] = str(data.get('m_Name', source.get('name', '')))
+        spec['logicalPaths'] = []
+        spec['references'] = []
+        state['catalog']['objects'].append(spec)
+        state['values'][identity] = data
+        state['original'][identity] = copy.deepcopy(data)
+        state['hashes'][identity] = hashlib.sha256(dumps(data).encode('utf-8')).hexdigest().upper()
+        objects[identity] = spec
+        known.add(identity.casefold())
+        additions.append((spec, data))
+    for spec, data in additions:
+        spec['references'] = _references_for_data(objects[spec['template']], data, objects)
+    state['author_assets'] = copy.deepcopy(rows)
+
+
+def _apply_emitter_edits(state, operations, editor):
+    if operations is None:
+        return
+    require(isinstance(operations, dict) and set(operations) == {'added', 'removed'} and
+            isinstance(operations['added'], list) and isinstance(operations['removed'], list) and
+            len(operations['added']) <= 4096 and len(operations['removed']) <= 1024,
+            '发射器操作数据无效')
+    try:
+        from . import eiem_effect_topology as topology
+        from . import eiem_effect_native
+        from .nativepack import type_tree
+    except ImportError:
+        import eiem_effect_topology as topology
+        import eiem_effect_native
+        from nativepack import type_tree
+    hierarchy = state['catalog'].get('hierarchy')
+    require(isinstance(hierarchy, list) and hierarchy, '发射器来源缺少有效树形结构')
+    state.setdefault('source_hierarchy', copy.deepcopy(hierarchy))
+    for identity in operations['removed']:
+        require(identity in editor.objects, '要删除的发射器不在来源中')
+        topology.remove(editor, identity)
+
+    declarations = operations['added']
+    known = {identity.casefold() for identity in editor.objects}
+    source_reader = eiem_effect_native.Reader(editor)
+    pending, path_ids = [], set()
+    for row in declarations:
+        require(isinstance(row, dict), '发射器新增记录无效')
+        identity, template, data = row.get('identity'), row.get('template'), row.get('data')
+        require(isinstance(identity, str) and isinstance(template, str) and
+                isinstance(data, dict) and template in editor.objects and
+                identity.casefold() not in known,
+                '发射器新增身份或模板无效')
+        source = editor.objects[template]
+        require(source.get('state') == 'parsed' and not source.get('template') and
+                source.get('classId') in (1, 4, 114, 198, 199),
+                '发射器仅支持可解析的来源组件模板')
+        native = source['native']
+        cab, separator, text_id = identity.rpartition(':')
+        require(separator and cab.casefold() == native['cab'].casefold(),
+                '发射器新增必须使用模板的源文件')
+        try:
+            path_id = int(text_id)
+        except (TypeError, ValueError) as error:
+            raise ValueError('发射器新增 PathID 无效') from error
+        source_file = next(file for file in source_reader.manifest['serializedFiles']
+                           if file['cab'].casefold() == native['cab'].casefold())
+        source_ids = {int(item['pathId']) for item in source_file.get('objects', [])}
+        require(path_id != 0 and (cab.casefold(), path_id) not in path_ids,
+                '发射器新增 PathID 重复或无效')
+        require(path_id not in source_ids, '发射器新增 PathID 与源对象冲突')
+        require((cab.casefold(), path_id) not in {
+            (obj['native']['cab'].casefold(), int(obj['native']['pathId']))
+            for obj in editor.objects.values() if obj.get('template')},
+            '发射器新增 PathID 与作者资源冲突')
+        schema_data = state['schemas'][source['schema']]
+        schema = type_tree.Schema.compile(schema_data['nodes'])
+        data = _native_plain(type_tree.from_data(schema, data))
+        spec = copy.deepcopy(source)
+        spec['identity'] = identity
+        spec['native'] = dict(native, pathId=path_id)
+        spec['template'] = template
+        spec['name'] = str(data.get('m_Name', source.get('name', '')))
+        spec['owner'] = None
+        spec['references'] = []
+        editor.objects[identity] = spec
+        state['catalog']['objects'].append(spec)
+        state['values'][identity] = data
+        state['original'][identity] = copy.deepcopy(data)
+        state['hashes'][identity] = hashlib.sha256(dumps(data).encode('utf-8')).hexdigest().upper()
+        pending.append((identity, template, data, spec))
+        known.add(identity.casefold())
+        path_ids.add((cab.casefold(), path_id))
+
+    if not pending:
+        return
+
+    def pointer_identity(owner, pointer):
+        identity = _identity_from_pointer(editor.objects[owner]['native']['cab'], pointer)
+        return next((key for key in editor.objects if identity and
+                     key.casefold() == identity.casefold()), None)
+
+    by_owner = {}
+    for identity, template, data, spec in pending:
+        if spec['classId'] == 1:
+            continue
+        owner = pointer_identity(identity, data.get('m_GameObject'))
+        require(owner and editor.objects[owner]['classId'] == 1 and
+                editor.objects[owner].get('template'), '发射器组件必须挂在新增 GameObject 上')
+        spec['owner'] = owner
+        by_owner.setdefault(owner, []).append((identity, template, data, spec))
+
+    source_nodes = {node['identity']: node for node in state['catalog']['hierarchy']}
+    new_nodes = []
+    for go_identity, go_template, go_data, go_spec in pending:
+        if go_spec['classId'] != 1:
+            continue
+        source_node = source_nodes.get(go_template)
+        require(source_node is not None, '发射器模板必须是来源树形节点')
+        components = by_owner.get(go_identity, [])
+        component_templates = [template for _, template, _, _ in components]
+        require(len(component_templates) == len(source_node['components']) and
+                set(component_templates) == set(source_node['components']) and
+                len(set(component_templates)) == len(component_templates),
+                '新增发射器必须复制完整组件')
+        require(sum(spec['classId'] == 4 for _, _, _, spec in components) == 1 and
+                sum(spec['classId'] == 198 for _, _, _, spec in components) == 1 and
+                sum(spec['classId'] == 199 for _, _, _, spec in components) == 1,
+                '新增发射器缺少 Transform/ParticleSystem/Renderer')
+        component_by_template = {template: identity for identity, template, _, _ in components}
+        declared = [pointer_identity(go_identity, item.get('component'))
+                    for item in go_data.get('m_Component', [])]
+        expected = [component_by_template.get(template) for template in source_node['components']]
+        require(declared == expected, '新增 GameObject 的组件指针不一致')
+        transform_identity = next(identity for identity, _, _, spec in components
+                                  if spec['classId'] == 4)
+        new_nodes.append(dict(identity=go_identity, name=go_data.get('m_Name', ''),
+                              transform=transform_identity, parent=None, children=[],
+                              components=[component_by_template[t] for t in source_node['components']]))
+
+    node_by_transform = {node['transform']: node for node in hierarchy}
+    node_by_transform.update((node['transform'], node) for node in new_nodes)
+    for node in new_nodes:
+        transform = state['values'][node['transform']]
+        parent = pointer_identity(node['transform'], transform.get('m_Father'))
+        require(parent in node_by_transform, '发射器父 Transform 不在有效 Prefab 中')
+        node['parent'] = parent
+        for child_identity, _, child_data, child_spec in pending:
+            if child_spec['classId'] == 4 and pointer_identity(
+                    child_identity, child_data.get('m_Father')) == node['transform']:
+                node['children'].append(child_identity)
+    for node in new_nodes:
+        visited = {node['transform']}
+        parent = node['parent']
+        while parent in node_by_transform:
+            require(parent not in visited, '发射器骨架不能形成循环')
+            visited.add(parent)
+            parent = node_by_transform[parent]['parent']
+    for node in new_nodes:
+        parent_node = node_by_transform[node['parent']]
+        parent_node['children'].append(node['transform'])
+        parent_children = state['values'][node['parent']].get('m_Children')
+        require(isinstance(parent_children, list), '发射器父 Transform 缺少子节点列表')
+        parent_children.append(dict(m_FileID=0,
+                                    m_PathID=int(node['transform'].rsplit(':', 1)[1])))
+    hierarchy.extend(new_nodes)
+    for _, template, data, spec in pending:
+        spec['references'] = _references_for_data(editor.objects[template], data, editor.objects)
 
 
 def write_edits(state, path):

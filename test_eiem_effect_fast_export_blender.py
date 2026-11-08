@@ -11,6 +11,7 @@ import time
 
 addon_path, scene, output = map(Path, sys.argv[sys.argv.index('--') + 1:])
 sys.path.insert(0, str(addon_path.resolve().parent))
+from nativepack import ini_reader
 addon = importlib.import_module(addon_path.name)
 addon.register()
 fx = addon.eiem_blender_addon.effect_editor
@@ -41,7 +42,7 @@ def export(label, expected_starts):
     result = bpy.ops.eiem.export_package('EXEC_DEFAULT', directory=str(destination.parent),filepath=str(destination))
     assert result == {'FINISHED'}, result
     assert len(starts) == expected_starts, (label, len(starts), expected_starts)
-    package = modules['ini_reader'].read_package(destination)
+    package = ini_reader.read_package(destination)
     assert len(package['effects']) == 1 and not package['parts']
     report.append(dict(case=label, seconds=time.perf_counter()-began, builds=len(starts)))
     return hashes()

@@ -1,13 +1,21 @@
 """Blender preview instances: original static renderers, clip overlays and VAT."""
 import json
+import importlib
 from pathlib import Path
 
 import bpy
 from mathutils import Matrix, Quaternion, Vector
 
-from . import eiem_effect_assets as assets
-from . import eiem_effect_timeline as timeline
-from .eiem_effect_native import Reader
+_MODULE_PREFIX = (__package__ + ".") if __package__ else ""
+
+
+def _module(name):
+    return importlib.import_module(_MODULE_PREFIX + name)
+
+
+assets = _module("eiem_effect_assets")
+timeline = _module("eiem_effect_timeline")
+Reader = _module("eiem_effect_native").Reader
 
 _sessions = {}
 _enum_items = {}
@@ -70,7 +78,7 @@ class Frame:
         self.placements = {}
 
     def placement(self, node):
-        from . import eiem_effect_preview as preview
+        preview = _module("eiem_effect_preview")
         key = node.as_pointer()
         if key in self.placements:
             return self.placements[key]
@@ -110,12 +118,12 @@ class Frame:
 
 
 def _pointer(edit, owner, path):
-    from . import eiem_effect_preview as preview
+    preview = _module("eiem_effect_preview")
     return preview._target(edit, owner, path)
 
 
 def _vat(frame, edit, mid, mesh, material):
-    from . import eiem_effect_vat as vat
+    vat = _module("eiem_effect_vat")
     data = edit.value(mid)
     floats = {row['first']: row['second'] for row in data.get('m_SavedProperties', {}).get('m_Floats', [])}
     keywords = data.get('m_ValidKeywords', data.get('m_ShaderKeywords', '').split())
@@ -134,7 +142,7 @@ def _vat(frame, edit, mid, mesh, material):
         if not target:
             return None
         # A replaced data texture must not silently keep sampling source bytes.
-        from . import eiem_effect_material as bridge
+        bridge = _module("eiem_effect_material")
         setting = assets.texture_slot(frame.root, mid, slot)
         if bridge.texture_path(frame.root, mid, slot) or setting and setting.image:
             raise ValueError('VAT 数据贴图已替换；新数据的浮点预览尚未接入：' + slot)
@@ -146,7 +154,7 @@ def _vat(frame, edit, mid, mesh, material):
 
 
 def static_renderers(frame, resources, diagnostics):
-    from . import eiem_effect_preview as preview
+    preview = _module("eiem_effect_preview")
     root, edit = frame.root, frame.edit
     for node in [root] + list(root.children_recursive):
         if node.get('eff_preview') or node.get('eff_particle_template'):
@@ -219,7 +227,7 @@ def static_renderers(frame, resources, diagnostics):
 
 
 def particle_position(frame, node, data, particle, at=None):
-    from . import eiem_effect_simulation as sim
+    sim = _module("eiem_effect_simulation")
     placement = frame.placement(node) if at is None else frame.at(node, at)
     if data.get('moveWithTransform', 0) == 1:
         born = (particle['born'] + sim.scalar(data.get('startDelay', {}))) / (data.get('simulationSpeed', 1) or 1)
@@ -235,9 +243,9 @@ def particle_position(frame, node, data, particle, at=None):
 
 
 def trails(frame, node, identity, renderer, data, resources, diagnostics):
-    from . import eiem_effect_preview as preview
-    from . import eiem_effect_simulation as sim
-    from . import eiem_effect_trails as sampler
+    preview = _module("eiem_effect_preview")
+    sim = _module("eiem_effect_simulation")
+    sampler = _module("eiem_effect_trails")
     module = data.get('TrailModule', {})
     key = identity + '/trails'
     existing = next((o for o in root_collection(frame.root).objects if o.get('eff_preview_key') == frame.root['eff_effect_id'] + key), None)
@@ -307,7 +315,7 @@ def root_collection(root):
 
 
 def research_report(root, edit):
-    from . import eiem_effect_material as bridge
+    bridge = _module("eiem_effect_material")
     current = session(edit)
     clips = current.clips(edit)
     materials=[]

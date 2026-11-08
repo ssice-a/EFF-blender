@@ -578,12 +578,14 @@ def read_format3_physics_resource(path, expected_id=None, expected_file=None):
             "document": document, "skeleton": skeleton}
 
 
-def encode_format3_effect_snapshot(source_archive, workspace, attachment):
+def encode_format3_effect_snapshot(source_archive, workspace, attachment, edit=None):
     source_archive = bytes(source_archive)
-    author = json.dumps(
-        {"format": "EFF_EFFECT_AUTHOR3", "version": 1,
-         "workspace": workspace, "attachment": attachment},
-        ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    document = {"format": "EFF_EFFECT_AUTHOR3", "version": 1,
+                "workspace": workspace, "attachment": attachment}
+    if edit is not None:
+        document["edit"] = edit
+    author = json.dumps(document, ensure_ascii=False, separators=(",", ":"),
+                        allow_nan=False).encode("utf-8")
     return EFFECT_AUTHOR3_HEADER.pack(
         MAGIC_EFFECT_AUTHOR3, 1, len(source_archive), len(author),
         hashlib.sha256(source_archive).digest(), hashlib.sha256(author).digest()
@@ -611,6 +613,11 @@ def decode_format3_effect_snapshot(data):
             not isinstance(value.get("workspace"), dict) or
             not isinstance(value.get("attachment"), dict)):
         raise ValueError("format-3 Effect author document structure differs")
+    if "edit" in value:
+        edit = value["edit"]
+        if (not isinstance(edit, dict) or edit.get("format") != "EFF_EFFECT_EDIT" or
+                edit.get("version") != 1 or not isinstance(edit.get("objects", []), list)):
+            raise ValueError("format-3 Effect author edit document is invalid")
     try:
         with zipfile.ZipFile(io.BytesIO(archive)) as package:
             names = package.namelist()
@@ -630,13 +637,16 @@ def decode_format3_effect_snapshot(data):
     return value
 
 
-def encode_format3_effect_source(source, workspace, attachment):
+def encode_format3_effect_source(source, workspace, attachment, edit=None):
     """Create an editable Effect snapshot directly from its author directory."""
     import stat
     source = Path(source).resolve()
     if not source.is_dir():
         raise ValueError("format-3 Effect source directory is absent")
-    attachment = {key: value for key, value in attachment.items() if key != "build"}
+    attachment = {
+        key: value for key, value in attachment.items()
+        if key != "build" and not str(key).startswith("_")
+    }
     archive_stream = io.BytesIO()
     with zipfile.ZipFile(archive_stream, "w", compression=zipfile.ZIP_DEFLATED,
                          compresslevel=6) as package:
@@ -649,7 +659,21 @@ def encode_format3_effect_source(source, workspace, attachment):
             if not stat.S_ISREG(mode):
                 raise ValueError("Effect source contains a non-file entry: " + str(file))
             package.write(file, file.relative_to(source).as_posix())
-    return encode_format3_effect_snapshot(archive_stream.getvalue(), workspace, attachment)
+    return encode_format3_effect_snapshot(archive_stream.getvalue(), workspace, attachment, edit)
+
+
+def encode_format3_effect_author(source, workspace, attachment, edit):
+    """Encode a clean source baseline together with its current edit delta."""
+    workspace = dict(workspace)
+    edit = dict(edit)
+    workspace.pop("source", None)
+    edit.pop("source", None)
+    if edit.get("format") != "EFF_EFFECT_EDIT" or edit.get("version") != 1:
+        raise ValueError("format-3 Effect author edit document is invalid")
+    for field in ("sourceManifestSha256", "sourceEffectSha256"):
+        if workspace.get(field, "").upper() != edit.get(field, "").upper():
+            raise ValueError("format-3 Effect author source digest differs: " + field)
+    return encode_format3_effect_source(source, workspace, attachment, edit)
 
 
 def write_format3_effect_snapshot(path, source, workspace, attachment):
@@ -751,6 +775,12 @@ def materialize_format3_effect_author_resource(path, expected_id, expected_file,
             raise
     workspace = result["workspace"]
     workspace["source"] = str(source)
+    if "edit" in result:
+        try:
+            from . import eiem_effect_document
+        except ImportError:
+            import eiem_effect_document
+        eiem_effect_document.apply_edit(workspace, result["edit"])
     return workspace, result["attachment"], source
 
 

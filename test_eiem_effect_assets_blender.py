@@ -1,5 +1,6 @@
 """Real effect source -> custom mesh/images -> native build -> saved author state."""
 import base64
+import copy
 import importlib
 import json
 import math
@@ -62,7 +63,7 @@ mask = material.eff_effect_textures['_MaskTex']; mask.image = image; mask.linear
 
 # Renderer material and texture selectors must be visible in the real layouts.
 class Layout:
-    def __init__(self): self.labels=[]; self.props=[]
+    def __init__(self): self.labels=[]; self.props=[]; self.operators=[]
     def row(self,**kwargs): return self
     def split(self,**kwargs): return self
     def box(self): return self
@@ -70,10 +71,16 @@ class Layout:
     def panel(self,*args,**kwargs): return self,self
     def prop(self,*args,**kwargs): self.props.append(kwargs.get('text',''))
     def label(self,**kwargs): self.labels.append(kwargs.get('text',''))
-    def operator(self,*args,**kwargs): return type('Op',(),{})()
+    def operator(self,*args,**kwargs):
+        self.operators.append((args,kwargs))
+        return type('Op',(),{})()
 layout=Layout()
 editor.effect_ui.Draw(editor,node,edit,renderer).renderer(layout)
-assert any('使用材质' in s for s in layout.labels)
+material_path=editor.logical_asset_text(edit,mid)
+assert any('材质 1' in s and material_path in s for s in layout.labels), layout.labels
+assert any(args and args[0]=='eiem.effect_pointer' and
+           kwargs.get('icon')=='EYEDROPPER'
+           for args,kwargs in layout.operators), layout.operators
 editor.effect_ui.Draw(editor,material,edit,mid).material(layout)
 assert '原始参数' in layout.props and '特效主图' in layout.labels
 
@@ -104,7 +111,9 @@ source_color_space=template['m_ColorSpace'].data
 previous=slot.linear;slot.linear=not bool(source_color_space)
 color_tree=assets.texture_tree(template,loaded,slot)
 assert color_tree['m_TextureFormat'].data in (25,27)
-assert len(color_tree['image data'].data)==16
+expected_mips=max(loaded.size).bit_length() if slot.mipmaps else 1
+assert color_tree['m_MipCount'].data==expected_mips
+assert len(color_tree['image data'].data)==16*expected_mips
 assert color_tree['m_ColorSpace'].data==source_color_space,'export overrode the source Texture2D color space'
 slot.linear=previous
 assert all(not a['identity'] in edit.objects for a in document['assets'])
@@ -131,5 +140,25 @@ for _ in range(3):
 root=next(o for o in bpy.data.objects if o.get('eff_effect_document'))
 editor.upgrade_loaded()
 assert assets.export_document(root,editor.synchronize(root))==document,'register/reload changed authoring'
-print('PASS custom mesh/modifier/UV, material slots, asymmetric RGBA/mips, preview coordinates, shared clones, determinism and save/reopen')
+
+# Materialize the exported additions from the original baseline, as Format 3 import does.
+roundtrip_source_edit=editor.synchronize(root)
+roundtrip_state=copy.deepcopy(roundtrip_source_edit.state)
+editor.document.apply_edit(roundtrip_state,document)
+roundtrip_root=editor.import_workspace(bpy.context,roundtrip_state,preserve_source=True)
+roundtrip_edit=editor.editor(roundtrip_root)
+mesh_asset=next(a for a in document['assets'] if roundtrip_source_edit.objects[a['template']]['classId']==43)
+authored_mesh=assets.source_meshes(roundtrip_root)[mesh_asset['identity']]
+assert len(authored_mesh.data.polygons)>0 and authored_mesh.data.uv_layers
+roundtrip_emitters=[o for o in editor.objects(roundtrip_root) if o.eff_effect.particle_mesh]
+assert roundtrip_emitters and all(o.eff_effect.particle_mesh==authored_mesh for o in roundtrip_emitters)
+material_asset=next(a for a in document['assets'] if roundtrip_source_edit.objects[a['template']]['classId']==21)
+authored_material=assets.material_object(roundtrip_root,material_asset['identity'])
+texture_ids={a['identity'] for a in document['assets'] if roundtrip_source_edit.objects[a['template']]['classId']==28}
+preview_slots=[s for s in authored_material.eff_effect_textures
+               if json.loads(s.source_metadata or '{}').get('identity') in texture_ids]
+assert len(preview_slots)==2 and all(s.image and s.image.packed_file for s in preview_slots)
+roundtrip_export=assets.export_document(roundtrip_root,roundtrip_edit)
+assert roundtrip_export['assets']==document['assets'], 'authored additions changed after import/export'
+print('PASS custom mesh/modifier/UV, material slots, asymmetric RGBA/mips, preview coordinates, shared clones, determinism, save/reopen and authored resource import/export')
 addon.unregister()

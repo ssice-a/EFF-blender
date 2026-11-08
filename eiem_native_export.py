@@ -1125,6 +1125,8 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
             header.read_file(stream)
         if header.get('Mod', 'format', fallback='') != '3':
             raise ValueError('Blender 只读取或覆盖 Format 3 Mod；请先使用 Mod Manager 迁移旧格式。')
+        if header.get('Mod', 'type', fallback='') == 'effect':
+            raise ValueError('不能用角色资源覆盖独立特效 Mod；请为角色选择新的输出目录。')
     if destination == source.package or source.package in destination.parents:
         raise ValueError('不能覆盖原生来源目录')
     bpy.context.view_layer.update()
@@ -1416,6 +1418,7 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
         author_files = {}
         phase = time.perf_counter()
         roots_by_id = {root.get('eff_effect_id'): root for root in (effect_roots or ())}
+        effect_baselines = {}
         for attachment in effects or ():
             root = roots_by_id.get(attachment['id'])
             if root is None:
@@ -1428,8 +1431,14 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
             if rig is not None:
                 attachment_author['mountSkeleton'] = base64.b64encode(
                     addon.encode_skeleton(rig)).decode('ascii')
-            author_files[relative] = addon.format_io.encode_format3_effect_source(
-                edit.state['source'], edit.state, attachment_author)
+            source_dir = edit.state['source']
+            if source_dir not in effect_baselines:
+                effect_baselines[source_dir] = addon.effect_editor.document.load_source(source_dir)
+                effect_baselines[source_dir].pop('source', None)
+            author_edit = addon.effect_editor.assets.export_document(root, edit)
+            author_edit.pop('source', None)
+            author_files[relative] = addon.format_io.encode_format3_effect_author(
+                source_dir, effect_baselines[source_dir], attachment_author, author_edit)
         detail['effectAuthor'] = (time.perf_counter() - phase) * 1000
         source_packages = {source.package: source}
         source_packages.update((baseline.package, baseline)

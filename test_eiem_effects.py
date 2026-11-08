@@ -1,10 +1,15 @@
 import copy
+import base64
+import hashlib
 import json
 from pathlib import Path
+import struct
 import tempfile
 import unittest
+import zlib
 
 import eiem_effect_document as effects
+from nativepack import type_tree
 
 
 def fixture():
@@ -26,6 +31,16 @@ def fixture():
                 sourceEffectSha256='B'*64, catalog=dict(objects=[obj]), values={'cab:1':value},
                 original={'cab:1':copy.deepcopy(value)}, hashes={'cab:1':'C'*64},
                 schemas={'schemas/schema.json':dict(nodes=nodes, managedTypes=[])})
+
+
+def png_preview():
+    def chunk(kind, data):
+        body = kind + data
+        return struct.pack('>I', len(data)) + body + struct.pack('>I', zlib.crc32(body))
+    header = struct.pack('>IIBBBBB', 1, 1, 8, 6, 0, 0, 0)
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', header) +
+            chunk(b'IDAT', zlib.compress(b'\x00\xff\x00\x00\xff\xff')) +
+            chunk(b'IEND', b''))
 
 
 class EffectTests(unittest.TestCase):
@@ -153,11 +168,90 @@ class EffectTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'effect'):
             effects.apply_edit(fixture(), damaged)
 
-    def test_edit_document_refuses_unmaterialized_author_additions(self):
-        payload = dict(effects.Editor(fixture()).export(), assets=[])
-        payload['assets'] = [dict(identity='cab:99')]
-        with self.assertRaisesRegex(ValueError, 'additions'):
-            effects.apply_edit(fixture(), payload)
+    def authored_asset_fixture(self, directory):
+        source = Path(directory)
+        (source / 'source').mkdir(parents=True)
+        (source / 'schemas').mkdir()
+        nodes = [dict(type='Texture2D', name='Base', level=0, metaFlag=0),
+                 dict(type='string', name='m_Name', level=1, metaFlag=0),
+                 dict(type='int', name='width', level=1, metaFlag=0)]
+        schema_file = source / 'schemas' / 'texture.json'
+        schema_bytes = json.dumps(dict(nodes=nodes), separators=(',', ':')).encode()
+        schema_file.write_bytes(schema_bytes)
+        schema = type_tree.Schema.compile(nodes)
+        original = type_tree.encode(type_tree.from_data(
+            schema, dict(m_Name='source texture', width=1)))
+        authored = type_tree.encode(type_tree.from_data(
+            schema, dict(m_Name='authored texture', width=2)))
+        native_file = source / 'source' / 'native.bin'
+        native_file.write_bytes(original)
+        state = fixture()
+        state['source'] = str(source)
+        state['schemas']['schemas/texture.json'] = dict(nodes=nodes, managedTypes=[])
+        texture = dict(identity='cab:22', name='source texture', state='parsed',
+                       classId=28, type='Texture2D', schema='schemas/texture.json',
+                       native=dict(cab='cab', pathId=22, offset=0, size=len(original)),
+                       logicalPaths=[], references=[])
+        state['catalog']['objects'].append(texture)
+        state['values']['cab:22'] = dict(m_Name='source texture', width=1)
+        state['original']['cab:22'] = copy.deepcopy(state['values']['cab:22'])
+        state['hashes']['cab:22'] = 'D' * 64
+        manifest = dict(format='EFFSOURCE', version=1, serializedFiles=[dict(
+            cab='cab', snapshot=dict(file='source/native.bin',
+                                     sha256=hashlib.sha256(original).hexdigest().upper()),
+            objects=[dict(pathId=22)])])
+        (source / 'source' / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+        receipt = dict(files={'schemas/texture.json': hashlib.sha256(schema_bytes).hexdigest().upper()})
+        (source / 'source' / 'generated-files.json').write_text(json.dumps(receipt), encoding='utf-8')
+        row = dict(identity='cab:99', template='cab:22',
+                   sourceObjectSha256=hashlib.sha256(original).hexdigest().upper(),
+                   payloadBase64=base64.b64encode(authored).decode('ascii'))
+        return state, row, authored
+
+    def test_edit_document_restores_authored_assets(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state, asset, authored = self.authored_asset_fixture(temp)
+            asset['previewPngBase64'] = base64.b64encode(png_preview()).decode('ascii')
+            payload = dict(format='EFF_EFFECT_EDIT', version=1,
+                           sourceManifestSha256=state['sourceManifestSha256'],
+                           sourceEffectSha256=state['sourceEffectSha256'],
+                           objects=[], assets=[asset])
+            effects.apply_edit(state, payload)
+            self.assertIn('cab:99', effects.Editor(state).objects)
+            self.assertEqual(state['values']['cab:99'],
+                             dict(m_Name='authored texture', width=2))
+            self.assertEqual(state['author_assets'], [asset])
+            self.assertNotIn('emitters', effects.Editor(state).export())
+            from eiem_effect_native import Reader
+            tree, raw = Reader(effects.Editor(state)).tree('cab:99')
+            self.assertEqual(raw, authored)
+            self.assertEqual(tree.plain(), dict(m_Name='authored texture', width=2))
+
+    def test_invalid_author_texture_preview_is_rejected_without_partial_mutation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state, asset, _ = self.authored_asset_fixture(temp)
+            asset['previewPngBase64'] = base64.b64encode(b'not a PNG').decode('ascii')
+            payload = dict(format='EFF_EFFECT_EDIT', version=1,
+                           sourceManifestSha256=state['sourceManifestSha256'],
+                           sourceEffectSha256=state['sourceEffectSha256'],
+                           objects=[], assets=[asset])
+            before = copy.deepcopy(state)
+            with self.assertRaisesRegex(ValueError, 'PNG'):
+                effects.apply_edit(state, payload)
+            self.assertEqual(state, before)
+
+    def test_invalid_authored_asset_is_rejected_without_partial_mutation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state, asset, _ = self.authored_asset_fixture(temp)
+            before = copy.deepcopy(state)
+            asset['sourceObjectSha256'] = '0' * 64
+            payload = dict(format='EFF_EFFECT_EDIT', version=1,
+                           sourceManifestSha256=state['sourceManifestSha256'],
+                           sourceEffectSha256=state['sourceEffectSha256'],
+                           objects=[], assets=[asset])
+            with self.assertRaisesRegex(ValueError, '摘要'):
+                effects.apply_edit(state, payload)
+            self.assertEqual(state, before)
 
 
 if __name__ == '__main__':

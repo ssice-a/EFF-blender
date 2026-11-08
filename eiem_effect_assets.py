@@ -6,8 +6,11 @@ the compiler validates the clone against the source schema before publishing.
 import base64
 import copy
 import hashlib
+import io
 import json
+import os
 import re
+import tempfile
 from pathlib import Path
 
 import bpy
@@ -21,6 +24,11 @@ else:
     import eiem_texture_compression as texture_compression
 
 BASIS = Matrix(((-1, 0, 0), (0, 0, -1), (0, 1, 0)))
+
+
+def _author_asset(edit, identity):
+    return next((row for row in edit.state.get('author_assets', [])
+                 if row.get('identity', '').casefold() == identity.casefold()), None)
 
 
 def material_object(root, identity):
@@ -127,6 +135,48 @@ def expand_meshes(context, root, edit):
         meshes[identity] = obj
         imported.append(obj)
         obj.hide_set(True)
+    for row in edit.state.get('author_assets', []):
+        identity = row.get('identity', '')
+        spec = edit.objects.get(identity)
+        if not spec or spec.get('classId') != 43 or identity in meshes:
+            continue
+        native_mesh = native_reader.mesh(identity)
+        mesh = bpy.data.meshes.new(spec.get('name') or 'Authored Effect Mesh')
+        vertices = native_mesh['vertices']
+        faces, material_indices = [], []
+        for slot, submesh in enumerate(native_mesh['submeshes']):
+            for triangle in submesh:
+                faces.append(tuple(int(index) for index in triangle[::-1]))
+                material_indices.append(slot)
+        document.require(faces, '作者 Mesh 没有可预览的三角形')
+        mesh.from_pydata([BASIS @ Vector(vertex) for vertex in vertices], [], faces)
+        mesh.update()
+        for slot, values in native_mesh['uvs'].items():
+            layer = mesh.uv_layers.new(name='UV' + str(slot))
+            layer.data.foreach_set('uv', [float(value) for loop in mesh.loops
+                                          for value in values[loop.vertex_index, :2]])
+        colors = native_mesh['colors']
+        if colors is not None:
+            if colors.shape[1] == 3:
+                import numpy as np
+                colors = np.column_stack((colors, np.ones(len(colors))))
+            color = mesh.color_attributes.new(name='EFFColor', type='FLOAT_COLOR', domain='POINT')
+            color.data.foreach_set('color', colors.ravel())
+        for polygon, slot in zip(mesh.polygons, material_indices):
+            polygon.material_index = slot
+        normals = native_mesh['normals']
+        if normals is not None and len(normals) == len(vertices):
+            mesh.normals_split_custom_set_from_vertices(
+                [BASIS @ Vector(normal) for normal in normals])
+        obj = bpy.data.objects.new(spec.get('name') or mesh.name, mesh)
+        collection.objects.link(obj)
+        obj.parent = root
+        obj.hide_render = True
+        obj.hide_set(True)
+        obj['eff_particle_template'] = True
+        obj['eff_effect_mesh_source'] = identity
+        meshes[identity] = obj
+        imported.append(obj)
     bindings = {}
     for node in [root] + list(root.children_recursive):
         ids = json.loads(node.get('eff_effect_components', '[]'))
@@ -222,12 +272,16 @@ def setup_textures(root, edit, obj, identity):
     native = None
     for index, row in enumerate(edit.value(identity).get('m_SavedProperties', {}).get('m_TexEnvs', [])):
         slot = obj.eff_effect_textures.get(row['first'])
+        tid = preview._target(edit, identity, ['m_SavedProperties', 'm_TexEnvs', index, 'second', 'm_Texture'])
+        authored = _author_asset(edit, tid) if tid else None
         if slot and slot.source_metadata:
+            if not slot.image and authored and authored.get('previewPngBase64'):
+                color_space = edit.value(tid)['m_ColorSpace']
+                slot.image = authored_texture_image(tid, authored['previewPngBase64'], color_space)
             continue
         created = slot is None
         if created:slot = obj.eff_effect_textures.add()
         slot.name = row['first']
-        tid = preview._target(edit, identity, ['m_SavedProperties', 'm_TexEnvs', index, 'second', 'm_Texture'])
         resource = resources.get(tid)
         if resource:
             slot.source_name = resource.get('name', tid)
@@ -247,6 +301,9 @@ def setup_textures(root, edit, obj, identity):
                 width=tree['m_Width'].data,height=tree['m_Height'].data,format=tree['m_TextureFormat'].data,
                 colorSpace=tree['m_ColorSpace'].data,mipCount=tree['m_MipCount'].data,
                 stream={k:tree['m_StreamData'][k].data for k in ('path','offset','size')}))
+            if authored and authored.get('previewPngBase64') and not slot.image:
+                slot.image = authored_texture_image(
+                    tid, authored['previewPngBase64'], tree['m_ColorSpace'].data)
         else:
             slot.source_metadata = document.dumps(dict(identity=tid, name=slot.source_name, logicalPaths=[]))
         # Loading every image on import is unnecessary; the preview loads the
@@ -259,6 +316,16 @@ def texture_signature(root, identity):
                   bool(s.image and s.image.is_dirty), tuple(s.image.size) if s.image else (),
                   s.linear, s.mipmaps, s.wrap, s.filter)
                  for s in obj.eff_effect_textures) if obj else ()
+
+
+def _unchanged_embedded_preview(slot, image):
+    if not image or slot.image != image or image.is_dirty:
+        return False
+    try:
+        identity = json.loads(slot.source_metadata or '{}').get('identity')
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return bool(identity and image.get('eff_effect_asset_identity') == identity)
 
 
 def image_for_slot(root, edit, identity, index, resources):
@@ -368,16 +435,36 @@ class NativeAssets:
 
     def add(self, template, label, tree):
         spec = self.edit.objects[template]
+        template = spec.get('template', template)
+        spec = self.edit.objects[template]
         cab = spec['native']['cab']
-        pid = int.from_bytes(hashlib.sha256((self.key + ':' + label).encode()).digest()[:8], 'little', signed=True)
-        document.require(pid != 0 and not any(r['pathId'] == pid for r in self.rows[cab]['objects']), '新增资源身份冲突')
+        occupied = {int(row['pathId']) for row in self.rows[cab]['objects']}
+        occupied.update(int(row['identity'].rsplit(':', 1)[1])
+                        for row in self.edit.state.get('author_assets', [])
+                        if row['identity'].rsplit(':', 1)[0].casefold() == cab.casefold())
+        occupied.update(int(row['identity'].rsplit(':', 1)[1])
+                        for row in self.additions
+                        if row['identity'].rsplit(':', 1)[0].casefold() == cab.casefold())
+        attempt = 0
+        while True:
+            seed = self.key + ':' + label + (':' + str(attempt) if attempt else '')
+            pid = int.from_bytes(hashlib.sha256(seed.encode()).digest()[:8], 'little', signed=True)
+            if pid and pid not in occupied:
+                break
+            attempt += 1
         _, original = self.tree(template)
-        identity = cab.lower() + ':' + str(pid)
-        document.require(not any(a['identity'] == identity for a in self.additions), '新增资源重复')
+        identity = cab + ':' + str(pid)
         self.additions.append(dict(identity=identity, template=template,
                                    sourceObjectSha256=document.digest(original),
                                    payloadBase64=base64.b64encode(self.codec.encode(tree)).decode('ascii')))
         return identity
+
+    def add_preview(self, identity, image, color_space):
+        row = next(row for row in self.additions if row['identity'] == identity)
+        preview = image_preview_png(image, color_space)
+        document.require(len(preview) <= 32 * 1024 * 1024,
+                         '贴图预览超过 32 MiB 限制')
+        row['previewPngBase64'] = base64.b64encode(preview).decode('ascii')
 
     def pointer(self, owner, target):
         owner_cab = self.edit.objects[owner]['native']['cab'].lower()
@@ -393,15 +480,69 @@ class NativeAssets:
         return dict(m_FileID=fid, m_PathID=int(pid))
 
 
-def texture_tree(native, image, settings):
-    import sys
+def image_preview_png(image, color_space):
     try:
         from . import eiem_shared_resources as shared_resources
     except ImportError:
         import eiem_shared_resources as shared_resources
     shared_resources.add_vendor_path()
-    vendor=Path(__file__).parent/'vendor'
-    if vendor.is_dir() and str(vendor) not in sys.path:sys.path.insert(0,str(vendor))
+    import numpy as np
+    from PIL import Image
+    document.require(color_space in (0, 1), 'texture color space is invalid')
+    width, height = map(int, image.size)
+    pixels = np.empty(width * height * 4, dtype=np.float32)
+    image.pixels.foreach_get(pixels)
+    pixels = pixels.reshape(height, width, 4)
+    document.require(np.isfinite(pixels).all(), 'texture preview contains nonfinite pixels')
+    if image.is_float and color_space == 1:
+        rgb = pixels[:, :, :3]
+        pixels[:, :, :3] = np.where(rgb <= .0031308, rgb * 12.92,
+            1.055 * np.maximum(rgb, 0) ** (1 / 2.4) - .055)
+    rgba = np.rint(np.clip(pixels, 0, 1) * 255).astype(np.uint8)
+    output = io.BytesIO()
+    preview = Image.fromarray(rgba, mode='RGBA')
+    if max(width, height) > 2048:
+        scale = 2048 / max(width, height)
+        size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        resampling = getattr(getattr(Image, 'Resampling', Image), 'LANCZOS')
+        preview = preview.resize(size, resampling)
+    flip_top_bottom = getattr(getattr(Image, 'Transpose', Image), 'FLIP_TOP_BOTTOM')
+    preview.transpose(flip_top_bottom).save(output, format='PNG', optimize=False)
+    return output.getvalue()
+
+
+def authored_texture_image(identity, encoded, color_space):
+    """Materialize an embedded preview and pack it into the current .blend."""
+    payload = base64.b64decode(encoded, validate=True)
+    digest = hashlib.sha256(payload).hexdigest()
+    image = next((candidate for candidate in bpy.data.images
+                  if candidate.get('eff_effect_asset_identity') == identity and
+                  candidate.get('eff_effect_asset_sha256') == digest), None)
+    if image:
+        return image
+    descriptor, filename = tempfile.mkstemp(prefix='eiem-effect-', suffix='.png')
+    os.close(descriptor)
+    path = Path(filename)
+    try:
+        path.write_bytes(payload)
+        image = bpy.data.images.load(str(path), check_existing=False)
+        image.name = 'EFF authored texture ' + identity
+        image.pack()
+        image['eff_effect_asset_identity'] = identity
+        image['eff_effect_asset_sha256'] = digest
+        if color_space == 0:
+            image.colorspace_settings.name = 'Non-Color'
+        return image
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def texture_tree(native, image, settings):
+    try:
+        from . import eiem_shared_resources as shared_resources
+    except ImportError:
+        import eiem_shared_resources as shared_resources
+    shared_resources.add_vendor_path()
     import numpy as np
     width, height = map(int, image.size)
     document.require(0 < width <= 16384 and 0 < height <= 16384, '贴图尺寸必须为 1～16384')
@@ -506,9 +647,12 @@ def export_document(root, edit):
                 current['m_Materials'][index] = native.pointer(renderer, mid)
             material_obj = material_object(root, mid)
             from . import eiem_effect_material as material_bridge
-            slots = [(s, material_bridge.image(root, mid, s.name) or s.image)
-                     for s in material_obj.eff_effect_textures] if material_obj else []
-            slots = [(s, image) for s, image in slots if image]
+            slots = []
+            if material_obj:
+                for slot in material_obj.eff_effect_textures:
+                    image = material_bridge.image(root, mid, slot.name) or slot.image
+                    if image and not _unchanged_embedded_preview(slot, image):
+                        slots.append((slot, image))
             if not slots:
                 continue
             if mid not in material_clones:
@@ -527,6 +671,9 @@ def export_document(root, edit):
                     document.require(tid and edit.objects[tid]['classId'] == 28, '此贴图槽缺少二维纹理结构模板')
                     texture, _ = native.tree(tid)
                     target = native.add(tid, mid + '/texture/' + slot.name, texture_tree(texture, image, slot))
+                    # VAT float data stays native; an 8-bit PNG is not its preview source.
+                    if texture['m_TextureFormat'].data not in (17, 20):
+                        native.add_preview(target, image, texture['m_ColorSpace'].data)
                     row['second']['m_Texture'] = native.pointer(mid, target)
                 # Material JSON has no byte blobs. from_data accepts the same
                 # flattened vector/map representation as effect author JSON.
@@ -564,8 +711,12 @@ def export_document(root, edit):
             continue
         result['objects'] = [o for o in result['objects'] if o['identity'] != identity]
         result['objects'].append(dict(identity=identity, sourceDataSha256=edit.state['hashes'][identity], data=data))
-    if native.additions:
-        result['assets'] = native.additions
+    existing_assets = copy.deepcopy(edit.state.get('author_assets', []))
+    additions = existing_assets + native.additions
+    identities = [row['identity'].casefold() for row in additions]
+    document.require(len(identities) == len(set(identities)), '作者资源身份重复')
+    if additions:
+        result['assets'] = additions
     return result
 
 
