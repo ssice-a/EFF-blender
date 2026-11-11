@@ -142,6 +142,9 @@ def write_format3_native_assets(library_path, mod_id, templates, meshes,
             manifest.get('Mod', 'id', fallback='') != mod_id):
         raise ValueError('Format 3 typed writer candidate identity differs')
     path = str(Path(library_path).resolve())
+    modules, _ = pack_modules()
+    from importlib import import_module
+    import_module(modules['author_format3'].__package__ + '.control_program').configure(path)
     library = _FORMAT3_WRITER_LIBRARIES.get(path)
     if library is None:
         library = ctypes.CDLL(path)
@@ -177,6 +180,9 @@ def format3_native_records(format3, source, parts, textures, rules):
                 for target in rule['targets'])
 
     meshes = []
+    mesh_paths = format3.named_resource_paths(
+        [(part['partId'], part.get('object', part['partId'])) for part in parts],
+        'meshes', '.effres')
     for part in parts:
         part_id = part['partId']
         targets = sorted(targets_by_part.get(part_id, ()))
@@ -194,8 +200,9 @@ def format3_native_records(format3, source, parts, textures, rules):
         meshes.append(dict(
             partId=section,
             meshId=format3.identifier('Mesh_' + section),
-            path='meshes/' + section + '.effres',
+            path=mesh_paths[part_id],
             material=(format3.identifier(part['material']) if part.get('material') else ''),
+            object=part.get('object', part_id),
             targetPath=target_path,
             targetAsset=target_asset,
             vertices=part['vertices'],
@@ -205,14 +212,9 @@ def format3_native_records(format3, source, parts, textures, rules):
             fieldData=part['fieldData'],
             authorData=part['authorData']))
 
-    textures_out = []
-    for texture in textures:
-        identity = format3.identifier(texture['id'])
-        textures_out.append(dict(
-            id=identity,
-            path='textures/' + identity + '.effres',
-        ))
-    return meshes, textures_out
+    # DDS and its sampler/template declaration are authored by the INI writer.
+    # No per-image native Texture scaffold is exported.
+    return meshes, []
 
 
 class _MeshSnapshot(dict):
@@ -296,7 +298,7 @@ def pack_modules():
         sys.modules[name] = module
     from importlib import import_module
     modules = {n: import_module(name+'.'+n) for n in
-               ('author_source', 'mesh', 'delta_apply', 'type_tree', 'author_format3', 'effect_native')}
+               ('author_source', 'mesh', 'delta_apply', 'type_tree', 'author_format3', 'effect_native', 'state_rules')}
     dll = shared_resources.native_tool_file('eff_author_core.dll')
     return modules, dll
 
@@ -304,7 +306,15 @@ def token(value):
     return re.sub(r'[^A-Za-z0-9_.-]', '_', str(value))
 
 
-def mesh_part_id(name, slot, split_count):
+def mesh_part_id(name, slot, split_count, imported_section=''):
+    # INI bindings address Part IDs, not Blender object names. Preserve the
+    # imported Part even after rename; newly added slots get separate IDs.
+    if imported_section:
+        section = str(imported_section)
+        if not section.startswith('Part') or token(section) != section:
+            raise ValueError('导入的 Part 标识无效：' + section)
+        identity = 'Mesh' + section[4:]
+        return identity if split_count == 1 or slot == 0 else identity + '_mat' + str(slot)
     original = str(name)
     normalized = token(original)
     # Sanitizing Chinese/spaced names can merge distinct objects. Keep the
@@ -313,6 +323,77 @@ def mesh_part_id(name, slot, split_count):
         normalized += '_' + hashlib.sha256(original.encode('utf-8')).hexdigest()[:16]
     identifier = 'Mesh' + normalized.removeprefix('Mesh')
     return identifier if split_count == 1 else identifier + '_mat' + str(slot)
+
+
+def control_program_source(preserved):
+    """Keep imported declarations internally; author widgets supply edits."""
+    return (preserved or {}).get('program_source') or ''
+
+
+def control_program_bindings(source):
+    if not source:
+        return []
+    if isinstance(source, dict):
+        source = ''.join(source.values())
+    ini = configparser.ConfigParser(interpolation=None, delimiters=('=',), strict=True)
+    ini.optionxform = str
+    ini.read_string(source)
+    return [dict(ini[s]) for s in ini.sections() if s.startswith('Binding')]
+
+
+def control_program_materials(source):
+    """Keep unchanged materials that are explicitly driven by INI bindings."""
+    return {b.get('material', '') for b in control_program_bindings(source)
+            if b.get('target') == 'material.float'}
+
+
+def part_shape_controls(controls, part_section, bindings):
+    channels = {b.get('channel') for b in bindings
+                if b.get('target') == 'shape.weight' and b.get('part') == part_section}
+    return [control for control in controls
+            if not (control.get('_automatic') and control['shape'] in channels)]
+
+
+def preserved_controls_for_objects(objects):
+    import bpy
+    import_ids = {str(obj.get('eiem_import_id', '')) for obj in objects
+                  if obj.get('eiem_import_id')}
+    states = []
+    for collection in bpy.data.collections:
+        if (collection.get('eiem_collection_role') == 'PACKAGE' and
+                str(collection.get('eiem_import_id', '')) in import_ids and
+                collection.get('eiem_controls_ini_json')):
+            states.append(json.loads(collection['eiem_controls_ini_json']))
+    if not states:
+        return None
+    result = dict(defaults={}, persistent=set(), bindings={}, controls={},
+                  visibility={}, program_source={},
+                  key_switch_enabled=states[0]['key_switch_enabled'] if states else True)
+    for state in states:
+        for key, value in state.get('program_source', {}).items():
+            if key in result['program_source'] and result['program_source'][key] != value:
+                raise ValueError('所选 Mod 的控制逻辑段冲突：' + key)
+            result['program_source'][key] = value
+        if state['key_switch_enabled'] != result['key_switch_enabled']:
+            raise ValueError('所选导入 Mod 使用了不同的 INI 按键开关设置')
+        for key, value in state['defaults'].items():
+            if key in result['defaults'] and result['defaults'][key] != value:
+                raise ValueError('所选 Mod 对同一运行时变量设置了不同默认值：' + key)
+            result['defaults'][key] = value
+        result['persistent'].update(state['persistent'])
+        for key, value in state['controls'].items():
+            if key in result['controls'] and result['controls'][key] != value:
+                raise ValueError('所选 Mod 对同一变量设置了不同控制范围：' + key)
+            result['controls'][key] = value
+        for binding in state['bindings']:
+            previous = result['bindings'].get(binding['id'])
+            if previous is not None and previous != binding:
+                raise ValueError('所选 Mod 的 INI 按键绑定 ID 冲突：' + binding['id'])
+            result['bindings'][binding['id']] = binding
+        for obj, values in state['visibility'].items():
+            result['visibility'].setdefault(obj, {}).update(values)
+    result['bindings'] = list(result['bindings'].values())
+    return result
 
 
 def author_skeleton_id(rig):
@@ -528,9 +609,10 @@ def shape_controls(addon, obj, include_hotkeys):
     result = []
     for control in obj.data.eiem_shape_controls:
         record = dict((key, getattr(control, key)) for key in
-                      ('shape', 'enabled', 'identity', 'label', 'default',
+                      ('shape', 'enabled', 'identity', 'variable', 'label', 'default',
                        'minimum', 'maximum', 'hotkey_increase',
                        'hotkey_decrease', 'hotkey_speed'))
+        record['_automatic'] = control.automatic
         if not control.enabled:
             result.append(record)
             continue
@@ -939,7 +1021,7 @@ def _replace_published_file(source, destination):
 
 
 def package_changes(staging, destination, previous, candidate):
-    """Compare validated packages, including content-preserving hardlinks."""
+    """Compare a validated candidate with the previous publication's inventory."""
     staging, destination = Path(staging), Path(destination)
     old_files = previous['_files'] if previous is not None else set()
     new_files = candidate['_files']
@@ -947,8 +1029,7 @@ def package_changes(staging, destination, previous, candidate):
     def same_bytes(a, b):
         if not b.is_file():
             return False
-        # Both packages have already passed checksum validation. An unchanged
-        # staging hardlink names the same file, so rereading both adds no proof.
+        # A staging hardlink names the same file; rereading both adds no proof.
         if os.path.samefile(a, b):
             return True
         if a.stat().st_size != b.stat().st_size:
@@ -975,6 +1056,44 @@ def _prepare_publication_file(source, destination):
         shutil.copy2(source, destination)
 
 
+def publication_inventory(root):
+    """Identify owned files safely, even when old resources need repairing.
+
+    Only the new candidate must pass payload validation. A missing scaffold or
+    edited DDS in the old output must not prevent publishing a complete repair.
+    """
+    root = Path(root).resolve()
+    ini = configparser.ConfigParser(interpolation=None, delimiters=('=',), strict=True)
+    ini.optionxform = str
+    with (root / 'mod.ini').open(encoding='utf-8-sig') as stream:
+        ini.read_file(stream)
+    if ini.get('Mod', 'format', fallback='') != '3':
+        raise ValueError('Format 3 发布目标包含其他格式 Mod')
+    if not ini.get('Mod', 'id', fallback='').strip():
+        raise ValueError('Format 3 发布目标缺少 Mod ID')
+    mod_type = ini.get('Mod', 'type', fallback='')
+    if mod_type not in ('', 'effect'):
+        raise ValueError('Format 3 发布目标的 Mod 类型无效')
+    files = {'mod.ini'}
+    for section in ini.sections():
+        if not section.startswith(('Mesh', 'Material', 'Texture', 'Skeleton',
+                                   'ShapeAnimation', 'EffectAttachment', 'Resource')):
+            continue
+        for key in ('path', 'dds'):
+            value = ini[section].get(key)
+            if value is None:
+                continue
+            if (not value or re.search(r'[\\:\x00-\x1f]', value)
+                    or any(part in ('', '.', '..') for part in value.split('/'))):
+                raise ValueError('Format 3 发布目标资源路径无效：' + value)
+            path = (root / value).resolve()
+            if root not in path.parents:
+                raise ValueError('Format 3 发布目标资源路径超出 Mod：' + value)
+            if path.is_file():
+                files.add(path.relative_to(root).as_posix())
+    return dict(format=3, modId=ini['Mod']['id'], modType=mod_type, _files=files)
+
+
 def publish(staging, destination, reader, previous=None, candidate=None):
     staging = Path(staging).resolve()
     destination = Path(destination).resolve()
@@ -982,7 +1101,7 @@ def publish(staging, destination, reader, previous=None, candidate=None):
     if destination.exists() and any(destination.iterdir()):
         if not marker.is_file():
             raise ValueError('不能覆盖缺少 mod.ini 的目录，请选择新的 Mod 输出目录')
-        if previous is None:previous = reader(destination)
+        if previous is None:previous = publication_inventory(destination)
     if candidate is None:candidate = reader(staging)
     changed, removed = package_changes(staging, destination, previous, candidate)
     if not changed and not removed:
@@ -1129,6 +1248,10 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
             raise ValueError('不能用角色资源覆盖独立特效 Mod；请为角色选择新的输出目录。')
     if destination == source.package or source.package in destination.parents:
         raise ValueError('不能覆盖原生来源目录')
+    preserved_controls = preserved_controls_for_objects(objects)
+    program_source = control_program_source(preserved_controls)
+    program_materials = control_program_materials(program_source)
+    program_bindings = control_program_bindings(program_source)
     bpy.context.view_layer.update()
     plan = addon.plan_switch_export(objects, include_switches=include_switches)
     if lod_levels is None:
@@ -1236,7 +1359,8 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
         records=skeleton_records_by_rig[rig]
         nodes=[(record[0],record[1],record[2],record[3],record[4])
                for bone,record,source_node in records]
-        skeletons.append(dict(id=skeleton_id,data=addon.bone_animation.encode_skeleton(nodes)))
+        skeletons.append(dict(id=skeleton_id,label=rig.name_full,
+                              data=addon.bone_animation.encode_skeleton(nodes)))
         if any(clip.enabled for clip in getattr(rig,'eiem_bone_animations',())):
             bone_animations.extend(addon.shape_animation.export_bone_clips(
                 rig,addon,skeleton_id,include_switches))
@@ -1286,7 +1410,7 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
                                     images, textures, temporary, encode, mid=mid,
                                     texture_cache=texture_cache,
                                     include_native_fields=False, texture_inputs=texture_inputs,
-                                    force=bool(switch or material_animated))
+                                    force=bool(switch or material_animated or mid in program_materials))
                                 if record is not None:
                                     materials[mid] = record
                                 detail['materialTexture'] += (time.perf_counter()-phase)*1000
@@ -1294,8 +1418,9 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
                         fields = native_mesh_fields(modules, source, target, author,
                                                     snapshots[identity], slot, asset, encode)
                         detail['meshEncoding'] += (time.perf_counter()-phase)*1000
-                        pid = mesh_part_id(original.name, slot, len(splits))
-                        controls = controls_by_object.get(identity, [])
+                        pid = mesh_part_id(original.name, slot, len(splits), original.get('eiem_part_section', ''))
+                        controls = part_shape_controls(controls_by_object.get(identity, []),
+                            modules['author_format3'].part_resource_id(pid), program_bindings)
                         common = dict(object=pid,vertices=author['vertex_count'],
                                       indices=len(author['indices']),bonePaths=author['bone_paths'],
                                       shapeNames=[c[0] for c in author['blend_channels']],shapeControls=controls,
@@ -1313,6 +1438,15 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
                                     authorData=addon.format_io.encode_mesh(author),
                                     visibilityBindings=bindings+[dict(variable=switch['variable'],visible=[option_index])],
                                     materialSlot=slot)
+                                if preserved_controls:
+                                    control_mesh_id = str(original.get('eiem_controls_mesh_id', original.name))
+                                    expressions = preserved_controls['visibility'].get(control_mesh_id, {})
+                                    expression = expressions.get('%d|%s' % (
+                                        slot, variant.get('eiem_section', '')))
+                                    if expression is None:
+                                        expression = expressions.get('%d|' % slot)
+                                    if expression is not None:
+                                        part['visibilityExpression'] = expression
                                 if mid in materials:part['material']=mid
                                 parts.append(part)
                                 cache.append(variant_id)
@@ -1322,6 +1456,15 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
                             part=dict(common,partId=pid,
                                       authorData=addon.format_io.encode_mesh(author),
                                       visibilityBindings=bindings,materialSlot=slot)
+                            if preserved_controls:
+                                control_mesh_id = str(original.get('eiem_controls_mesh_id', original.name))
+                                expressions = preserved_controls['visibility'].get(control_mesh_id, {})
+                                expression = expressions.get('%d|%s' % (
+                                    slot, selected_material.get('eiem_section', '')))
+                                if expression is None:
+                                    expression = expressions.get('%d|' % slot)
+                                if expression is not None:
+                                    part['visibilityExpression'] = expression
                             if mid in materials:part['material']=mid
                             parts.append(part)
                             cache.append(pid)
@@ -1410,6 +1553,7 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
                     physics_document.encode(document), skeleton_bytes)
                 physics_resources.append(dict(
                     id=resource_id,
+                    label=rig.name_full,
                     native=data,
                     author=author_data,
                     targets=sorted({target for rows in targets.values() for target in rows})))
@@ -1456,7 +1600,14 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
             physics=physics_resources, author_files=author_files,
             target_bundles=modules['author_format3'].resolve_target_bundles(
                 source_packages.values(), rules),
-            skeletons=skeletons,bone_animations=bone_animations)
+            skeletons=skeletons,bone_animations=bone_animations,
+            state_defaults=(preserved_controls['defaults'] if preserved_controls else None),
+            persistent_states=(preserved_controls['persistent'] if preserved_controls else None),
+            preserved_controls=(preserved_controls['controls'] if preserved_controls else None),
+            preserved_bindings=(preserved_controls['bindings'] if preserved_controls else None),
+            key_switch_enabled=(preserved_controls['key_switch_enabled'] if preserved_controls else True),
+            control_program_source=program_source,
+            texture_template=next((t for t in templates if t['kind'] == 'Texture2D'), None))
         detail['writeAuthor'] = (time.perf_counter() - phase) * 1000
         tool = shared_resources.native_tool_file('eff_author_assets.dll')
         try:

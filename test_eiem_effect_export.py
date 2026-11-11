@@ -67,9 +67,12 @@ class StandaloneEffectExportTests(unittest.TestCase):
             lambda _path: None, eiem_format)
 
         self.assertEqual(manifest['modType'], 'effect')
-        self.assertIn('controls.effres', manifest['_files'])
-        self.assertIn('effects/EffectBuild123/0.effres', manifest['_files'])
+        self.assertNotIn('controls.effres', manifest['_files'])
+        self.assertIn('effects/Weapon_FX_0.effres', manifest['_files'])
+        self.assertIn('effects/author/Weapon_FX.effres', manifest['_files'])
         ini = (self.staging / 'mod.ini').read_text(encoding='utf-8')
+        self.assertIn('controls=ini', ini)
+        self.assertRegex(ini, r'bundles=ResourceEffect_[A-F0-9]+')
         self.assertIn('type=effect', ini)
         self.assertIn('[EffectAttachmentWeaponFx]', ini)
         self.assertNotIn('[Replace', ini)
@@ -102,9 +105,9 @@ class StandaloneEffectExportTests(unittest.TestCase):
             lambda _path: None, eiem_format)
         self.assertEqual(manifest['modType'], 'effect')
         self.assertEqual(author_format3.read_format3_directory(self.staging)['modType'], 'effect')
-        controls = (self.staging / 'controls.effres').read_bytes()
-        self.assertIn(b'assets/game/effects/skill.prefab', controls)
-        self.assertNotIn(b'assets/game/weapon.mesh', controls)
+        controls = (self.staging / 'mod.ini').read_text(encoding='utf-8')
+        self.assertIn('target.prefab=assets/game/effects/skill.prefab', controls)
+        self.assertNotIn('assets/game/weapon.mesh', controls)
 
     def test_rejects_unknown_effect_usage_mode(self):
         effect = self.effect()

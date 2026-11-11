@@ -85,6 +85,20 @@ def addon_function(name, namespace, path=ADDON):
 
 
 class NativeExportCoreTests(unittest.TestCase):
+    def test_imported_part_identity_survives_rename_and_extra_slots(self):
+        self.assertEqual(exporter.mesh_part_id('Renamed', 0, 1, 'PartOriginal'), 'MeshOriginal')
+        self.assertEqual(exporter.mesh_part_id('Renamed', 0, 2, 'PartOriginal'), 'MeshOriginal')
+        self.assertEqual(exporter.mesh_part_id('Renamed', 1, 2, 'PartOriginal'), 'MeshOriginal_mat1')
+        with self.assertRaisesRegex(ValueError, 'Part'):
+            exporter.mesh_part_id('Renamed', 0, 1, 'broken identity')
+
+    def test_program_material_bindings_keep_unchanged_material_resources(self):
+        source = '[BindingA]\ntarget=material.float\nmaterial=MaterialA\nproperty=_Value\nvalue=1\n'
+        self.assertEqual(exporter.control_program_materials(source), {'MaterialA'})
+        self.assertEqual(exporter.control_program_materials({'BindingA': source}), {'MaterialA'})
+        self.assertEqual(exporter.control_program_source(None), '')
+        self.assertEqual(exporter.control_program_source({'program_source': source}), source)
+
     def test_all_resource_identity_paths_share_assets_and_packages_namespaces(self):
         format3 = exporter.pack_modules()[0]['author_format3']
         for path in (
@@ -221,6 +235,9 @@ class NativeExportCoreTests(unittest.TestCase):
             def part_resource_id(value): return 'Part' + value.removeprefix('Mesh')
             @staticmethod
             def identifier(value): return value
+            @staticmethod
+            def named_resource_paths(rows, folder, extension):
+                return {key: folder + '/' + str(label) + extension for key, label in rows}
 
         class Source:
             @staticmethod
@@ -242,6 +259,9 @@ class NativeExportCoreTests(unittest.TestCase):
             def part_resource_id(value): return 'Part' + value.removeprefix('Mesh')
             @staticmethod
             def identifier(value): return value
+            @staticmethod
+            def named_resource_paths(rows, folder, extension):
+                return {key: folder + '/' + str(label) + extension for key, label in rows}
 
         class Source:
             @staticmethod
@@ -257,7 +277,7 @@ class NativeExportCoreTests(unittest.TestCase):
         self.assertEqual(textures, [])
         self.assertEqual(meshes[0]['partId'], 'PartBody')
         self.assertEqual(meshes[0]['meshId'], 'Mesh_PartBody')
-        self.assertEqual(meshes[0]['path'], 'meshes/PartBody.effres')
+        self.assertEqual(meshes[0]['path'], 'meshes/MeshBody.effres')
         self.assertEqual(meshes[0]['targetAsset'], 'Body')
 
     def test_typed_format3_records_allow_mesh_only_parts(self):
@@ -266,6 +286,9 @@ class NativeExportCoreTests(unittest.TestCase):
             def part_resource_id(value): return 'Part' + value.removeprefix('Mesh')
             @staticmethod
             def identifier(value): return value
+            @staticmethod
+            def named_resource_paths(rows, folder, extension):
+                return {key: folder + '/' + str(label) + extension for key, label in rows}
 
         class Source:
             @staticmethod
@@ -340,7 +363,7 @@ class NativeExportCoreTests(unittest.TestCase):
             format3 = exporter.pack_modules()[0]['author_format3']
             format3.write_format3_directory(
                 root, 'Smoke', [], {}, list(textures.values()), [], [], [], [])
-            published_dds = root / 'textures' / (texture_id + '.dds')
+            published_dds = root / 'textures' / (textures[texture_id]['pixelLabel'] + '.dds')
             self.assertEqual(exporter.texture_compression.parse_source_dds(
                 published_dds.read_bytes())['format'], 'BC7')
             self.assertEqual(Path(image.filepath), png_path)
@@ -378,6 +401,7 @@ class NativeExportCoreTests(unittest.TestCase):
             parsed_source = exporter.texture_compression.parse_source_dds(raw_dds)
             texture = dict(parsed_source, id='TextureExample', colorSpace=1,
                            filter=1, wrap=0, aniso=1, mipBias=0.0,
+                           sourcePath='assets/game/texture.png', sourceAsset='TextureExample',
                            ddsSourcePath=str(source_dds),
                            ddsHash=hashlib.sha256(raw_dds).hexdigest().upper())
             texture_inputs = {'TextureExample': {
@@ -1257,6 +1281,7 @@ class NativeExportCoreTests(unittest.TestCase):
 
     def test_automatic_shape_control_uses_live_channel_and_range(self):
         control = SimpleNamespace(shape='DisplayKey', enabled=True, identity='0123456789abcdef',
+                                  variable='',
                                   label='Shape', default=0, minimum=0, maximum=1,
                                   hotkey_increase='K', hotkey_decrease='J', hotkey_speed=1,
                                   automatic=True)

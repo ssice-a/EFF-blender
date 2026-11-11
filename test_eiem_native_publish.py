@@ -123,6 +123,55 @@ class Format3PublicationTests(unittest.TestCase):
             result = exporter.publish(self.staging, self.destination, read_format3)
         self.assertEqual(result['_files'], read_format3(self.destination)['_files'])
 
+    def test_repairs_missing_scaffold_and_unreadable_old_dds(self):
+        (self.destination / 'textures/body.effres').unlink()
+        (self.destination / 'textures/body.dds').write_bytes(b'broken DDS')
+        (self.destination / 'notes.txt').write_text('user file')
+        exporter.publish(self.staging, self.destination, read_format3)
+        self.assertEqual((self.destination / 'textures/body.effres').read_bytes(),
+                         b'texture scaffold')
+        self.assertEqual((self.destination / 'textures/body.dds').read_bytes(), b'old dds')
+        self.assertEqual((self.destination / 'notes.txt').read_text(), 'user file')
+
+    def test_invalid_candidate_does_not_change_damaged_destination(self):
+        (self.destination / 'textures/body.effres').unlink()
+        (self.staging / 'textures/body.effres').unlink()
+        with self.assertRaises(ValueError):
+            exporter.publish(self.staging, self.destination, read_format3)
+        self.assertFalse((self.destination / 'textures/body.effres').exists())
+        self.assertEqual((self.destination / 'textures/body.dds').read_bytes(), b'old dds')
+
+    def test_destination_inventory_rejects_other_formats_and_path_escapes(self):
+        original = (self.destination / 'mod.ini').read_text('utf-8')
+        for text in (original.replace('format=3', 'format=2'),
+                     original.replace('meshes/body.effres', '../outside.effres'),
+                     original.replace('meshes/body.effres', 'C:/outside.effres')):
+            with self.subTest(text=text):
+                (self.destination / 'mod.ini').write_text(text, encoding='utf-8')
+                with self.assertRaises(ValueError):
+                    exporter.publish(self.staging, self.destination, read_format3)
+                self.assertEqual((self.destination / 'mod.ini').read_text('utf-8'), text)
+
+    def test_failed_repair_restores_the_original_damaged_package(self):
+        (self.destination / 'textures/body.effres').unlink()
+        (self.destination / 'textures/body.dds').write_bytes(b'broken DDS')
+        before = {p.relative_to(self.destination): p.read_bytes()
+                  for p in self.destination.rglob('*') if p.is_file()}
+        (self.staging / 'mod.ini').write_text(
+            (self.staging / 'mod.ini').read_text('utf-8') + '\n; repaired\n', encoding='utf-8')
+        replace = exporter._replace_published_file
+
+        def fail_manifest(source, target):
+            if Path(target) == self.destination / 'mod.ini':
+                raise PermissionError('manifest is locked')
+            return replace(source, target)
+
+        with patch.object(exporter, '_replace_published_file', side_effect=fail_manifest):
+            with self.assertRaises(PermissionError):
+                exporter.publish(self.staging, self.destination, read_format3)
+        self.assertEqual({p.relative_to(self.destination): p.read_bytes()
+                          for p in self.destination.rglob('*') if p.is_file()}, before)
+
     @unittest.skipUnless(os.name == 'nt', 'requires Windows sharing flags')
     def test_open_mod_directory_survives_resource_update(self):
         from ctypes import wintypes

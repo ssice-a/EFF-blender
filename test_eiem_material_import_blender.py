@@ -76,6 +76,8 @@ def make_package(root, kind):
                "path=textures/body.effres\ndds=textures/body.dds\n")
     ini += ("source=assets/test/body.png\nname=BodyTexture\nlinear=true\n"
             "[MaterialBody]\npath=" + relative + "\n")
+    if kind == "format3":
+        ini += "texture._BaseMap=TextureBody\ntexture._DetailMap=TextureBody\n"
     (root / "mod.ini").write_text(ini, encoding="utf-8")
     return root / relative
 

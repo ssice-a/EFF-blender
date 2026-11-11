@@ -40,6 +40,20 @@ class TextureCompressionTests(unittest.TestCase):
         self.assertEqual((parsed['format'], parsed['formatId']), ('BC7', 25))
         self.assertEqual(parsed['pixels'], payload)
 
+    def test_photoshop_2d_depth_one_preserves_mip_payload(self):
+        data = bytearray(dds_fixture(4, 4, 1, 98, bytes(range(16))))
+        struct.pack_into('<I', data, 24, 1)
+        self.assertEqual(parse_source_dds(data)['pixels'], bytes(range(16)))
+
+    def test_rejects_volume_cube_and_array_dds(self):
+        for offset, value in ((24, 2), (8, 0x82100F), (112, 0x200000),
+                              (112, 0x200), (132, 4), (140, 2)):
+            with self.subTest(offset=offset, value=value):
+                data = bytearray(dds_fixture(4, 4, 1, 98, bytes(16)))
+                struct.pack_into('<I', data, offset, value)
+                with self.assertRaises(ValueError):
+                    parse_source_dds(data)
+
     def test_color_space_selects_bc7_variant_without_changing_unity_format(self):
         srgb = target_format('RGBA32', 1)
         linear = target_format('RGBA32', 0)

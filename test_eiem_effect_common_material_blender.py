@@ -61,6 +61,9 @@ assert before == dict(material.items())
 # Edit real RNA widgets used by the original EFF Material UI.
 material.eiem_editor_values['eiem_float._TintColorIntensity'].scalar = 2.75
 material.eiem_editor_values['eiem_value4._TintColor'].color = (3, .5, .25, .7)
+assert material['eiem_value4._TintColor'].startswith('1,0.5,0.25,0.7'), 'ordinary color widget must clamp to 0-1'
+material.eiem_editor_advanced = True
+material.eiem_editor_values['eiem_value4._TintColor'].vector4 = (3, .5, .25, .7)
 material.eiem_editor_values['eiem_value4._MainTexUVSpeed'].uv_speed = (.125, -.25)
 material.eiem_editor_values['eiem_render_queue'].integer = 3025
 material.eiem_editor_values['eiem_texture_scale._MainTex'].vector2 = (1.25, .75)

@@ -188,18 +188,91 @@ class Format3PublicationTests(unittest.TestCase):
         self.assertEqual(result["format"], 3)
         validated = read_format3_directory(output)
         self.assertEqual(validated["modId"], "DirectSmoke")
-        self.assertIn("controls.effres", validated["_files"])
-        self.assertIn("[ResourceControls]", (output / "mod.ini").read_text("utf-8"))
+        self.assertEqual(validated["_files"], {"mod.ini"})
+        self.assertIn("controls=ini", (output / "mod.ini").read_text("utf-8"))
+
+    def test_writer_preserves_imported_ini_controls_and_key_bindings(self):
+        output = self.root / "preserved-controls"
+        output.mkdir()
+        author_format3.write_format3_directory(
+            output, "PreservedControls", [], {}, [], [], [], [], [],
+            state_defaults={"$mode": 1.0}, persistent_states={"$mode"},
+            preserved_controls={"$mode": {
+                "label": "Mode", "minimum": 0.0, "maximum": 2.0}},
+            preserved_bindings=[dict(
+                id="KeyCustomMode", variable="$mode", type="cycle", key="F7",
+                speed=1.0, label="Mode", values=[0.0, 1.0, 2.0])],
+            key_switch_enabled=False)
+        parser = author_format3.configparser.ConfigParser(interpolation=None)
+        parser.optionxform = str
+        parser.read(output / "mod.ini", encoding="utf-8")
+        restored = author_format3.read_controls_ini(output, parser)
+        self.assertEqual(restored["defaults"]["$mode"], 1.0)
+        self.assertEqual(restored["controls"]["$mode"]["maximum"], 2.0)
+        self.assertEqual(restored["bindings"][0]["id"], "KeyCustomMode")
+        self.assertEqual(restored["bindings"][0]["values"], [0.0, 1.0, 2.0])
+        self.assertEqual(parser.get("Mod", "key_switch_enabled"), "0")
+
+    def test_imported_visibility_remains_required_after_adding_a_new_switch(self):
+        original = ("variable", 0.0, "$enabled", None, None)
+        bindings = [{"variable": "$style", "visible": [1]}]
+        expression = author_format3._part_visibility({
+            "visibilityExpression": original, "visibilityBindings": bindings})
+
+        def evaluate(node, values):
+            op, value, variable, left, right = node
+            if op == "number":
+                return value
+            if op == "variable":
+                return values[variable]
+            if op == "equal":
+                return evaluate(left, values) == evaluate(right, values)
+            if op == "and":
+                return evaluate(left, values) and evaluate(right, values)
+            self.fail("Unexpected expression operator: " + op)
+
+        self.assertTrue(evaluate(expression, {"$enabled": 1, "$style": 1}))
+        self.assertFalse(evaluate(expression, {"$enabled": 0, "$style": 1}))
+        self.assertFalse(evaluate(expression, {"$enabled": 1, "$style": 0}))
+
+    def test_resource_filenames_use_labels_and_case_insensitive_numeric_suffixes(self):
+        rows = [('TextureA_0123456789ab', 'dao_Roll'),
+                ('TextureB_abcdef012345', 'DAO_roll'),
+                ('TextureC_deadbeef0123', 'dao_Roll_2'),
+                ('TextureD_012345abcdef', '../刀:光*')]
+        paths = author_format3.named_resource_paths(rows, 'textures', '.effres')
+        self.assertEqual(paths, author_format3.named_resource_paths(reversed(rows), 'textures', '.effres'))
+        self.assertEqual(len({p.casefold() for p in paths.values()}), 4)
+        self.assertEqual(paths[rows[0][0]], 'textures/dao_Roll.effres')
+        for relative in paths.values():
+            self.assertEqual(Path(relative).parent.as_posix(), 'textures')
+            self.assertNotRegex(relative, r'[a-fA-F0-9]{12,}')
+            self.assertNotRegex(Path(relative).name, r'[:*\\/]')
+
+    def test_texture_filename_uses_source_label_instead_of_internal_hash(self):
+        output = self.root / 'readable'
+        output.mkdir()
+        texture = dict(id='TextureMat_0123456789ab', pixelLabel='mat_25.001_01',
+                       width=4, height=4, mipCount=1, formatId=25, pixels=bytes(16),
+                       colorSpace=1, filter=1, wrap=0, aniso=1, mipBias=0,
+                       sourcePath='assets/game/texture.png', sourceAsset='Texture')
+        manifest = author_format3.write_format3_directory(
+            output, 'Readable', [], {}, [texture], [], [], [], [])
+        row = manifest['_ini'][texture['id']]
+        self.assertEqual(row['dds'], 'textures/mat_25.001_01.dds')
+        self.assertNotIn('path', row)
+        self.assertFalse(list((output / 'textures').glob('*.effres')))
+        self.assertEqual((output / row['dds']).read_bytes()[148:], bytes(16))
 
     def test_meshes_share_and_select_distinct_author_skeletons(self):
         output = self.root / "multi-skeleton"
         output.mkdir()
         skeletons = [
-            dict(id="weapon_a", data=bone_codec.encode_skeleton([
+            dict(id="weapon_a", label="Weapon A", data=bone_codec.encode_skeleton([
                 ("WeaponA", -1, (0, 0, 0), (0, 0, 0, 1), (1, 1, 1)),
                 ("WeaponA/FxAnchor", 0, (0, 0, 0), (0, 0, 0, 1), (1, 1, 1)),
             ])),
-            dict(id="weapon_b", data=bone_codec.encode_skeleton([
+            dict(id="weapon_b", label="Weapon B", data=bone_codec.encode_skeleton([
                 ("WeaponB", -1, (0, 0, 0), (0, 0, 0, 1), (1, 1, 1)),
             ])),
         ]
@@ -233,14 +306,14 @@ class Format3PublicationTests(unittest.TestCase):
             skeletons=skeletons, bone_animations=clips)
         (output / "meshes").mkdir()
         for name in ("Blade", "Guard", "Staff"):
-            (output / "meshes" / ("Part" + name + ".effres")).write_bytes(
+            (output / "meshes" / (name + ".effres")).write_bytes(
                 author_format3.encode_resource_file(1, b"mesh metadata", b"mesh"))
 
         manifest = (output / "mod.ini").read_text("utf-8")
         self.assertIn("skeleton=weapon_a", manifest)
         self.assertIn("skeleton=weapon_b", manifest)
-        self.assertIn("[ShapeAnimationweapon_a_spin]", manifest)
-        self.assertIn("[ShapeAnimationweapon_b_pulse]", manifest)
+        self.assertIn("[Animationweapon_a_spin]", manifest)
+        self.assertIn("[Animationweapon_b_pulse]", manifest)
         self.assertNotIn("[BoneAnimation", manifest)
         self.assertEqual(read_format3_directory(output)["format"], 3)
 
@@ -257,7 +330,7 @@ class Format3PublicationTests(unittest.TestCase):
         author_format3.write_format3_directory(
             output, "UnanimatedSkeleton", [part], {}, [], [], [], [], [],
             skeletons=[skeleton])
-        mesh_path = output / "meshes" / "PartBlade.effres"
+        mesh_path = output / "meshes" / "Blade.effres"
         mesh_path.parent.mkdir(parents=True, exist_ok=True)
         mesh_path.write_bytes(author_format3.encode_resource_file(
             1, b"mesh metadata", b"mesh"))
@@ -296,7 +369,7 @@ class Format3PublicationTests(unittest.TestCase):
             output, "MixedAnimation", [part], {}, [], [], [], [], [],
             skeletons=[skeleton], bone_animations=[bone_clip])
         manifest = (output / "mod.ini").read_text("utf-8")
-        self.assertIn("[ShapeAnimationshared_swing]", manifest)
+        self.assertIn("[Animationshared_swing]", manifest)
         self.assertNotIn("[BoneAnimationshared_swing]", manifest)
 
         invalid = dict(bone_clip, data=bone_codec.encode_animation({
@@ -345,7 +418,7 @@ class Format3PublicationTests(unittest.TestCase):
         ]
         written = author_format3.write_format3_directory(
             output, "InheritedMaterial", [part], {}, [], rules, [], [], [])
-        mesh = output / "meshes" / "PartBody.effres"
+        mesh = output / "meshes" / "Body.effres"
         mesh.parent.mkdir(parents=True, exist_ok=True)
         mesh.write_bytes(author_format3.encode_resource_file(1, b"mesh metadata", b"mesh"))
         manifest = (output / "mod.ini").read_text("utf-8")
@@ -425,7 +498,7 @@ class Format3PublicationTests(unittest.TestCase):
             b"format=EFFMAT\nversion=1\noverrides=true\n"
             b"source=assets/game/metal.mat\nname=Metal\n")
         material = author_format3.encode_material_resource(
-            "MaterialMetal", "materials/MaterialMetal.effres",
+            "MaterialMetal", "materials/Metal.effres",
             "assets/game/metal.mat", "Metal", material_author)
         header = HEADER.unpack_from(material)
         self.assertEqual((header[1], header[2]), (3, 2))
@@ -473,6 +546,24 @@ class Format3PublicationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mip data extent"):
             read_format3_directory(self.root)
 
+    def test_accepts_photoshop_2d_depth_one_without_changing_scaffold(self):
+        scaffold = (self.root / 'textures/a.effres').read_bytes()
+        data = bytearray(_dds())
+        struct.pack_into('<I', data, 24, 1)
+        (self.root / 'textures/a.dds').write_bytes(data)
+        self.assertEqual(read_format3_directory(self.root)['format'], 3)
+        self.assertEqual((self.root / 'textures/a.effres').read_bytes(), scaffold)
+
+    def test_rejects_volume_cube_and_array_dds(self):
+        for offset, value in ((24, 2), (8, 0x801007), (112, 0x200000),
+                              (112, 0x200), (132, 4), (140, 2)):
+            with self.subTest(offset=offset, value=value):
+                data = bytearray(_dds())
+                struct.pack_into('<I', data, offset, value)
+                (self.root / 'textures/a.dds').write_bytes(data)
+                with self.assertRaises(ValueError):
+                    read_format3_directory(self.root)
+
     def test_rejects_resource_kind_mismatch(self):
         (self.root / "textures/a.effres").write_bytes(
             HEADER.pack(MAGIC, 3, 2, 0, 64, hashlib.sha256(b"").digest()) + b"P" * 64)
@@ -502,7 +593,7 @@ class Format3PublicationTests(unittest.TestCase):
 
     def test_rejects_material_author_texture_binding_drift(self):
         author = ("format=EFFMAT\nversion=1\noverrides=true\n"
-                  "source=assets/game/metal.mat\nname=Metal\ntexture._BaseMap=TextureMissing\n").encode()
+                  "source=assets/game/metal.mat\nname=Metal\n").encode()
         relative = "materials/metal.effres"
         (self.root / relative).parent.mkdir(parents=True)
         (self.root / relative).write_bytes(author_format3.encode_material_resource(
@@ -510,9 +601,55 @@ class Format3PublicationTests(unittest.TestCase):
         with (self.root / "mod.ini").open("a", encoding="utf-8") as stream:
             stream.write("\n[MaterialMetal]\npath=" + relative +
                          "\nsource.path=assets/game/metal.mat\nsource.asset=Metal\n"
-                         "texture._BaseMap=TextureMissing\n")
+                         "texture._BaseMap=TextureA\n")
+        self.assertEqual(read_format3_directory(self.root)["format"], 3)
+        ini = author_format3.configparser.ConfigParser(
+            interpolation=None, delimiters=("=",), strict=True)
+        ini.optionxform = str
+        ini.read(self.root / "mod.ini", encoding="utf-8")
+        ini["MaterialMetal"]["texture._BaseMap"] = "TextureMissing"
+        with (self.root / "mod.ini").open("w", encoding="utf-8") as stream:
+            ini.write(stream)
         with self.assertRaisesRegex(ValueError, "undeclared Texture"):
             read_format3_directory(self.root)
+
+    def test_rejects_duplicate_ini_owned_material_bindings_in_snapshot(self):
+        author = ("format=EFFMAT\nversion=1\noverrides=true\n"
+                  "source=assets/game/metal.mat\nname=Metal\n"
+                  "texture._BaseMap=TextureA\n").encode()
+        relative = "materials/metal.effres"
+        (self.root / relative).parent.mkdir(parents=True)
+        (self.root / relative).write_bytes(author_format3.encode_material_resource(
+            "MaterialMetal", relative, "assets/game/metal.mat", "Metal", author))
+        with (self.root / "mod.ini").open("a", encoding="utf-8") as stream:
+            stream.write("\n[MaterialMetal]\npath=" + relative +
+                         "\nsource.path=assets/game/metal.mat\nsource.asset=Metal\n"
+                         "texture._BaseMap=TextureA\n")
+        with self.assertRaisesRegex(ValueError, "duplicated in author snapshot"):
+            read_format3_directory(self.root)
+
+    def test_legacy_resource_controls_keep_material_binding_mirror_compatible(self):
+        author = ("format=EFFMAT\nversion=1\noverrides=true\n"
+                  "source=assets/game/metal.mat\nname=Metal\n"
+                  "texture._BaseMap=TextureA\n").encode()
+        relative = "materials/metal.effres"
+        (self.root / relative).parent.mkdir(parents=True)
+        (self.root / relative).write_bytes(author_format3.encode_material_resource(
+            "MaterialMetal", relative, "assets/game/metal.mat", "Metal", author))
+        (self.root / "controls.effres").write_bytes(
+            author_format3.encode_resource_file(6, b"legacy controls metadata", b""))
+        ini = author_format3.configparser.ConfigParser(
+            interpolation=None, delimiters=("=",), strict=True)
+        ini.optionxform = str
+        ini.read(self.root / "mod.ini", encoding="utf-8")
+        ini["Mod"]["controls"] = "resource"
+        ini["ResourceControls"] = {"type": "controls", "path": "controls.effres"}
+        ini["MaterialMetal"] = {
+            "path": relative, "source.path": "assets/game/metal.mat",
+            "source.asset": "Metal", "texture._BaseMap": "TextureA"}
+        with (self.root / "mod.ini").open("w", encoding="utf-8") as stream:
+            ini.write(stream)
+        self.assertIn("controls.effres", read_format3_directory(self.root)["_files"])
 
     def test_physics_author_snapshot_is_bound_to_manifest_targets(self):
         relative = "physics/a.effres"
@@ -541,9 +678,57 @@ class Format3PublicationTests(unittest.TestCase):
         ini.optionxform = str
         ini.read(self.root / "mod.ini", encoding="utf-8")
         ini["ReplaceBody"]["lod.1.asset"] = "Other"
-        with self.assertRaisesRegex(ValueError, "Mesh targets"):
+        # A single legacy rule unambiguously follows its current INI targets.
+        author_format3._validate_physics_resource(
+            self.root, relative, "ResourcePhysicsA", ini, len(native + author))
+        for index, (source, level) in enumerate(((target, 0), (lod_target, 1))):
+            prefix = 'bind.' + str(index) + '.'
+            ini['ResourcePhysicsA'].update({prefix + 'rule': 'ReplaceBody',
+                prefix + 'lod': str(level), prefix + 'source.path': source[0],
+                prefix + 'source.asset': source[1]})
+        author_format3._validate_physics_resource(
+            self.root, relative, 'ResourcePhysicsA', ini, len(native + author))
+        ini['ResourcePhysicsA']['bind.1.source.asset'] = 'ForgedSource'
+        with self.assertRaisesRegex(ValueError, 'source binding'):
             author_format3._validate_physics_resource(
-                self.root, relative, "ResourcePhysicsA", ini, len(native + author))
+                self.root, relative, 'ResourcePhysicsA', ini, len(native + author))
+
+    def test_writer_binds_physics_sources_to_independent_rules_and_lods(self):
+        output = self.root / 'physics-retarget'
+        output.mkdir()
+        targets = [('assets/game/a.mesh', 'A'), ('assets/game/a_lod1.mesh', 'A_LOD1'),
+                   ('assets/game/b.mesh', 'B')]
+        rules = [dict(hidden=False, parts=['Blade'], targets=[dict(
+            sourcePath=path, sourceAsset=asset, level=level)
+            for level, (path, asset) in enumerate(targets[:2])]),
+            dict(hidden=False, parts=['Blade'], targets=[dict(
+                sourcePath=targets[2][0], sourceAsset=targets[2][1], level=0)])]
+        part = dict(partId='Blade', object='Blade',
+                    visibilityExpression=('number', 1.0, '', None, None))
+        document, skeleton = b'EFFPHYS\0document', b'EFFSKEL\0skeleton'
+        author = b'EFFPHS3\0' + struct.pack('<IQQ', 1, len(document), len(skeleton)) + document + skeleton
+        native = b'native-physics'
+        written = author_format3.write_format3_directory(
+            output, 'PhysicsRetarget', [part], {}, [], rules, [], [], [],
+            physics=[dict(id='ResourcePhysicsRibbon', author=author,
+                          native=native, targets=targets)])
+        ini = written['_ini']
+        resource = ini['ResourcePhysicsRibbon']
+        mapping = {(resource[f'bind.{i}.source.path'], resource[f'bind.{i}.source.asset']):
+                   (resource[f'bind.{i}.rule'], resource[f'bind.{i}.lod']) for i in range(3)}
+        self.assertEqual(mapping, {targets[0]: ('ReplaceA', '0'),
+                                  targets[1]: ('ReplaceA', '1'), targets[2]: ('ReplaceB', '0')})
+        path = output / resource['path']
+        before = path.read_bytes()
+        ini['ReplaceA']['target.path'] = 'assets/game/new_a.mesh'
+        ini['ReplaceA']['target.asset'] = 'NewA'
+        ini['ReplaceA']['lod.1.path'] = 'assets/game/new_a_lod1.mesh'
+        ini['ReplaceA']['lod.1.asset'] = 'NewA_LOD1'
+        ini['ReplaceB']['target.path'] = 'assets/game/new_b.mesh'
+        ini['ReplaceB']['target.asset'] = 'NewB'
+        author_format3._validate_physics_resource(output, resource['path'],
+            'ResourcePhysicsRibbon', ini, len(native + author))
+        self.assertEqual(path.read_bytes(), before)
 
     def test_effect_author_resource_is_linked_to_attachment(self):
         archive = io.BytesIO()

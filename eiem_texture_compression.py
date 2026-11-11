@@ -63,7 +63,10 @@ def parse_source_dds(data):
             or struct.unpack_from('<I', data, 76)[0] != 32):
         raise ValueError('DDS 头无效')
     flags = struct.unpack_from('<I', data, 8)[0]
-    if (flags & 0x1007) != 0x1007 or struct.unpack_from('<I', data, 112)[0] or struct.unpack_from('<I', data, 24)[0]:
+    # Photoshop writes depth=1 for ordinary 2D DDS without DDSD_DEPTH.
+    if ((flags & 0x1007) != 0x1007 or flags & 0x800000
+            or struct.unpack_from('<I', data, 112)[0]
+            or struct.unpack_from('<I', data, 24)[0] > 1):
         raise ValueError('DDS 必须是普通 2D 贴图')
     height, width = struct.unpack_from('<II', data, 12)
     mips = struct.unpack_from('<I', data, 28)[0] or 1

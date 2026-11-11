@@ -34,8 +34,10 @@ from bpy_extras.io_utils import ImportHelper, ExportHelper
 from mathutils import Matrix, Quaternion, Vector
 try:
     from . import eiem_shared_resources as shared_resources
+    from . import eiem_controls_import as controls_import
 except ImportError:
     import eiem_shared_resources as shared_resources
+    import eiem_controls_import as controls_import
 
 
 # Blender does not expose a persistent revision number for every editable
@@ -1196,6 +1198,13 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
         raise ValueError("目录既不是 AnimeStudio EFFSOURCE 解包包，也不是 Format 3 运行时 Mod。")
     is_source_package = kind == "source"
     resources = {section: dict(parser.items(section)) for section in parser.sections()}
+    control_state = None
+    if not is_source_package and parser.get("Mod", "controls", fallback="") == "ini":
+        modules, _ = native_export.pack_modules()
+        control_state = modules["author_format3"].read_controls_ini(root, parser,
+            shared_resources.native_tool_file('eff_author_assets.dll') if any(s.startswith(('Parameter','Action','Event','Binding','UI')) for s in parser.sections()) else None)
+        control_state["key_switch_enabled"] = parser.getboolean(
+            "Mod", "key_switch_enabled", fallback=True)
     effect_attachments = []
     for section, values in resources.items():
         if not section.startswith("EffectAttachment"):
@@ -1253,7 +1262,7 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
             render_owners[render_section] = (section, prefab_path)
     textures = {}
     for section, values in resources.items():
-        if not section.lower().startswith("texture") or not values.get("path"):
+        if not section.lower().startswith("texture") or not values.get("path" if is_source_package else "dds"):
             continue
         # Do not let Blender's global filepath cache alias two imported
         # Mod packages. Their section/source metadata is package-local,
@@ -1268,16 +1277,16 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
                 if item.get("eiem_section") and item is not image}
         image_section = section
         if section in used:
-            image_section = unique_texture_section(safe_path(root, values["path"]), used)
+            image_section = unique_texture_section(image_file, used)
         image["eiem_section"] = image_section
         image["eiem_source_section"] = section
         image["eiem_author_package"] = str(Path(root).resolve())
         image["eiem_relative_path"] = image_path
-        image["eiem_native_resource_path"] = values["path"]
+        image["eiem_native_resource_path"] = values.get("path", "")
         image["eiem_source"] = values.get("source", "")
         image["eiem_name"] = values.get("name", image.name)
-        image["eiem_target_path"] = values.get("target.path", "")
-        image["eiem_target_asset"] = values.get("target.asset", "")
+        image["eiem_target_path"] = values.get("target.path", values.get("source.path", ""))
+        image["eiem_target_asset"] = values.get("target.asset", values.get("source.asset", ""))
         image["eiem_linear"] = values.get("linear", "false")
         image["eiem_mipmaps"] = values.get("mipmaps", "true")
         image["eiem_filter"] = values.get("filter", "1")
@@ -1420,6 +1429,11 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
         obj["eiem_render_section"] = section
         obj["eiem_original_material_sections_json"] = json.dumps({"0": material_section})
         obj["eiem_format3_import"] = True
+    if control_state is not None:
+        controls_import.restore_format3_controls(
+            control_state, meshes, skeletons, skeleton_payloads, materials,
+            package_collection, bpy.context.scene,
+            unity_transform_matrix_to_blender_basis(), modules["state_rules"].Condition)
     for armature in armatures_by_hierarchy.values():
         armature.data["eiem_source_bindings_json"] = json.dumps(shared_skin_bindings(armature), separators=(",", ":"))
     has_physics = any(values.get("type") == "physics" for values in resources.values())
@@ -1529,6 +1543,7 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
             author_values = resources[author_id]
             workspace, attachment, _source = format_io.materialize_format3_effect_author_resource(
                 safe_path(root, author_values["path"]), author_id, author_values["path"], cache_root)
+            attachment = format_io.format3_effect_attachment(section, values, attachment)
             # Keep the source attachment identity when it is not already in
             # this Blender scene. It makes an export/import cycle content
             # stable while still avoiding collisions when importing a copy.
@@ -3274,9 +3289,10 @@ class EFF_PT_material_properties(bpy.types.Panel):
 
 class EFF_PG_shape_control(bpy.types.PropertyGroup):
     shape: StringProperty(name="形态键")
-    enabled: BoolProperty(name='导出控制变量', default=True)
+    enabled: BoolProperty(name='启用游戏内控制', default=True)
     automatic: BoolProperty(name='使用 Blender 当前权重', default=False)
     identity: StringProperty(options={"HIDDEN"})
+    variable: StringProperty(options={"HIDDEN"})
     label: StringProperty(name='显示名称')
     default: FloatProperty(name="默认值", default=0.0)
     minimum: FloatProperty(name="最小值", default=0.0)

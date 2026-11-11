@@ -483,11 +483,16 @@ def read_package_material(root, section, declaration, kind):
         values["target.path"] = values["source"]
         values["target.asset"] = values.get("name", section)
     elif kind == "format3":
-        values = read_format3_material_resource(path, section, declaration["path"])
+        values = read_format3_material_resource(path, section)
         source_asset = values.pop("_source_asset")
         values.pop("_author_hash", None)
         values["target.path"] = declaration.get("source.path", values["source"])
         values["target.asset"] = declaration.get("source.asset", source_asset)
+        for key in list(values):
+            if key.startswith("texture."):
+                del values[key]
+        values.update((key, value) for key, value in declaration.items()
+                      if key.startswith("texture."))
     else:
         raise ValueError("Material input is neither EFFSOURCE nor a Format 3 Mod")
     return values
@@ -576,6 +581,32 @@ def read_format3_physics_resource(path, expected_id=None, expected_file=None):
     document, skeleton = decode_format3_physics_snapshot(author)
     return {"id": resource_id, "file": expected_file or resource_file, "targets": targets,
             "document": document, "skeleton": skeleton}
+
+
+def format3_effect_attachment(section, declaration, snapshot):
+    """Restore editable attachment relations from INI, keeping author data reusable."""
+    result = dict(snapshot)
+    if "mode" not in declaration:
+        return result  # Original Format 3 packages keep assembly in the snapshot.
+    mode = declaration["mode"]
+    if mode not in ("attach_mesh", "replace_game_prefab"):
+        raise ValueError("Format 3 Effect usage is invalid: " + mode)
+    result["id"] = section[len("EffectAttachment"):]
+    result["mode"] = "mesh_attachment" if mode == "attach_mesh" else mode
+    for key, field in (("label", "label"), ("part", "part"), ("bone", "bone"),
+                       ("target.prefab", "targetPrefab"), ("renderer", "rendererPath"),
+                       ("target.path", "targetPath"), ("target.asset", "targetAsset")):
+        result[field] = declaration.get(key, "")
+    result["replacementPrefab"] = result["targetPrefab"] if mode == "replace_game_prefab" else ""
+    result["autoplay"] = declaration.get("autoplay", "1").lower() in ("1", "true")
+    result["bones"] = [v.strip() for v in declaration.get("target_bones", "").split(",") if v.strip()]
+    for field, fallback, size in (("position", "0,0,0", 3), ("rotation", "0,0,0,1", 4),
+                                  ("scale", "1,1,1", 3)):
+        values = [float(v) for v in declaration.get(field, fallback).split(",")]
+        if len(values) != size or not all(math.isfinite(v) for v in values):
+            raise ValueError("Format 3 Effect transform differs: " + field)
+        result[field] = values
+    return result
 
 
 def encode_format3_effect_snapshot(source_archive, workspace, attachment, edit=None):

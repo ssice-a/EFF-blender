@@ -47,6 +47,9 @@ for cycle in range(3):
     assert bpy.ops.eiem.export_package.get_rna_type().properties['package_directory'].is_skip_save
     assert bpy.ops.eiem.export_update.get_rna_type() is not None
     assert hasattr(bpy.types.Scene,'eiem_export_last_directory')
+    assert not hasattr(bpy.types.Scene, 'eiem_control_program_text')
+    assert not hasattr(bpy.types.Collection, 'eiem_control_program_text')
+    assert not hasattr(bpy.types, 'SCENE_PT_eiem_control_program')
     try:
         bpy.ops.eiem.export_mesh_only.get_rna_type()
     except KeyError:

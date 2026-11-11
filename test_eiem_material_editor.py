@@ -40,6 +40,9 @@ class Layout:
     def operator(self,*args,**kwargs):return type('Operation',(),{})()
 
 try:
+    color_property=editor.EFF_PG_material_value.bl_rna.properties['color']
+    assert (color_property.hard_min,color_property.hard_max)==(0.0,1.0)
+    assert (color_property.soft_min,color_property.soft_max)==(0.0,1.0)
     editor._prepare_material(queue_mat)
     queue_row=queue_mat.eiem_editor_values['eiem_render_queue']
     assert queue_row.render_queue==2000, 'an absent native queue must display its actual opaque queue'
@@ -79,8 +82,20 @@ try:
     assert mat['eiem_float._UseEmission']=='1'
     fields=[];editor.draw(Layout(fields),mat)
     assert ('eiem_float._EmissionBrightness','scalar') in fields
-    color=editor._row(mat,'eiem_value4._EmissionColor');assert color.color[0]==4, 'HDR color was clamped'
-    color.color=(3,0.4,0.2,1);assert float(mat['eiem_value4._EmissionColor'].split(',')[0])==3
+    color=editor._row(mat,'eiem_value4._EmissionColor')
+    assert all(abs(actual-expected)<1e-6 for actual,expected in zip(color.color,(1.0,0.2,0.1,1.0))), 'normal color widget must display clamped HDR values'
+    assert mat['eiem_value4._EmissionColor']=='4,0.2,0.1,1', 'reading normal color must preserve stored HDR data'
+    color.color=(3,0.4,0.2,1)
+    written=tuple(float(value) for value in mat['eiem_value4._EmissionColor'].split(','))
+    assert all(0.0 <= value <= 1.0 for value in written), 'normal color input must stay in 0-1'
+    assert all(abs(actual-expected)<1e-6 for actual,expected in zip(written,(1,0.4,0.2,1)))
+    mat.eiem_editor_advanced=True
+    fields=[];editor.draw(Layout(fields),mat)
+    assert ('eiem_value4._EmissionColor','vector4') in fields, 'raw mode must expose numeric HDR editing'
+    color.vector4=(4,0.2,0.1,1)
+    written=tuple(float(value) for value in mat['eiem_value4._EmissionColor'].split(','))
+    assert all(abs(actual-expected)<1e-6 for actual,expected in zip(written,(4,0.2,0.1,1)))
+    mat.eiem_editor_advanced=False
     queue=editor._row(mat,'eiem_render_queue');queue.render_queue=2999;assert mat['eiem_render_queue']=='2999'
     # New imported fields must initialise without writing during draw, even
     # when the corresponding category/texture transform has never been opened.
@@ -190,16 +205,26 @@ try:
     effect=bpy.data.materials.new('Dedicated VFX Editor Test')
     try:
         effect['eiem_shader']='HGRP/CharacterNPR_VFX'
+        effect['eiem_value4._TintColor']='9999.28906,9794.01562,9999.75781,1'
         effect['eiem_float._UseBlend']='0';effect['eiem_float._UseMask']='0'
         for slot in ('_MainTex','_BlendTex','_MaskTex'):
             effect['eiem_texture_scale.'+slot]='1,1'
         editor._prepare_material(effect)
+        tint=editor._row(effect,'eiem_value4._TintColor')
+        assert all(abs(actual-1.0)<1e-6 for actual in tint.color), 'normal TintColor widget should display old 10000-like data as white'
+        assert effect['eiem_value4._TintColor']=='9999.28906,9794.01562,9999.75781,1', 'opening TintColor must not overwrite stored data'
+        tint.color=(1,1,1,1)
+        assert effect['eiem_value4._TintColor']=='1,1,1,1', 'explicit normal TintColor edit must write normalized white'
         effect.eiem_editor_features['blend'].enabled=True
         effect.eiem_editor_features['mask'].enabled=True
         effect.eiem_editor_groups['blend'].expanded=False
         fields=[];editor.draw(Layout(fields),effect)
         for slot in ('_MainTex','_BlendTex','_MaskTex'):
             assert ('eiem_texture.'+slot,'text') in fields
+        effect.eiem_editor_groups['blend'].expanded=True
+        labels=[];editor.draw(Layout([],labels),effect)
+        for label in ('Shader 主色','Shader 中标记 HDR / Gamma','Mask 只影响 Alpha'):
+            assert any(label in text for text,_ in labels), 'missing shader-backed guidance: '+label+' in '+repr(labels)
         assert effect['eiem_keyword._USE_BLEND']=='1' and effect['eiem_keyword._USE_MASK']=='1'
         assert 'eiem_keyword._CHARACTER_VFX_SPECIAL' not in effect
     finally:

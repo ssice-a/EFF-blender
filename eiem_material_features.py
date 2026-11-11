@@ -141,7 +141,7 @@ VFX = (
             prefixes=('_MainTex', '_TintColor'), names=('_MainUVSet', '_UseMainTexAsAlpha', '_MainUVWeights')),
     feature('blend', '混合图层', '_UseBlend', '_USE_BLEND', ('_BlendTex',),
             ('_BlendTex', '_BlendTint', '_BlendUV')),
-    feature('mask', '透明遮罩', '_UseMask', '_USE_MASK', ('_MaskTex',),
+    feature('mask', 'Mask（只影响 Alpha）', '_UseMask', '_USE_MASK', ('_MaskTex',),
             ('_MaskTex', '_MaskUV'), ('_UseMaskTexAsAlpha',)),
     feature('disturb', 'UV 扰动', '_UseDisturb', '_USE_DISTURB', ('_DisturbTex1',),
             ('_Disturb',), ('_Bi_Disturb',)),
@@ -332,10 +332,10 @@ LABELS = {
     '_OutlineMask': '描边遮罩', '_OutlineWidth': '描边宽度', '_EnableOutlineMask': '使用描边遮罩',
     '_MainTex': '特效主图', '_BlendTex': '混合图', '_MaskTex': '透明遮罩',
     '_DisturbTex1': 'UV 扰动图', '_NormalMap': '法线图', '_TintColor': '主图颜色',
-    '_TintColorIntensity': '主图亮度', '_TintColorAlpha': '主图不透明度', '_BlendTint': '混合颜色与亮度',
+    '_TintColorIntensity': '主图亮度', '_TintColorAlpha': '主图不透明度', '_BlendTint': '混合图颜色（Shader 支持 HDR）',
     '_MainTexUVSpeed': '主图速度（U/V）', '_BlendTexUVSpeed': '混合图速度（U/V）',
-    '_MaskTexUVSpeed': '遮罩速度（U/V）', '_UseMainTexAsAlpha': '主图 R 作为透明度',
-    '_UseMaskTexAsAlpha': '遮罩 R 作为透明度', '_Cull': '绘制面', '_ZWrite': '深度写入',
+    '_MaskTexUVSpeed': '遮罩速度（U/V）', '_UseMainTexAsAlpha': '主图参与 Alpha',
+    '_UseMaskTexAsAlpha': '遮罩参与 Alpha', '_Cull': '绘制面', '_ZWrite': '深度写入',
     '_TransparentDepthWrite': '透明深度写入', '_ZTest': '深度比较',
 }
 

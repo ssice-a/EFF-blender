@@ -2,6 +2,7 @@
 import math
 import uuid
 import hashlib
+import json
 import bpy
 from bpy.props import BoolProperty,CollectionProperty,EnumProperty,FloatProperty,FloatVectorProperty,IntProperty,StringProperty
 
@@ -27,6 +28,9 @@ def values(material,key):
 
 class EFF_PG_material_animation(bpy.types.PropertyGroup):
     identity:StringProperty()
+    runtime_id:StringProperty(options={'HIDDEN'})
+    speed_variable:StringProperty(options={'HIDDEN'})
+    runtime_variables:StringProperty(options={'HIDDEN'})
     label:StringProperty(name='名称',default='材质动画',update=lambda self,context:setattr(self,'name',self.label))
     enabled:BoolProperty(name='导出',default=True)
     property:StringProperty(name='Shader 参数')
@@ -85,17 +89,18 @@ def export_clips(material,mid,addon,include_hotkeys=True):
                     bag=strip.channelbag(slot)
                     if bag:curves.extend(bag.fcurves)
     for index,c in clips:
-        cid='mat_'+hashlib.sha256((mid+'\n'+c.identity).encode('utf-8')).hexdigest()[:32]
+        cid=c.runtime_id or 'mat_'+hashlib.sha256((mid+'\n'+c.identity).encode('utf-8')).hexdigest()[:32]
         if not math.isfinite(c.end-c.start) or c.end<=c.start:raise ValueError(c.label+' 的帧范围无效')
         path='eiem_material_animations[%d].%s'%(index,'value' if c.kind=='FLOAT' else 'vector')
         count=max(2,math.ceil((c.end-c.start)/fps*c.sample_rate)+1);tracks=[];channels=1 if c.kind=='FLOAT' else 4
+        variables=json.loads(c.runtime_variables) if c.runtime_variables else {}
         for component in range(channels):
             curve=next((f for f in curves if f.data_path==path and f.array_index==component),None)
             if curve is None:raise ValueError(c.label+' 缺少动画频道 %d 的关键帧'%component)
             samples=[float(curve.evaluate(c.start+(c.end-c.start)*i/(count-1))) for i in range(count)]
             if not all(math.isfinite(v) and abs(v)<=3.402823466e38 for v in samples):raise ValueError(c.label+' 存在无效数值')
-            tracks.append(dict(variable='$'+cid+'_'+str(component),material=mid,property=c.property,kind=c.kind,component=component,samples=samples))
-        result.append(dict(id=cid,label=c.label,key=c.hotkey if include_hotkeys else '',duration=(c.end-c.start)/fps,speed=c.speed,loop=c.loop,autoplay=c.autoplay,sample_rate=c.sample_rate,targets=tracks))
+            tracks.append(dict(variable=variables.get(str(component),'$'+cid+'_'+str(component)),material=mid,property=c.property,kind=c.kind,component=component,samples=samples))
+        result.append(dict(id=cid,label=c.label,key=c.hotkey if include_hotkeys else '',duration=(c.end-c.start)/fps,speed=c.speed,speedVariable=c.speed_variable or None,loop=c.loop,autoplay=c.autoplay,sample_rate=c.sample_rate,targets=tracks))
     return result
 
 class EFF_PT_material_animation(bpy.types.Panel):

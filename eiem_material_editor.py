@@ -1,4 +1,5 @@
 """Typed material controls over the existing, portable EFF author properties."""
+import json
 import math
 import re
 import importlib.util
@@ -48,6 +49,8 @@ _PARAMETER_PREFIXES = ('eiem_float.', 'eiem_int.', 'eiem_value4.', 'eiem_color.'
                        'eiem_keyword.', 'eiem_tag.')
 _TEXTURE_PREFIXES = ('eiem_texture.', 'eiem_texture_scale.', 'eiem_texture_offset.')
 _INFO_KEYS = ('eiem_source', 'eiem_shader', 'eiem_section')
+_BLEND_TINT_KEY = 'eiem_value4._BlendTint'
+_BLEND_EDITOR_STATE = 'eiem_editor_blend_hdr'
 
 
 def enabled(value):
@@ -154,6 +157,79 @@ def _set_vector(row, values):
     _put(row, ','.join(format(v, '.9g') for v in values))
 
 
+def _set_color(row, values):
+    rgba = tuple(min(1.0, max(0.0, float(v))) for v in values)
+    if row.key == _BLEND_TINT_KEY:
+        _, brightness = _blend_tint_state(row.id_data)
+        _write_blend_tint(row.id_data, rgba[:3], rgba[3], brightness)
+    else:
+        _set_vector(row, rgba)
+
+
+def _get_color(row):
+    if row.key == _BLEND_TINT_KEY:
+        rgb, _ = _blend_tint_state(row.id_data)
+        return (*rgb, min(1.0, max(0.0, _blend_tint_values(row.id_data)[3])))
+    # Keep the ordinary color widget in its display range without changing
+    # stored HDR values until the user explicitly edits the color.
+    return tuple(min(1.0, max(0.0, value)) for value in _vector(row, 4))
+
+
+def _blend_tint_values(material):
+    """Read _BlendTint without routing HDR values through the 0-1 color widget."""
+    try:
+        values = tuple(float(value) for value in str(
+            material.get(_BLEND_TINT_KEY, '1,1,1,1')).split(','))
+        if len(values) != 4 or not all(math.isfinite(value) for value in values):
+            raise ValueError
+        return values
+    except (TypeError, ValueError):
+        return (1.0, 1.0, 1.0, 1.0)
+
+
+def _blend_tint_state(material):
+    """Decompose native HDR RGB; retained UI values are valid only for that payload."""
+    native = str(material.get(_BLEND_TINT_KEY, '1,1,1,1'))
+    try:
+        state = json.loads(material.get(_BLEND_EDITOR_STATE, ''))
+        rgb = tuple(float(value) for value in state['rgb'])
+        brightness = float(state['brightness'])
+        if (state['native'] == native and len(rgb) == 3
+                and all(math.isfinite(value) and 0 <= value <= 1 for value in rgb)
+                and math.isfinite(brightness) and brightness >= 0):
+            return rgb, brightness
+    except (TypeError, ValueError, KeyError, OverflowError):
+        pass
+    current = _blend_tint_values(material)
+    brightness = max(0.0, *current[:3])
+    rgb = (tuple(min(1.0, max(0.0, value / brightness)) for value in current[:3])
+           if brightness > 0 else (1.0, 1.0, 1.0))
+    # Reading/drawing an old material must not author a new override or UI state.
+    return rgb, brightness
+
+
+def _write_blend_tint(material, rgb, alpha, brightness):
+    values = tuple(value * brightness for value in rgb) + (alpha,)
+    material[_BLEND_TINT_KEY] = ','.join(
+        format(value, '.9g') for value in values)
+    # The native RGBA remains the sole exported value. Persist the decomposition
+    # in the blend file so zero brightness and dark picker colors stay editable.
+    material[_BLEND_EDITOR_STATE] = json.dumps(
+        dict(native=material[_BLEND_TINT_KEY], rgb=rgb, brightness=brightness),
+        separators=(',', ':'), allow_nan=False)
+
+
+def _get_blend_brightness(material):
+    return _blend_tint_state(material)[1]
+
+
+def _set_blend_brightness(material, value):
+    """Adjust the multiplier without changing picker RGB or native alpha."""
+    target = max(0.0, min(64.0, float(value)))
+    rgb, _ = _blend_tint_state(material)
+    _write_blend_tint(material, rgb, _blend_tint_values(material)[3], target)
+
+
 def _set_uv_speed(row, values):
     _set_vector(row, tuple(values) + _vector(row, 4)[2:])
 
@@ -200,8 +276,10 @@ class EFF_PG_material_value(bpy.types.PropertyGroup):
     vector4: FloatVectorProperty(size=4, precision=4, get=lambda s: _vector(s,4), set=_set_vector)
     uv_speed: FloatVectorProperty(size=2, precision=4, get=lambda s: _vector(s,4)[:2], set=_set_uv_speed)
     choice: EnumProperty(items=_choices, get=lambda s: _number(s, True), set=lambda s,v: _put(s,str(v)))
-    color: FloatVectorProperty(size=4, subtype='COLOR', precision=4, min=0.0,
-                               get=lambda s: _vector(s,4), set=_set_vector)
+    color: FloatVectorProperty(size=4, subtype='COLOR', precision=4, min=0.0, max=1.0,
+                               soft_min=0.0, soft_max=1.0,
+                               get=_get_color, set=_set_color,
+                               description='颜色范围为 0–1；混合图颜色与其 HDR 亮度独立，调色保留亮度倍率；其他 HDR 原值可在“原始参数”编辑')
     text: StringProperty(get=lambda s: str(_get(s)), set=_put)
     uv_expanded: BoolProperty()
 
@@ -308,6 +386,8 @@ def draw_value(layout, material, key, simple=False):
     kind = property_kind(key, material.get(key, '-1' if key == 'eiem_render_queue' else ''))
     field = {'BOOL':'boolean','INT':'integer','FLOAT':'scalar','VECTOR2':'vector2',
              'VECTOR4':'vector4','COLOR':'color','TEXT':'text'}[kind]
+    if kind == 'COLOR' and material.eiem_editor_advanced and not simple:
+        field = 'vector4'
     if key == 'eiem_render_queue':
         field = 'render_queue'
     name = features.property_name(key)
@@ -486,14 +566,14 @@ def _draw_surface(layout, material, ownership):
         box.prop(material, 'eiem_editor_surface', text='表面模式')
         if features.surface_mode(material) == 1 and 'eiem_float._AlphaClipThreshold' in material:
             draw_value(box, material, 'eiem_float._AlphaClipThreshold', True)
-    for key in material.keys():
+    owned_keys = ownership.get('_keys_by_owner', {}).get('surface', ())
+    for key in owned_keys:
         if key.startswith(_PARAMETER_PREFIXES) and ownership.get(key) == 'surface' and _matches(material, key):
             draw_value(box, material, key, True)
 
 
-def _draw_feature(layout, material, item, ownership):
-    keys = [key for key in material.keys() if key.startswith(_PARAMETER_PREFIXES)
-            and ownership.get(key) == item['key']]
+def _draw_feature(layout, material, item, ownership, items, profile_name):
+    keys = list(ownership.get('_keys_by_owner', {}).get(item['key'], ()))
     query = material.eiem_editor_search.strip().casefold()
     if (query and query not in item['label'].casefold()
             and not any(_matches(material, key) for key in keys)
@@ -512,10 +592,19 @@ def _draw_feature(layout, material, item, ownership):
         return
     if item['key'] == 'pbr':
         box.label(text='P 图：R 金属、G 高光、B 阴影、A 光滑度' if active else '未使用 P 图，直接编辑表面数值')
-    if item['key'] == 'vfx' and features.profile(material) == 'character':
+    if item['key'] == 'vfx' and profile_name == 'character':
         box.label(text='空贴图沿用来源／Shader 默认值；选择文件后才导出覆盖')
     if item['key'] == 'breath':
         box.label(text='E 图 Alpha 控制呼吸参与度；开启时联动角色 VFX')
+    if item['key'] == 'main' and profile_name == 'vfx':
+        box.label(text='MainTex 默认白；TintColor 是 Shader 主色，亮度与不透明度另有参数。')
+        box.label(text='MainTex UV 速度 XY 按时间、ZW 按 Custom1.X；主图 Alpha 开关独立控制。')
+    if item['key'] == 'blend' and profile_name == 'vfx':
+        box.label(text='BlendTex 默认黑；BlendTint 在 Shader 中标记 HDR / Gamma。')
+        box.label(text='BlendTex UV 速度 XY 按时间、ZW 按 Custom1.Y。')
+    if item['key'] == 'mask' and profile_name == 'vfx':
+        box.label(text='Shader 属性说明：Mask 只影响 Alpha。')
+        box.label(text='静态遮罩请将 UV 速度和旋转设为 0，并关闭遮罩扰动。')
     primary = features.PRIMARY.get(item['key'], ())
     keys.sort(key=lambda key: primary.index(features.property_name(key)) if features.property_name(key) in primary else len(primary))
     secondary = []
@@ -529,11 +618,13 @@ def _draw_feature(layout, material, item, ownership):
         if _matches(material, key):
             if name in primary or query:
                 draw_value(box, material, key, True)
+                if item['key'] == 'blend' and profile_name == 'vfx' and name == '_BlendTint':
+                    box.prop(material, 'eiem_blend_brightness', text='混合图亮度 (HDR)')
             else:
                 secondary.append(key)
-    for child in features.features(material):
+    for child in items:
         if child['parent'] == item['key']:
-            _draw_feature(box, material, child, ownership)
+            _draw_feature(box, material, child, ownership, items, profile_name)
     if secondary:
         box.prop(state, 'details_expanded', text='更多此功能参数',
                  icon='TRIA_DOWN' if state.details_expanded else 'TRIA_RIGHT', emboss=False)
@@ -548,8 +639,8 @@ _SURFACE_STATE = {'_SurfaceType', '_EnableAlphaTest', '_BlendMode', '_AlphaPremu
 
 
 def _draw_remaining(layout, material, ownership):
-    remaining = [key for key in material.keys() if key.startswith(_PARAMETER_PREFIXES)
-                 and not key.startswith(('eiem_keyword.', 'eiem_tag.'))
+    remaining = [key for key in ownership.get('_parameter_keys', ())
+                 if not key.startswith(('eiem_keyword.', 'eiem_tag.'))
                  and ownership.get(key) is None and features.property_name(key) not in _SURFACE_STATE]
     state = material.eiem_editor_groups['extras']
     box = layout.box()
@@ -589,14 +680,23 @@ def draw(layout, material):
         _draw_raw(layout, material)
     else:
         items = features.features(material)
-        ownership = {key: features.owner(material, key, items) for key in material.keys()}
+        profile_name = features.profile(material)
+        parameter_keys = tuple(key for key in material.keys()
+                              if key.startswith(_PARAMETER_PREFIXES))
+        ownership = {key: features.owner(material, key, items) for key in parameter_keys}
+        keys_by_owner = {}
+        for key, owner in ownership.items():
+            if owner is not None:
+                keys_by_owner.setdefault(owner, []).append(key)
+        ownership['_parameter_keys'] = parameter_keys
+        ownership['_keys_by_owner'] = keys_by_owner
         ownership.update({key: features.owner(material, key, items)
                           for key in ('eiem_texture.' + slot for slot in texture_slots(material)) if key not in ownership})
         _draw_textures(layout, material, items)
         _draw_surface(layout, material, ownership)
         for item in items:
             if not item['parent']:
-                _draw_feature(layout, material, item, ownership)
+                _draw_feature(layout, material, item, ownership, items, profile_name)
         _draw_remaining(layout, material, ownership)
     _draw_info(layout, material)
     if getattr(material,'eff_effect_author',None):
@@ -616,17 +716,22 @@ def register():
     bpy.types.Material.eiem_editor_features = CollectionProperty(type=EFF_PG_material_feature)
     bpy.types.Material.eiem_editor_surface = EnumProperty(items=features.SURFACE_ITEMS,
         get=features.surface_mode, set=_set_surface, description='同步透明参数、Shader 关键字和实际渲染队列；保留贴图和深度写入')
-    bpy.types.Material.eiem_editor_advanced = BoolProperty(description='查看全部原始字段，包括关闭功能的参数和贴图')
+    bpy.types.Material.eiem_editor_advanced = BoolProperty(
+        description='查看全部原始字段；颜色在此以 RGBA 数值编辑，可保留 HDR 值')
     bpy.types.Material.eiem_editor_search = StringProperty()
     bpy.types.Material.eiem_editor_uv_expanded = BoolProperty()
     bpy.types.Material.eiem_editor_info_expanded = BoolProperty()
+    bpy.types.Material.eiem_blend_brightness = FloatProperty(
+        name='混合图亮度 (HDR)', min=0.0, max=64.0, soft_max=8.0,
+        precision=3, get=_get_blend_brightness, set=_set_blend_brightness,
+        description='导出 RGB = 混合图颜色 × 此 HDR 倍率；调亮度保留颜色与 Alpha，调色保留此倍率')
 
 
 def unregister():
     if bpy.app.timers.is_registered(_prepare_pending):
         bpy.app.timers.unregister(_prepare_pending)
     _PENDING_MATERIALS.clear()
-    for name in ('eiem_editor_advanced','eiem_editor_surface','eiem_editor_features',
+    for name in ('eiem_blend_brightness','eiem_editor_advanced','eiem_editor_surface','eiem_editor_features',
                  'eiem_editor_info_expanded','eiem_editor_uv_expanded','eiem_editor_search',
                  'eiem_editor_groups','eiem_editor_values'):
         delattr(bpy.types.Material,name)

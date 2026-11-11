@@ -7,7 +7,7 @@ import bpy
 from mathutils import Matrix
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 
-SHARED_FIELDS=('label','enabled','start','end','loop','autoplay','speed','sample_rate','hotkey')
+SHARED_FIELDS=('label','enabled','start','end','loop','autoplay','speed','speed_variable','sample_rate','hotkey')
 _syncing=False
 
 def sync_settings(clip, context):
@@ -281,7 +281,7 @@ def export_clips(obj, addon, include_hotkeys=True):
             if not all(math.isfinite(v) and control.minimum-1e-6<=v<=control.maximum+1e-6 for v in values): raise ValueError('动画权重超出形态键范围：'+item.name)
             channels[addon.shape_channel_name(obj,key)]=values
         if not channels: raise ValueError('播放组没有启用的动画频道：'+clip.label)
-        result.append(dict(id=clip.identity,label=clip.label,key=clip.hotkey if include_hotkeys else '',duration=duration,speed=clip.speed,loop=clip.loop,autoplay=clip.autoplay,sample_rate=clip.sample_rate,channels=channels))
+        result.append(dict(id=clip.identity,label=clip.label,key=clip.hotkey if include_hotkeys else '',duration=duration,speed=clip.speed,speedVariable=clip.speed_variable or None,loop=clip.loop,autoplay=clip.autoplay,sample_rate=clip.sample_rate,channels=channels))
     return result
 
 def export_bone_clips(obj,addon,skeleton_id,include_hotkeys=True):
@@ -307,7 +307,16 @@ def export_bone_clips(obj,addon,skeleton_id,include_hotkeys=True):
         count=max(2,math.ceil(duration*clip.sample_rate)+1)
         tracks={name:[] for name in selected}
         original_frame,original_subframe=scene.frame_current,scene.frame_subframe
+        animation=obj.animation_data_create()
+        original_action=animation.action
+        original_slot=getattr(animation,'action_slot',None)
         try:
+            animation.action=clip.action
+            if hasattr(clip.action,'slots'):
+                slot=next((item for item in clip.action.slots
+                           if item.handle==clip.slot_handle and item.target_id_type=='OBJECT'),None)
+                if slot is None:raise ValueError('骨骼动画缺少匹配的 Action 插槽：'+clip.label)
+                animation.action_slot=slot
             depsgraph=bpy.context.evaluated_depsgraph_get()
             for index in range(count):
                 frame=clip.start+(clip.end-clip.start)*index/(count-1)
@@ -331,6 +340,8 @@ def export_bone_clips(obj,addon,skeleton_id,include_hotkeys=True):
                         raise ValueError('骨骼动画包含无效 TRS：'+name)
                     tracks[name].append(sample)
         finally:
+            animation.action=original_action
+            if original_action and original_slot is not None:animation.action_slot=original_slot
             scene.frame_set(original_frame,subframe=original_subframe)
         payload=addon.bone_animation.encode_animation(dict(
             id=clip.identity,skeleton=skeleton_id,duration=duration,
@@ -339,7 +350,7 @@ def export_bone_clips(obj,addon,skeleton_id,include_hotkeys=True):
                     for name,values in tracks.items()]))
         result.append(dict(id=clip.identity,skeleton=skeleton_id,data=payload,
             label=clip.label,key=clip.hotkey if include_hotkeys else '',
-            duration=duration,speed=clip.speed,loop=clip.loop,autoplay=clip.autoplay,
+            duration=duration,speed=clip.speed,speedVariable=clip.speed_variable or None,loop=clip.loop,autoplay=clip.autoplay,
             sample_rate=int(clip.sample_rate)))
     return result
 
@@ -347,6 +358,7 @@ class EFF_PG_animation_channel(bpy.types.PropertyGroup):
     enabled: BoolProperty(name='参与播放',default=True)
 class EFF_PG_shape_animation(bpy.types.PropertyGroup):
     identity: StringProperty()
+    speed_variable: StringProperty(options={'HIDDEN'})
     label: StringProperty(name='名称',default='动画片段',update=sync_settings)
     enabled: BoolProperty(name='导出',default=True,update=sync_settings)
     action: PointerProperty(name='形态 Action',type=bpy.types.Action,poll=compatible_action)
@@ -364,6 +376,7 @@ class EFF_PG_shape_animation(bpy.types.PropertyGroup):
 
 class EFF_PG_bone_animation(bpy.types.PropertyGroup):
     identity: StringProperty()
+    speed_variable: StringProperty(options={'HIDDEN'})
     label: StringProperty(name='名称',default='动画片段',update=sync_settings)
     enabled: BoolProperty(name='导出',default=True,update=sync_settings)
     action: PointerProperty(name='骨骼 Action',type=bpy.types.Action,poll=compatible_bone_action)

@@ -109,7 +109,7 @@ def publish(destination, effects):
     if destination.exists() and any(destination.iterdir()):
         if not (destination / 'mod.ini').is_file():
             raise ValueError('不能覆盖缺少 mod.ini 的目录，请选择新的特效 Mod 目录')
-        previous = author_format3.read_format3_directory(destination)
+        previous = eiem_native_export.publication_inventory(destination)
         _require(previous.get('modType') == 'effect',
                  '输出目录是角色 Mod；请通过角色的完整 Format 3 导出更新特效')
         mod_id = previous['modId']

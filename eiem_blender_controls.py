@@ -728,7 +728,8 @@ def plan_shape_controls(objects, include_hotkeys=True):
                 channel_key = (source_identity, channel_name)
                 existing = by_source_channel.get(channel_key)
                 if existing is None:
-                    variable = "$shape_%s_%s" % (mesh_id, control.identity)
+                    variable = control.variable or ("$shape_%s_%s" % (mesh_id, control.identity))
+                    control.variable = variable
                     existing = {
                         "variable": variable,
                         "label": label,
@@ -738,6 +739,10 @@ def plan_shape_controls(objects, include_hotkeys=True):
                     declarations.append((variable, label, *values))
                 else:
                     variable = existing["variable"]
+                    if control.variable and control.variable != variable:
+                        raise ValueError(
+                            "同一源 Mesh 的形态键 %s 绑定到不同运行时变量" % channel_name)
+                    control.variable = variable
                     old_values = existing["values"]
                     if any(abs(float(left) - float(right)) > 1e-6
                            for left, right in zip(old_values, values)):
