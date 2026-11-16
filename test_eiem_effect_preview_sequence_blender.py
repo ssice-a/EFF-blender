@@ -50,14 +50,13 @@ for frame in (31, 46, 61, 76):
     sampled = sim.particles(data, (frame - scene.frame_start) / scene.render.fps, seed=seed)
     preview_obj = next(o for o in root.children_recursive
                        if o.get('eff_preview_key') == root['eff_effect_id'] + particle_id)
-    assert len(preview_obj.data.polygons) == len(sampled), 'billboard count diverged from particle simulation'
+    assert len(preview_obj.data.vertices) == len(sampled) and not preview_obj.data.polygons, 'particle point count diverged from simulation'
     assert preview_obj.data.materials, 'billboard preview lost its source material'
     image_nodes = [n for n in preview_obj.data.materials[0].node_tree.nodes
                    if n.type == 'TEX_IMAGE' and n.image]
     assert image_nodes, 'billboard preview material has no source image texture'
-    uv_layer = preview_obj.data.uv_layers.active
-    actual = [tuple(round(v, 6) for v in uv_layer.data[p.loop_start].uv)
-              for p in preview_obj.data.polygons]
+    uv_attribute = preview_obj.data.attributes[preview.particle_geometry.UV_OFFSET]
+    actual = [tuple(round(v, 6) for v in value.vector[:2]) for value in uv_attribute.data]
     expected = [tuple(round(v, 6) for v in sim.uv_transform(data['UVModule'], particle, (0, 0)))
                 for particle in sampled]
     assert actual == expected, f'preview UVs diverged at frame {frame}'

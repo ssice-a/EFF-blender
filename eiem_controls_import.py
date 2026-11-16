@@ -205,7 +205,9 @@ def _restore_material_animations(state, materials, fps):
                     raise ValueError("INI material animation has an incomplete channel: " + property_name)
                 settings = _settings(clip, samples_count, fps)
                 item = material.eiem_material_animations.add()
-                item.identity = identity + "_" + hashlib.sha256(property_name.encode("utf-8")).hexdigest()[:12]
+                item.action = action
+                item.slot_handle = slot_handle
+                item.source_bound = True
                 item.label = clip["label"]
                 item.enabled = True
                 item.hotkey = clip["key"]
@@ -225,6 +227,8 @@ def _restore_material_animations(state, materials, fps):
                 else:
                     item.vector = tuple(components_by_index[index][0]
                                         for index in range(expected_components))
+                # Publish only complete playback settings to the shared group.
+                item.identity = identity
                 path = "eiem_material_animations[%d].%s" % (
                     len(material.eiem_material_animations) - 1,
                     "value" if expected_components == 1 else "vector")

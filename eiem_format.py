@@ -11,6 +11,7 @@ import json
 import math
 import struct
 import zipfile
+from collections import OrderedDict
 from pathlib import Path
 
 MAGIC_MESH = b"EFFMESH\0"
@@ -342,6 +343,9 @@ def read_effmat_snapshot(data):
     if (values.get("format") != "EFFMAT" or values.get("version") != "1" or
             values.get("overrides", "").lower() != "true" or not values.get("source", "").strip()):
         raise ValueError("format-3 Material author snapshot header differs")
+    for line in data.decode('utf-8-sig').splitlines():
+        if line.startswith(';EFF_MATERIAL_IMPORT='):
+            values['_native_bindings'] = line.split('=',1)[1]
     return values
 
 
@@ -600,9 +604,21 @@ def format3_effect_attachment(section, declaration, snapshot):
     result["replacementPrefab"] = result["targetPrefab"] if mode == "replace_game_prefab" else ""
     result["autoplay"] = declaration.get("autoplay", "1").lower() in ("1", "true")
     result["bones"] = [v.strip() for v in declaration.get("target_bones", "").split(",") if v.strip()]
+    indices=sorted({int(k.split('.')[1]) for k in declaration if k.startswith('lod.')})
+    result['lodTargets']=[dict(renderer=declaration['lod.'+str(i)+'.renderer'],
+        path=declaration['lod.'+str(i)+'.path'],asset=declaration['lod.'+str(i)+'.asset'],
+        bones=[b.strip() for b in declaration.get('lod.'+str(i)+'.bones','').split(',') if b.strip()]) for i in indices]
+    result['lodCoverage']=declaration.get('lod_coverage', snapshot.get('lodCoverage','all'))
+    if 'lod_anchor' in declaration:
+        indices=sorted({int(k.split('.')[1]) for k in declaration if k.startswith('lod_anchor.')})
+        result['lodAnchor']=dict(path='' if declaration['lod_anchor']=='.' else declaration['lod_anchor'],nodes=[
+            {f:[float(v) for v in declaration['lod_anchor.'+str(i)+'.'+f].split(',')]
+             for f in ('position','rotation','scale')} for i in indices])
+    else:result.pop('lodAnchor',None)
     for field, fallback, size in (("position", "0,0,0", 3), ("rotation", "0,0,0,1", 4),
                                   ("scale", "1,1,1", 3)):
-        values = [float(v) for v in declaration.get(field, fallback).split(",")]
+        raw = declaration.get(field, fallback)
+        values = [float(v) for v in (raw.split(',') if isinstance(raw, str) else raw)]
         if len(values) != size or not all(math.isfinite(v) for v in values):
             raise ValueError("Format 3 Effect transform differs: " + field)
         result[field] = values
@@ -668,29 +684,73 @@ def decode_format3_effect_snapshot(data):
     return value
 
 
-def encode_format3_effect_source(source, workspace, attachment, edit=None):
-    """Create an editable Effect snapshot directly from its author directory."""
+_EFFECT_SOURCE_ARCHIVES = OrderedDict()
+_EFFECT_SOURCE_ARCHIVE_LIMIT = 64 * 1024 * 1024
+
+
+def _effect_source_archive(source, replacements=None, omitted=()):
+    """Reuse compression, never file validation: hash actual contents each time."""
     import stat
     source = Path(source).resolve()
     if not source.is_dir():
         raise ValueError("format-3 Effect source directory is absent")
+    replacements = replacements or {}
+    files = []
+    fingerprint = []
+    for file in sorted(source.rglob("*")):
+        mode = file.lstat().st_mode
+        if stat.S_ISLNK(mode):
+            raise ValueError("Effect source contains a symbolic link: " + str(file))
+        if file.is_dir():
+            continue
+        if not stat.S_ISREG(mode):
+            raise ValueError("Effect source contains a non-file entry: " + str(file))
+        relative = file.relative_to(source).as_posix()
+        if relative in omitted:
+            continue
+        data = replacements[relative] if relative in replacements else file.read_bytes()
+        files.append((file, relative))
+        # Timestamps alone cannot detect externally replaced source assets.
+        fingerprint.append((relative, hashlib.sha256(data).digest()))
+    key = (str(source), tuple(fingerprint))
+    cached = _EFFECT_SOURCE_ARCHIVES.get(key)
+    if cached is not None:
+        _EFFECT_SOURCE_ARCHIVES.move_to_end(key)
+        return cached
+    archive_stream = io.BytesIO()
+    with zipfile.ZipFile(archive_stream, "w", compression=zipfile.ZIP_DEFLATED,
+                         compresslevel=1) as package:
+        for file, relative in files:
+            if relative in replacements:
+                package.writestr(relative, replacements[relative])
+            else:
+                package.write(file, relative)
+    result = archive_stream.getvalue()
+    if len(result) <= _EFFECT_SOURCE_ARCHIVE_LIMIT:
+        # Keep one content generation per source and a bounded total archive size.
+        for previous in list(_EFFECT_SOURCE_ARCHIVES):
+            if previous[0] == str(source):
+                del _EFFECT_SOURCE_ARCHIVES[previous]
+        _EFFECT_SOURCE_ARCHIVES[key] = result
+        while (len(_EFFECT_SOURCE_ARCHIVES) > 4 or
+               sum(map(len, _EFFECT_SOURCE_ARCHIVES.values())) > _EFFECT_SOURCE_ARCHIVE_LIMIT):
+            _EFFECT_SOURCE_ARCHIVES.popitem(last=False)
+    return result
+
+
+def encode_format3_effect_source(source, workspace, attachment, edit=None):
+    """Create an editable Effect snapshot directly from its author directory."""
     attachment = {
         key: value for key, value in attachment.items()
         if key != "build" and not str(key).startswith("_")
     }
-    archive_stream = io.BytesIO()
-    with zipfile.ZipFile(archive_stream, "w", compression=zipfile.ZIP_DEFLATED,
-                         compresslevel=6) as package:
-        for file in sorted(source.rglob("*")):
-            mode = file.lstat().st_mode
-            if stat.S_ISLNK(mode):
-                raise ValueError("Effect source contains a symbolic link: " + str(file))
-            if file.is_dir():
-                continue
-            if not stat.S_ISREG(mode):
-                raise ValueError("Effect source contains a non-file entry: " + str(file))
-            package.write(file, file.relative_to(source).as_posix())
-    return encode_format3_effect_snapshot(archive_stream.getvalue(), workspace, attachment, edit)
+    if __package__:
+        from .eiem_effect_source import author_projection
+    else:
+        from eiem_effect_source import author_projection
+    replacements, omitted, workspace, edit = author_projection(source, workspace, edit)
+    archive = _effect_source_archive(source, replacements, omitted)
+    return encode_format3_effect_snapshot(archive, workspace, attachment, edit)
 
 
 def encode_format3_effect_author(source, workspace, attachment, edit):
@@ -766,29 +826,43 @@ def read_format3_effect_author_resource(path, expected_id=None, expected_file=No
 def materialize_format3_effect_author_resource(path, expected_id, expected_file, cache_root):
     import stat
     result = read_format3_effect_author_resource(path, expected_id, expected_file)
-    source = Path(cache_root).resolve() / result["id"]
-    if not (source / "effect.json").is_file() or not (source / "source/manifest.json").is_file():
-        temporary = source.with_name(source.name + ".tmp")
-        if temporary.exists():
-            import shutil
-            shutil.rmtree(temporary)
-        temporary.mkdir(parents=True)
+    archive = result["_source_archive"]
+    source = Path(cache_root).resolve() / hashlib.sha256(archive).hexdigest()
+    with zipfile.ZipFile(io.BytesIO(archive)) as package:
+        entries, names, total = [], set(), 0
+        for info in package.infolist():
+            name = info.filename.rstrip('/') if info.is_dir() else info.filename
+            if (not name or "\\" in name or ":" in name or
+                    any(part in ("", ".", "..") for part in name.split("/"))):
+                raise ValueError("format-3 Effect source archive entry is invalid: " + info.filename)
+            if stat.S_ISLNK(info.external_attr >> 16):
+                raise ValueError("format-3 Effect source archive contains a symbolic link")
+            if info.is_dir():continue
+            if name.casefold() in names:
+                raise ValueError("format-3 Effect source archive contains duplicate paths")
+            names.add(name.casefold());total += info.file_size;entries.append(info)
+            if total > 2 * 1024 * 1024 * 1024:
+                raise ValueError("format-3 Effect source archive exceeds the import size limit")
+        if not {'effect.json', 'source/manifest.json'}.issubset(names):
+            raise ValueError("format-3 Effect source archive is incomplete")
+    # The validated archive is authoritative, including when an extracted
+    # cache was edited or truncated. IDs only identify resources inside a Mod.
+    def cache_valid():
         try:
-            with zipfile.ZipFile(io.BytesIO(result["_source_archive"])) as package:
-                total = 0
-                for info in package.infolist():
+            with zipfile.ZipFile(io.BytesIO(archive)) as package:
+                return all((source.joinpath(*info.filename.split('/')).is_file() and
+                            source.joinpath(*info.filename.split('/')).read_bytes() == package.read(info))
+                           for info in entries)
+        except (OSError, ValueError, zipfile.BadZipFile):
+            return False
+    if not cache_valid():
+        import tempfile
+        source.parent.mkdir(parents=True, exist_ok=True)
+        temporary = Path(tempfile.mkdtemp(prefix=source.name + ".tmp-", dir=source.parent))
+        try:
+            with zipfile.ZipFile(io.BytesIO(archive)) as package:
+                for info in entries:
                     name = info.filename
-                    if (info.is_dir() or not name or "\\" in name or ":" in name or
-                            any(part in ("", ".", "..") for part in name.split("/"))):
-                        if info.is_dir() and name.endswith("/"):
-                            continue
-                        raise ValueError("format-3 Effect source archive entry is invalid: " + name)
-                    mode = info.external_attr >> 16
-                    if stat.S_ISLNK(mode):
-                        raise ValueError("format-3 Effect source archive contains a symbolic link")
-                    total += info.file_size
-                    if total > 2 * 1024 * 1024 * 1024:
-                        raise ValueError("format-3 Effect source archive exceeds the import size limit")
                     target = temporary.joinpath(*name.split("/"))
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(package.read(info))
@@ -812,6 +886,8 @@ def materialize_format3_effect_author_resource(path, expected_id, expected_file,
         except ImportError:
             import eiem_effect_document
         eiem_effect_document.apply_edit(workspace, result["edit"])
+        if result['edit'].get('resourceBindings'):
+            workspace['author_resource_bindings'] = result['edit']['resourceBindings']
     return workspace, result["attachment"], source
 
 
@@ -949,5 +1025,5 @@ def validate_skeleton_nodes(nodes, source_nodes):
             if source_nodes[i] and not source_nodes[parent]:
                 raise ValueError("source bone cannot be reparented under a new bone: " + path)
         if (not all(math.isfinite(v) for v in (*position, *rotation, *scale)) or
-                abs(sum(v*v for v in rotation)-1) > .001 or min(scale) <= 0):
+                abs(sum(v*v for v in rotation)-1) > .001 or any(v == 0 for v in scale)):
             raise ValueError("invalid skeleton transform: " + path)

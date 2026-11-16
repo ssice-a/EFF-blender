@@ -129,6 +129,24 @@ def _typed_author_input(mod_id, templates, meshes, textures):
     return bytes(writer.data)
 
 
+def published_native_meshes(meshes, manifest):
+    """Resolve typed geometry through the INI's published Mesh declarations."""
+    by_path={}
+    for section in manifest.sections():
+        if not section.startswith('Part'):continue
+        declaration=manifest[section];mesh_id=declaration.get('mesh','')
+        if mesh_id not in manifest:continue
+        by_path.setdefault(manifest[mesh_id].get('path',''),[]).append((section,mesh_id,declaration))
+    result=[]
+    for row in meshes:
+        candidates=by_path.get(row['path'],[])
+        if len(candidates)!=1:
+            raise ValueError('Format 3 typed geometry has no unique published Mesh Part: '+row['path'])
+        section,mesh_id,declaration=candidates[0]
+        result.append(dict(row,partId=section,meshId=mesh_id,material=declaration.get('material','')))
+    return result
+
+
 def write_format3_native_assets(library_path, mod_id, templates, meshes,
                                 textures, output_path):
     output_path = Path(output_path).resolve()
@@ -141,6 +159,9 @@ def write_format3_native_assets(library_path, mod_id, templates, meshes,
     if (manifest.get('Mod', 'format', fallback='') != '3' or
             manifest.get('Mod', 'id', fallback='') != mod_id):
         raise ValueError('Format 3 typed writer candidate identity differs')
+    # INI owns public names; the typed geometry request can still carry an
+    # imported material's private author identity as provenance.
+    meshes = published_native_meshes(meshes, manifest)
     path = str(Path(library_path).resolve())
     modules, _ = pack_modules()
     from importlib import import_module
@@ -474,6 +495,12 @@ def split_material(author):
         yield slot, part
 
 def material_fields(tree, overrides, encode):
+    def defaults(schema):
+        if schema.type == 'string': return ''
+        if schema.type == 'TypelessData': return b''
+        if schema.type == 'Array' or len(schema.children) == 1 and schema.children[0].type == 'Array': return []
+        if schema.children: return {c.name: defaults(c) for c in schema.children}
+        return 0
     before = {key: encode(tree[key]) for key in tree.data}
     for key, value in overrides.items():
         if key.startswith('texture.'): continue
@@ -493,7 +520,13 @@ def material_fields(tree, overrides, encode):
             entries = tree['m_SavedProperties']['m_TexEnvs'].items()
             entry = next((p for p in entries if p['first'].data == prop), None)
             if entry is None:
-                raise ValueError('原生材质没有此贴图槽：'+prop)
+                envs = tree['m_SavedProperties']['m_TexEnvs']
+                row = defaults(envs.array_node().schema.children[1])
+                row['first'] = prop
+                row['second'].update(m_Texture=dict(m_FileID=0,m_PathID=0),
+                                     m_Scale=dict(x=1.,y=1.),m_Offset=dict(x=0.,y=0.))
+                envs.set_items(entries + [row])
+                entry = tree['m_SavedProperties']['m_TexEnvs'].items()[-1]
             values = [float(x) for x in str(value).split(',')]
             if len(values) != 2 or not all(math.isfinite(x) for x in values):
                 raise ValueError('贴图缩放和偏移需要两个有限分量：'+key)
@@ -543,12 +576,19 @@ def material_fields(tree, overrides, encode):
             raise ValueError('尚未支持的材质字段修改：'+key)
         entries = tree['m_SavedProperties'][maps[kind]].items()
         entry = next((p for p in entries if p['first'].data == prop), None)
-        if entry is None: raise ValueError('原生材质没有此属性：'+key)
+        if entry is None:
+            default = dict(r=0.,g=0.,b=0.,a=0.) if kind in ('value4','color') else 0
+            tree['m_SavedProperties'][maps[kind]].set_items(entries + [dict(first=prop,second=default)])
+            entry = tree['m_SavedProperties'][maps[kind]].items()[-1]
         if kind in ('float', 'int'):
-            entry.set('second', float(value) if kind == 'float' else int(value))
+            number = float(value) if kind == 'float' else int(value)
+            if not math.isfinite(number):
+                raise ValueError('材质数值必须为有限值：'+key)
+            entry.set('second', number)
         else:
             values = [float(x) for x in value.split(',')]
-            if len(values) != 4: raise ValueError('材质向量需要四个分量：'+key)
+            if len(values) != 4 or not all(math.isfinite(x) for x in values):
+                raise ValueError('材质向量需要四个有限分量：'+key)
             entry.set('second', dict(zip(('r','g','b','a'), values)))
     changed = {}
     for key in tree.data:
@@ -850,6 +890,45 @@ def _texture_resource_id(section, image, color_space, target, width, height,
     return 'Texture' + token(label)[:70] + '_' + suffix
 
 
+def _texture_author_profile(source, native, property_name, image):
+    """Retain an imported Texture declaration; a Material slot is a default."""
+    pointer = next((row['pointer'] for row in native['details']['textures']
+                    if row['property'] == property_name), None)
+    if pointer is None:
+        raise ValueError('原生材质没有此贴图槽：' + property_name)
+    path = str(image.get('eiem_target_path', '') or '').strip()
+    asset = str(image.get('eiem_target_asset', '') or '').strip()
+    if path or asset:
+        if not path or not asset or not _is_logical_resource_path(path):
+            raise ValueError('作者 Texture 的逻辑来源不完整：' + image.name)
+        # A clean DDS with explicit sampling semantics does not require this
+        # template's pixels or an offline snapshot. Runtime resolves the
+        # declared identity in the current game when the resource is needed.
+        candidates = source.find_all('Texture2D', path, asset) if hasattr(source, 'find_all') else None
+        template = {} if candidates is not None and not candidates else source.resolve('Texture2D', path, asset)
+        details = template.get('details') or {}
+    else:
+        if pointer['isNull']:
+            pointer = next((row['pointer'] for row in native['details']['textures']
+                            if not row['pointer']['isNull'] and row['pointer'].get('identity')), None)
+            if pointer is None:
+                raise ValueError('材质来源没有可用的 Texture2D 结构模板：' + property_name)
+        template = source.resolve_identity(pointer['identity'])
+        path, asset = template['logicalPath'], template['name']
+        details = template.get('details') or {}
+    if 'eiem_linear' in image:
+        linear = str(image['eiem_linear']).lower()
+        if linear not in ('true', 'false', '1', '0'):
+            raise ValueError('作者 Texture 的 Linear 设置无效：' + image.name)
+        color_space = 0 if linear in ('true', '1') else 1
+    else:
+        color_space = details.get('colorSpace')
+    if color_space not in (0, 1):
+        raise ValueError('源贴图缺少有效的 sRGB/Linear 元数据：' + path)
+    return dict(sourcePath=path, sourceAsset=asset, colorSpace=color_space,
+                sourceFormat=details.get('format'))
+
+
 def collect_material(addon, source, mat, images, textures, temporary, encode,
                      existing=None, texture_only=False, mid=None,
                      texture_cache=None, include_native_fields=True,
@@ -883,28 +962,17 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
         if not key.startswith('texture.'):
             continue
         prop = key.removeprefix('texture.')
-        pointer = next((x['pointer'] for x in native['details']['textures'] if x['property'] == prop), None)
-        if pointer is None:
-            raise ValueError('原生材质没有此贴图槽：' + prop)
-        if pointer['isNull']:
-            # The slot exists; only its value is null. An already referenced
-            # Texture2D supplies the native schema, not the new slot's pixels.
-            pointer = next((entry['pointer'] for entry in native['details']['textures']
-                            if not entry['pointer']['isNull'] and entry['pointer'].get('identity')), None)
-            if pointer is None:
-                raise ValueError('材质来源没有可用的 Texture2D 结构模板：' + prop)
-        tex = source.resolve_identity(pointer['identity'])
-        details = tex.get('details') or {}
-        color_space = details.get('colorSpace')
-        source_format = details.get('format')
-        if color_space not in (0, 1):
-            raise ValueError('源贴图缺少有效的 sRGB/Linear 元数据：' + tex['logicalPath'])
         image = images[section]
+        profile = _texture_author_profile(source, native, prop, image)
+        color_space, source_format = profile['colorSpace'], profile['sourceFormat']
         disk = Path(addon.image_absolute_path(image)) if hasattr(addon, 'image_absolute_path') else Path(image.filepath)
         is_dds = disk.suffix.casefold() == '.dds'
         if not is_dds and (not isinstance(source_format, str) or not source_format):
-            raise ValueError('源贴图缺少 Texture2D 格式元数据：' + tex['logicalPath'])
-        cache_key = _texture_image_signature(addon, image, color_space, source_format or '')
+            raise ValueError('源贴图缺少 Texture2D 格式元数据：' + profile['sourcePath'])
+        # DDS describes its own encoding. Native template formats must not
+        # split its cache or turn a painted BC7 DDS into the slot's BC5.
+        cache_key = _texture_image_signature(addon, image, color_space,
+                                             'DDS' if is_dds else source_format)
         payload = texture_cache.get(cache_key)
         if payload is None:
             settings = dict(colorSpace=color_space,
@@ -937,7 +1005,7 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
                     converted = _compress_texture_blocks(
                         base_pixels, width, height,
                         str(image.get('eiem_mipmaps', 'true' if parsed['mipCount'] > 1 else 'false')) == 'true',
-                        source_format, color_space,
+                        parsed['format'], color_space,
                         shared_resources.native_tool_file('texconv.exe'),
                         source_pixels_hash)
                     payload = dict(converted, pixelLabel=token(disk.stem or image.name),
@@ -977,7 +1045,7 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
         # The game texture is a template, not the identity of an authored
         # override. One author image/profile is shared across all material bindings.
         record = dict(payload, id=tid, section=tid,
-                      sourcePath=tex['logicalPath'], sourceAsset=tex['name'])
+                      sourcePath=profile['sourcePath'], sourceAsset=profile['sourceAsset'])
         if tid in textures and any(textures[tid][key] != record[key] for key in
                                    ('pixels', 'pixelLabel', 'format', 'formatId',
                                     'sourcePixelsHash', 'width', 'height', 'mipCount',
@@ -1201,7 +1269,7 @@ def export_native_package(addon, destination, mesh_objects, *, armatures=None,
         if effect_roots is None and addon is not None:
             effect_roots = addon.effect_editor.export_roots((), objects, addon)
         modules, dll = pack_modules()
-        for root in effect_roots or ():
+        for root in addon.effect_editor.export_roots(effect_roots or ()):
             state = addon.effect_editor.synchronize(root).state
             packages.add(Path(state['source']).resolve())
         with contextlib.ExitStack() as locks:
@@ -1320,6 +1388,7 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
             else:
                 selected_materials.add(original.data.materials[slot])
     material_sections = material_ids(selected_materials)
+    addon.material_animation.register_action_tracks(selected_materials)
     parts, materials, textures, rules = [], {}, {}, []
     texture_inputs = {}
     texture_cache = {}
@@ -1342,7 +1411,8 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
                      if modifier.type=='ARMATURE' and modifier.object),None)
                for original in originals}
     armatures.discard(None)
-    addon.shape_animation.validate_export_members(originals,armatures)
+    from . import eiem_effect_mounts
+    mount_roots=addon.effect_editor.export_roots(effect_roots or (),objects,addon)
     clips_by_object = {original.as_pointer(): addon.shape_animation.export_clips(
         original, addon, include_switches) for original in originals}
     skeleton_records_by_rig={}
@@ -1403,8 +1473,8 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
                             if mid not in materials:
                                 phase = time.perf_counter()
                                 material_animated = any(
-                                    clip.enabled for clip in
-                                    getattr(variant, 'eiem_material_animations', ()))
+                                    clip.enabled for clip,_track in
+                                    addon.material_animation.action_tracks(variant))
                                 record = collect_material(
                                     addon, material_source(source, variant, material_sources), variant,
                                     images, textures, temporary, encode, mid=mid,
@@ -1561,7 +1631,7 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
         started_format3 = time.perf_counter()
         author_files = {}
         phase = time.perf_counter()
-        roots_by_id = {root.get('eff_effect_id'): root for root in (effect_roots or ())}
+        roots_by_id = {root.get('eff_effect_id'): root for root in mount_roots}
         effect_baselines = {}
         for attachment in effects or ():
             root = roots_by_id.get(attachment['id'])
@@ -1569,7 +1639,7 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
                 raise ValueError('Format 3 Effect author root is missing: ' + attachment['id'])
             edit = addon.effect_editor.synchronize(root)
             relative = modules['author_format3'].identifier(attachment['id']) + '.effeffect'
-            attachment_author = dict(attachment)
+            attachment_author = {k:v for k,v in attachment.items() if not k.startswith('_')}
             owner = root.eff_effect.owner
             rig = addon.effect_editor.preview.mount_rig(owner) if owner else None
             if rig is not None:
@@ -1579,10 +1649,11 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
             if source_dir not in effect_baselines:
                 effect_baselines[source_dir] = addon.effect_editor.document.load_source(source_dir)
                 effect_baselines[source_dir].pop('source', None)
-            author_edit = addon.effect_editor.assets.export_document(root, edit)
+            author_edit = dict(attachment.pop('_authorEdit'))
             author_edit.pop('source', None)
             author_files[relative] = addon.format_io.encode_format3_effect_author(
                 source_dir, effect_baselines[source_dir], attachment_author, author_edit)
+        eiem_effect_mounts.compile_clips(mount_roots,effects,include_switches)
         detail['effectAuthor'] = (time.perf_counter() - phase) * 1000
         source_packages = {source.package: source}
         source_packages.update((baseline.package, baseline)
@@ -1594,10 +1665,14 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
         format3_staging = Path(temporary) / 'format3'
         format3_staging.mkdir()
         phase = time.perf_counter()
-        modules['author_format3'].write_format3_directory(
+        from . import eiem_effect_author_resources
+        effect_resources = eiem_effect_author_resources.merge_resource_sets(effects,
+            existing=dict(materials=materials, textures=list(textures.values())),
+            occupied=['Mesh_' + modules['author_format3'].part_resource_id(p['partId']) for p in parts])
+        written = modules['author_format3'].write_format3_directory(
             format3_staging, token(destination.name), parts, materials,
             list(textures.values()), rules, switches, material_clips, effects,
-            physics=physics_resources, author_files=author_files,
+            physics=physics_resources, author_files=author_files, extra_resources=effect_resources,
             target_bundles=modules['author_format3'].resolve_target_bundles(
                 source_packages.values(), rules),
             skeletons=skeletons,bone_animations=bone_animations,
@@ -1608,6 +1683,7 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
             key_switch_enabled=(preserved_controls['key_switch_enabled'] if preserved_controls else True),
             control_program_source=program_source,
             texture_template=next((t for t in templates if t['kind'] == 'Texture2D'), None))
+        eiem_effect_author_resources.finalize_author_resources(format3_staging,effects,written)
         detail['writeAuthor'] = (time.perf_counter() - phase) * 1000
         tool = shared_resources.native_tool_file('eff_author_assets.dll')
         try:

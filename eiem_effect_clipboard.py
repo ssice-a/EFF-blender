@@ -7,19 +7,26 @@ objects and native CAB/PathID identities are never used as destination
 identities; they are remapped when the payload is pasted.
 """
 import copy
+import base64
 import json
 import re
 import uuid
 
 if __package__:
     from . import eiem_effect_document as document
+    from . import eiem_effect_game_resources as game_resources
+    from . import eiem_effect_resources as resource_set
 else:
     import eiem_effect_document as document
+    import eiem_effect_game_resources as game_resources
+    import eiem_effect_resources as resource_set
 
 
 FORMAT = 'EFF_EFFECT_BLOCK_CLIPBOARD'
 VERSION = 1
 _FIELD = re.compile(r'\.([^\.\[\]]+)|\[(\d+)\]')
+# Match the native author's resource edit contract. A compatible TypeTree alone
+# is insufficient: immutable texture/mesh settings must match the new template.
 
 
 def _path(field):
@@ -41,24 +48,31 @@ def _relative_path(module, path):
     return path[len(prefix):] if path[:len(prefix)] == prefix else None
 
 
-def _pointer_identity(edit, owner_identity, pointer, fallback=''):
-    owner = edit.objects[owner_identity]['native']['cab'].casefold()
-    file_id = int(pointer.get('m_FileID', 0))
-    path_id = int(pointer.get('m_PathID', 0))
-    if not path_id:
+def _logical_reference(edit, target_spec, ref):
+    metadata = ref.get('gameLogical') or {}
+    paths = copy.deepcopy((target_spec or {}).get('logicalPaths') or [])
+    logical_path = metadata.get('path')
+    logical_asset = metadata.get('asset', '')
+    if logical_path and not any(row.get('path') == logical_path and
+                                row.get('name', '') == logical_asset for row in paths):
+        paths.append(dict(path=logical_path, name=logical_asset))
+    if not paths:
         return None
-    if file_id == 0:
-        candidate = owner + ':' + str(path_id)
-        return candidate if candidate in edit.objects else fallback
-    for spec in edit.objects.values():
-        if spec['native']['cab'].casefold() != owner:
-            continue
-        for ref in spec.get('references', []):
-            if int(ref.get('fileId', -1)) == file_id and ref.get('cab'):
-                candidate = ref['cab'].casefold() + ':' + str(path_id)
-                if candidate in edit.objects:
-                    return candidate
-    return fallback
+    result = dict(logicalPaths=paths,
+                assetName=logical_asset or (target_spec or {}).get('name', ''),
+                previewSource=(metadata.get('previewSource') or
+                               (target_spec or {}).get('gameSource') or
+                               edit.state.get('source', '')))
+    selected = dict(metadata, path=logical_path or paths[0]['path'],
+                    asset=logical_asset or paths[0].get('name', ''),
+                    type=metadata.get('type') or ref.get('type') or (target_spec or {}).get('type', 'Object'))
+    selected = game_resources.portable_binding(selected, result['previewSource'], target_spec)
+    result.update({key: selected[key] for key in game_resources.PROOF_FIELDS if selected.get(key)})
+    return result
+
+
+def _pointer_identity(edit, owner_identity, pointer, fallback=''):
+    return resource_set.target(edit, owner_identity, pointer)
 
 
 def _reference_rows(edit, identity, module):
@@ -78,15 +92,17 @@ def _reference_rows(edit, identity, module):
             continue
         target = _pointer_identity(edit, identity, pointer, ref.get('identity', ''))
         target_spec = edit.objects.get(target) if target else None
-        rows.append({
+        logical = _logical_reference(edit, target_spec, ref)
+        row = {
             'path': list(relative),
             'type': ref.get('type') or '',
-            'sourceIdentity': target or '',
-            'fileId': int(pointer.get('m_FileID', 0)),
-            'pathId': int(pointer.get('m_PathID', 0)),
-            'logicalPaths': copy.deepcopy((target_spec or {}).get('logicalPaths') or []),
-            'assetName': (target_spec or {}).get('name', ''),
-        })
+            'logicalPaths': logical['logicalPaths'] if logical else [],
+            'assetName': logical['assetName'] if logical else (target_spec or {}).get('name', ''),
+            'previewSource': logical['previewSource'] if logical else '',
+        }
+        if logical:
+            row.update({key: logical[key] for key in game_resources.PROOF_FIELDS if logical.get(key)})
+        rows.append(row)
     return rows
 
 
@@ -125,9 +141,15 @@ def _emitter_subtree(edit, identity):
 
 
 def _schema_hash(edit, identity):
-    spec = edit.objects[identity]
-    schema = edit.state['schemas'].get(spec.get('schema'))
-    return document.digest(document.dumps(schema).encode('utf-8')) if schema else ''
+    return resource_set.schema_hash(edit, identity)
+
+
+def _schema_shape_hash(edit, identity):
+    return resource_set.schema_shape_hash(edit, identity)
+
+
+def _schema_matches(edit, identity, row):
+    return resource_set.schema_matches(edit, identity, row)
 
 
 def _sanitise_pointers(value):
@@ -143,39 +165,28 @@ def _sanitise_pointers(value):
 
 def _object_reference_rows(edit, identity, included, node_transforms):
     """Describe every parsed PPtr without carrying source native IDs."""
-    spec = edit.objects[identity]
-    value = edit.value(identity)
     rows = []
-    for ref in spec.get('references', []):
-        path = _path(ref.get('field'))
-        if path is None:
-            continue
-        try:
-            pointer = _at(value, path)
-        except (KeyError, IndexError, TypeError):
-            continue
-        if not isinstance(pointer, dict) or set(pointer) != {'m_FileID', 'm_PathID'}:
-            continue
-        target = _pointer_identity(edit, identity, pointer, ref.get('identity', ''))
+    for path, pointer, target, ref in resource_set.references(edit, identity):
         # The parent of the copied root is deliberately supplied by the paste
         # destination, so the original scene hierarchy is never transplanted.
         if identity in node_transforms and path[-1] == 'm_Father':
             rows.append({'path': list(path), 'kind': 'destinationParent',
                          'type': ref.get('type') or 'Transform'})
             continue
-        if not target:
-            rows.append({'path': list(path), 'kind': 'null', 'type': ref.get('type') or ''})
-            continue
-        if target in included:
+        if target and target in included:
             rows.append({'path': list(path), 'kind': 'internal', 'target': included[target]})
             continue
-        target_spec = edit.objects.get(target)
-        logical = copy.deepcopy((target_spec or {}).get('logicalPaths') or [])
+        target_spec = edit.objects.get(target) if target else None
+        logical = _logical_reference(edit, target_spec, ref)
         if logical:
             rows.append({'path': list(path), 'kind': 'logical',
                          'type': ref.get('type') or '',
-                         'logicalPaths': logical,
-                         'assetName': (target_spec or {}).get('name', '')})
+                         **logical})
+            continue
+        if not target:
+            document.require(not pointer.get('m_PathID'),
+                             '资源引用缺少可移植来源：' + game_resources.field_path(path))
+            rows.append({'path': list(path), 'kind': 'null', 'type': ref.get('type') or ''})
             continue
         # Same-source copies can retain an authored resource by identity. A
         # cross-file paste will reject it rather than inventing a null pointer.
@@ -187,13 +198,15 @@ def _object_reference_rows(edit, identity, included, node_transforms):
 def copy_emitter(edit, identity):
     """Create a portable visual emitter tree, including child emitters."""
     nodes = _emitter_subtree(edit, identity)
-    node_ids = {node['identity'] for node in nodes}
     transforms = {node['transform'] for node in nodes}
     root_transforms = {node['transform'] for node in nodes if node['identity'] == identity}
     object_ids = set()
     for node in nodes:
         object_ids.update(_node_components(edit, node))
+    resources = sorted(identity for identity in resource_set.reachable(edit, object_ids)
+                       if resource_set.owned(edit, identity))
     keys = {object_id: 'o' + str(index) for index, object_id in enumerate(sorted(object_ids))}
+    keys.update({identity: 'r' + str(index) for index, identity in enumerate(resources)})
     portable = []
     for node in nodes:
         for object_id in _node_components(edit, node):
@@ -207,6 +220,7 @@ def copy_emitter(edit, identity):
                 'name': spec.get('name', ''),
                 'schema': spec.get('schema', ''),
                 'schemaSha256': _schema_hash(edit, object_id),
+                'schemaShapeSha256': _schema_shape_hash(edit, object_id),
                 'value': _sanitise_pointers(edit.value(object_id)),
                 'references': _object_reference_rows(edit, object_id, keys, root_transforms),
                 'components': [keys[i] for i in node.get('components', [])]
@@ -224,7 +238,7 @@ def copy_emitter(edit, identity):
                          if child in transforms],
         })
     root_key = keys[identity]
-    return {
+    result = {
         'format': FORMAT,
         'version': VERSION,
         'kind': 'emitter',
@@ -233,6 +247,36 @@ def copy_emitter(edit, identity):
         'nodes': portable_nodes,
         'objects': portable,
     }
+    if resources:
+        if __package__:from .eiem_effect_native import Reader
+        else:from eiem_effect_native import Reader
+        reader = None
+        authored = {row['identity']: row for row in edit.state.get('author_assets', [])}
+        result['resources'] = []
+        for resource in resources:
+            spec = edit.objects[resource]
+            if spec['classId'] == 21:
+                value = copy.deepcopy(edit.value(resource))
+            else:
+                if reader is None:reader = Reader(edit)
+                tree, _ = reader.tree(resource)
+                value = document._native_plain(tree, encode_bytes=True)
+            row = dict(key=keys[resource], classId=spec['classId'], type=spec['type'],
+                       name=spec.get('name', ''), schemaSha256=_schema_hash(edit, resource),
+                       schemaShapeSha256=_schema_shape_hash(edit, resource),
+                       value=_sanitise_pointers(value),
+                       references=_object_reference_rows(edit, resource, keys, set()))
+            for key in ('sourceMaterial', 'sourceTexture', 'authorDataBase64'):
+                if authored.get(resource, {}).get(key):
+                    row[key] = copy.deepcopy(authored[resource][key])
+            if spec['classId'] == 21 and not row.get('sourceMaterial'):
+                if __package__:from .eiem_effect_material_origin import material_for_origin
+                else:from eiem_effect_material_origin import material_for_origin
+                row['sourceMaterial'] = material_for_origin(edit, resource)
+            if authored.get(resource, {}).get('previewPngBase64'):
+                row['previewPngBase64'] = authored[resource]['previewPngBase64']
+            result['resources'].append(row)
+    return result
 
 
 def copy_module(edit, identity, module):
@@ -252,9 +296,8 @@ def copy_module(edit, identity, module):
             'type': spec.get('type', 'ParticleSystem'),
             'module': module,
             'name': spec.get('name', ''),
-            'sourceIdentity': identity,
         },
-        'value': copy.deepcopy(value[module]),
+        'value': _sanitise_pointers(value[module]),
         'references': _reference_rows(edit, identity, module),
     }
 
@@ -286,7 +329,12 @@ def _validate_emitter(payload):
                      'emitter clipboard hierarchy is invalid')
     document.require(isinstance(objects, list) and 0 < len(objects) <= 4096,
                      'emitter clipboard object list is invalid')
-    keys = [row.get('key') for row in objects]
+    resources = payload.get('resources', [])
+    document.require(isinstance(resources, list) and len(resources) <= 4096,
+                     'emitter clipboard resource list is invalid')
+    document.require(all(isinstance(row, dict) and row.get('classId') in resource_set.KINDS
+                         for row in resources), 'unsupported authored clipboard resource')
+    keys = [row.get('key') for row in [*objects, *resources]]
     document.require(all(isinstance(key, str) and key for key in keys) and
                      len(keys) == len(set(keys)), 'emitter clipboard object keys are invalid')
     document.require(root['key'] in keys, 'emitter clipboard root is missing')
@@ -297,7 +345,7 @@ def _validate_emitter(payload):
                          'emitter clipboard parent is invalid')
         document.require(all(child in keys for child in row.get('children', [])),
                          'emitter clipboard child is invalid')
-    for row in objects:
+    for row in [*objects, *resources]:
         document.require(isinstance(row.get('value'), dict) and
                          isinstance(row.get('references'), list),
                          'emitter clipboard object data is invalid')
@@ -310,6 +358,8 @@ def _validate_emitter(payload):
                              all(isinstance(part, (str, int)) for part in key),
                              'emitter clipboard reference path is invalid')
             seen.add(key)
+            if ref.get('kind') == 'internal':
+                document.require(ref.get('target') in keys, 'emitter clipboard resource target is missing')
     return payload
 
 
@@ -348,21 +398,55 @@ def _resolve_reference(trial, target_identity, module, value, ref):
         if pointer.get('m_FileID') == 0 and pointer.get('m_PathID') == 0:
             return
         raise ValueError('特效剪贴板存在没有逻辑路径的外部引用: ' + '.'.join(map(str, path)))
-    matches = []
+    _resolve_logical_reference(trial, target_identity, path, ref)
+
+
+def _resolve_logical_reference(trial, owner, path, ref):
+    logical = ref.get('logicalPaths') or []
+    source = ref.get('previewSource') or trial.state.get('source', '')
+    matches = {}
     for row in logical:
         if not isinstance(row, dict) or not row.get('path'):
             continue
+        asset = row.get('name', ref.get('assetName', ''))
         try:
             target = document.resolve_logical_asset(
-                trial.objects.values(), ref.get('type') or 'Object',
-                row['path'], row.get('name', ref.get('assetName', '')))
+                trial.objects.values(), ref.get('type') or 'Object', row['path'], asset)
         except ValueError:
-            continue
-        matches.append(target['identity'])
-    matches = sorted(set(matches))
+            if not source:
+                continue
+            try:
+                target = game_resources.import_asset(
+                    trial, source, ref.get('type') or 'Object', row['path'], asset)
+            except (OSError, ValueError):
+                continue
+        matches[target['identity']] = row
+    if not matches and logical:
+        preferred = next((row for row in logical if isinstance(row, dict) and row.get('path')), None)
+        document.require(preferred, '特效剪贴板缺少游戏逻辑路径')
+        pointer = game_resources.bind_logical(
+            trial, owner, path, preferred['path'],
+            preferred.get('name', ref.get('assetName', '')),
+            ref.get('type') or 'Object', source)
+        binding = next(r for r in trial.objects[owner]['references']
+                       if r.get('field') == game_resources.field_path(path))['gameLogical']
+        binding.update({key: ref[key] for key in game_resources.PROOF_FIELDS if ref.get(key)})
+        return pointer
     document.require(len(matches) == 1,
-                     '目标特效缺少唯一逻辑资源: ' + '/'.join(str(x) for x in logical))
-    trial.set_pointer(target_identity, path, matches[0])
+                     '目标特效缺少唯一逻辑资源: ' + '/'.join(
+                         row.get('path', '') for row in logical if isinstance(row, dict)))
+    identity, row = next(iter(matches.items()))
+    spec = trial.objects[identity]
+    binding = dict(path=row['path'], asset=row.get('name', ref.get('assetName', '')),
+                   type=ref.get('type') or spec['type'],
+                   previewSource=spec.get('gameSource') or source)
+    binding.update({key: ref[key] for key in game_resources.PROOF_FIELDS if ref.get(key)})
+    pointer = game_resources.bind(trial, owner, path, identity, binding)
+    parent_value = trial.value(owner)
+    for part in path[:-1]:
+        parent_value = parent_value[part]
+    parent_value[path[-1]] = pointer
+    return pointer
 
 
 def paste_module(edit, target_identity, payload):
@@ -415,6 +499,45 @@ def _template_node(edit, parent_identity):
     return next((node for node in nodes.values() if _has_particle(edit, node)), None)
 
 
+def _resource_templates(trial, rows, preserve_defaults=True):
+    return resource_set.templates(trial, rows, preserve_defaults=preserve_defaults)
+
+
+def _finish_resources(trial, rows, keys, templates):
+    if not rows:
+        return
+    if __package__:
+        from .eiem_effect_native import Reader
+        from .nativepack import type_tree
+    else:
+        from eiem_effect_native import Reader
+        from nativepack import type_tree
+    reader = Reader(trial)
+    additions = trial.state.setdefault('author_assets', [])
+    total = 0
+    for row in rows:
+        identity, template = keys[row['key']], templates[row['key']]
+        tree, original = reader.tree(template)
+        data = trial.value(identity)
+        tree = type_tree.from_data(tree.schema, document._native_input(data))
+        raw = type_tree.encode(tree)
+        total += len(raw)
+        document.require(total <= 256 * 1024 * 1024, '作者资源合计超过 256 MiB')
+        asset = dict(identity=identity, template=template,
+                     sourceObjectSha256=document.digest(original),
+                     payloadBase64=base64.b64encode(raw).decode('ascii'))
+        for key in ('sourceMaterial', 'sourceTexture', 'authorDataBase64'):
+            if row.get(key):asset[key] = copy.deepcopy(row[key])
+        if row.get('previewPngBase64'):
+            asset['previewPngBase64'] = row['previewPngBase64']
+            document._decode_preview_png(asset, row['classId'])
+        additions.append(asset)
+        value = document._workspace_plain(document._native_plain(tree))
+        trial.state['values'][identity] = value
+        trial.state['original'][identity] = copy.deepcopy(value)
+        trial.state['hashes'][identity] = document.digest(document.dumps(value).encode('utf-8'))
+
+
 def paste_emitter(edit, parent_identity, payload):
     """Paste a complete visual emitter subtree below a destination node."""
     validate(payload)
@@ -435,30 +558,38 @@ def paste_emitter(edit, parent_identity, payload):
                          if trial.objects[identity]['classId'] == row['classId']), None)
         document.require(template, 'target emitter is missing a matching component')
         source_to_template[row['key']] = template
-        document.require(row.get('schemaSha256') == _schema_hash(trial, template),
+        document.require(_schema_matches(trial, template, row),
                          'source and target effect TypeTrees are incompatible')
+    resource_rows = payload.get('resources', [])
+    resource_keys = {row['key'] for row in resource_rows}
+    source_to_template.update(_resource_templates(trial, resource_rows))
     target_cab = trial.objects[parent_node['transform']]['native']['cab'].casefold()
     key_to_identity = {}
-    for row in payload['objects']:
+    for row in [*payload['objects'], *resource_rows]:
+        cab = trial.objects[source_to_template[row['key']]]['native']['cab'].casefold() if row['key'] in resource_keys else target_cab
         while True:
             path_id = int.from_bytes(uuid.uuid4().bytes[:8], 'little', signed=True)
-            identity = target_cab + ':' + str(path_id)
+            identity = cab + ':' + str(path_id)
             if path_id and identity not in trial.objects and identity not in key_to_identity.values():
                 break
         key_to_identity[row['key']] = identity
-    for row in payload['objects']:
+    for row in [*payload['objects'], *resource_rows]:
         new = key_to_identity[row['key']]
         template = source_to_template[row['key']]
         spec = copy.deepcopy(trial.objects[template])
         spec['identity'] = new
-        spec['template'] = template
+        spec['template'] = spec.get('template', template)
         spec['native']['pathId'] = int(new.rsplit(':', 1)[1])
         spec['name'] = row.get('name', spec.get('name', ''))
+        spec['references'] = []
+        if row['key'] in resource_keys:
+            spec['owner'] = None
+            spec['logicalPaths'] = []
         data = copy.deepcopy(row['value'])
         trial.objects[new] = spec
         trial.state['catalog']['objects'].append(spec)
         trial.state['values'][new] = data
-    for row in payload['objects']:
+    for row in [*payload['objects'], *resource_rows]:
         new = key_to_identity[row['key']]
         data = trial.value(new)
         for ref in row['references']:
@@ -472,26 +603,22 @@ def paste_emitter(edit, parent_identity, payload):
                 document.require(source in trial.objects, 'target effect is missing an external resource')
                 target = _native_pointer(trial, new, source)
             elif kind == 'logical':
-                matches = []
-                for logical in ref.get('logicalPaths', []):
-                    if not logical.get('path'):
-                        continue
-                    try:
-                        matches.append(document.resolve_logical_asset(
-                            trial.objects.values(), ref.get('type') or 'Object',
-                            logical['path'], logical.get('name', ref.get('assetName', '')))['identity'])
-                    except ValueError:
-                        pass
-                matches = sorted(set(matches))
-                document.require(len(matches) == 1, 'target effect is missing a unique logical resource')
-                target = _native_pointer(trial, new, matches[0])
+                target = _resolve_logical_reference(trial, new, path, ref)
             elif kind == 'destinationParent':
                 target = _native_pointer(trial, new, parent_node['transform'])
             else:
                 raise ValueError('unsupported portable emitter reference')
             _set_path(data, path, target)
+            if not any(r.get('field') == game_resources.field_path(path) for r in trial.objects[new]['references']):
+                target_id = _pointer_identity(trial, new, target)
+                target_spec = trial.objects.get(target_id, {})
+                trial.objects[new]['references'].append(dict(field=game_resources.field_path(path),
+                    fileId=target['m_FileID'], pathId=target['m_PathID'], identity=target_id,
+                    cab=target_spec.get('native', {}).get('cab'), type=ref.get('type') or target_spec.get('type', ''),
+                    isNull=not target['m_PathID'], resolved=bool(target_id)))
         if trial.objects[new]['classId'] == 1:
             trial.objects[new]['name'] = data.get('m_Name', trial.objects[new].get('name', ''))
+    _finish_resources(trial, resource_rows, key_to_identity, source_to_template)
     for row in payload['objects']:
         if row['classId'] == 1:
             continue

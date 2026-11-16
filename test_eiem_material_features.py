@@ -20,6 +20,48 @@ def character():
 
 
 class MaterialFeatures(unittest.TestCase):
+    def test_per_texture_uv_angles_update_native_matrix_without_cross_editing(self):
+        material = {'eiem_shader': 'HGRP/CharacterNPR_VFX'}
+        for slot, fields in ui.VFX_UV.items():
+            material['eiem_float.' + fields[0]] = '0'
+            material['eiem_value4.' + ui.VFX_UV_WEIGHTS[slot]] = '1,0,0,0'
+            material['eiem_float.' + fields[2]] = '0'
+            material['eiem_value4.' + fields[3]] = '1,0,0,1'
+        before = copy.deepcopy(material)
+        self.assertTrue(ui.set_uv_angle(material, '_MainTexUVRotate', 90))
+        actual = [float(v) for v in material['eiem_value4._MainTexUVRotateMat'].split(',')]
+        for value, expected in zip(actual, (0, 1, -1, 0)):
+            self.assertAlmostEqual(value, expected)
+        self.assertTrue(ui.set_uv_source(material, '_BlendUVSet', 1))
+        self.assertEqual(material['eiem_value4._BlendTexUVWeights'], '0,1,0,0')
+        for key in before:
+            if key not in {'eiem_float._MainTexUVRotate', 'eiem_value4._MainTexUVRotateMat',
+                           'eiem_float._BlendUVSet', 'eiem_value4._BlendTexUVWeights'}:
+                self.assertEqual(material[key], before[key], key)
+        before = copy.deepcopy(material)
+        with self.assertRaises(ValueError):ui.set_uv_angle(material, '_MainTexUVRotate', float('nan'))
+        with self.assertRaises(ValueError):ui.set_uv_source(material, '_BlendUVSet', 1.5)
+        self.assertEqual(material, before)
+        material['eiem_shader'] = 'Unrelated/Shader'
+        self.assertFalse(ui.set_uv_angle(material, '_MainTexUVRotate', 180))
+        self.assertFalse(ui.set_uv_source(material, '_BlendUVSet', 0))
+        self.assertEqual(ui.uv_controls(material, '_MainTex'), ())
+
+    def test_polar_uv_is_a_per_texture_native_uv_mode(self):
+        self.assertEqual(tuple(item[1] for item in ui.UV_SET_ITEMS),
+                         ('UV0', 'UV1', 'PolarUV', 'ScreenUV'))
+        material = {'eiem_shader': 'HGRP/CharacterNPR_VFX',
+                    'eiem_float._MainUVSet': '0',
+                    'eiem_value4._MainTexUVWeights': '1,0,0,0'}
+        self.assertIsNone(ui.owner(material, 'eiem_float._UsePolarUV'))
+        self.assertTrue(ui.set_uv_source(material, '_MainUVSet', 2))
+        self.assertEqual(material['eiem_float._MainUVSet'], '2')
+        self.assertEqual(material['eiem_value4._MainTexUVWeights'], '0,0,1,0')
+        self.assertTrue(ui.set_uv_source(material, '_MainUVSet', 3))
+        self.assertEqual(material['eiem_value4._MainTexUVWeights'], '0,0,0,1')
+        with self.assertRaises(ValueError):
+            ui.set_uv_source(material, '_MainUVSet', 4)
+
     def test_legacy_signature_and_explicit_other_shader(self):
         material = character()
         del material['eiem_shader']
@@ -30,6 +72,8 @@ class MaterialFeatures(unittest.TestCase):
         self.assertEqual(material, before, 'read-only inspection changed a material')
         material['eiem_shader'] = 'Unrelated/Shader'
         self.assertIsNone(ui.profile(material))
+        material['eiem_texture._ClearCoatMask'] = 'unrelated-shader-mask.png'
+        self.assertIn('_ClearCoatMask', ui.visible_texture_slots(material))
         with self.assertRaises(ValueError):
             ui.set_feature(material, 'clearcoat', True)
         self.assertNotIn('eiem_keyword._CLEARCOAT', material)
@@ -44,6 +88,8 @@ class MaterialFeatures(unittest.TestCase):
             self.assertEqual(material['eiem_keyword._CLEARCOAT'], str(int(enabled)))
             self.assertEqual(ui.visible_slots(material, ui.get_feature(material, 'clearcoat')),
                              ('_ClearCoatMask',) if enabled else ())
+            self.assertEqual('_ClearCoatMask' in ui.visible_texture_slots(material), enabled)
+            self.assertIn('_BaseMap', ui.visible_texture_slots(material))
         self.assertEqual(material['eiem_texture._ClearCoatMask'], 'my-mask.png')
         self.assertEqual(material['eiem_float._ClearCoatSmoothness'], '0.94')
         self.assertEqual(material['eiem_value4._ClearCoatColor'], '0.2,0.3,1,1')
@@ -140,11 +186,49 @@ class MaterialFeatures(unittest.TestCase):
         with self.assertRaises(ValueError):
             ui.set_surface(material, 1)
 
+    def test_vfx_surface_alpha_and_opaque_presets_match_native_material_values(self):
+        material = {'eiem_shader': 'HGRP/CharacterNPR_VFX',
+                    'eiem_float._SurfaceType': '1', 'eiem_float._EnableAlphaTest': '0',
+                    'eiem_float._BlendMode': '0', 'eiem_float._AlphaPremultiply': '0',
+                    'eiem_float._SrcBlend': '1', 'eiem_float._DstBlend': '10',
+                    'eiem_float._AlphaSrcBlend': '1', 'eiem_float._AlphaDstBlend': '10',
+                    'eiem_float._ZWrite': '0', 'eiem_float._ZTest': '4',
+                    'eiem_keyword._ALPHABLEND_ON': '1',
+                    'eiem_keyword._ALPHATEST_ON': '0'}
+        self.assertEqual(ui.surface_mode(material), 1)
+        ui.set_surface(material, 0)
+        self.assertEqual(ui.surface_mode(material), 0)
+        for key, value in (('_SurfaceType', '0'), ('_EnableAlphaTest', '0'),
+                           ('_BlendMode', '0'), ('_AlphaPremultiply', '0'),
+                           ('_SrcBlend', '1'), ('_DstBlend', '0'),
+                           ('_AlphaSrcBlend', '1'), ('_AlphaDstBlend', '0')):
+            self.assertEqual(ui.field(material, key), value, key)
+        self.assertEqual(ui.field(material, '_ZWrite'), '0')
+        self.assertEqual(ui.field(material, '_ZTest'), '4')
+        ui.set_surface(material, 1)
+        self.assertEqual(ui.surface_mode(material), 1)
+        for key, value in (('_SurfaceType', '1'), ('_EnableAlphaTest', '0'),
+                           ('_BlendMode', '0'), ('_AlphaPremultiply', '0'),
+                           ('_SrcBlend', '1'), ('_DstBlend', '10'),
+                           ('_AlphaSrcBlend', '1'), ('_AlphaDstBlend', '10')):
+            self.assertEqual(ui.field(material, key), value, key)
+        self.assertEqual(ui.field(material, '_ZWrite'), '0')
+        self.assertEqual(ui.surface_mode(material), 1)
+        ui.set_surface(material, 2)
+        self.assertEqual(ui.surface_mode(material), 2)
+        self.assertEqual(ui.field(material, '_BlendMode'), '1')
+        self.assertEqual(ui.field(material, '_DstBlend'), '10')
+
     def test_petal_shader_groups_and_switches_use_its_own_fields(self):
         material = {'eiem_shader': 'HGRP/Effect/VFXDitherAlpha',
                     'eiem_float._UseMain2': '0', 'eiem_float._UseDissolve': '0',
                     'eiem_float._EnableNormalMap': '1', 'eiem_float._UseDisturb': '0',
                     'eiem_texture_scale._MainTex2': '1,1'}
+        for slot in ('_MainTex', '_MainTex2', '_DissolveTex', '_NormalMap', '_UnknownTex'):
+            material['eiem_texture.' + slot] = slot + '.png'
+        before = copy.deepcopy(material)
+        self.assertEqual(ui.visible_texture_slots(material), ('_MainTex', '_NormalMap', '_UnknownTex'))
+        self.assertEqual(material, before, 'texture visibility must not change source values')
         self.assertEqual(ui.owner(material, 'eiem_value4._MainTex2Color'), 'main2')
         self.assertEqual(ui.owner(material, 'eiem_value4._MainTexUVSpeed'), 'main')
         self.assertEqual(ui.owner(material, 'eiem_float._NormalScale'), 'normal')
@@ -156,6 +240,7 @@ class MaterialFeatures(unittest.TestCase):
             self.assertEqual(ui.field(material, keyword, 'keyword'), '0')
         self.assertNotIn('blend', [item['key'] for item in ui.features(material)])
         self.assertNotIn('eiem_keyword._CHARACTER_VFX_SPECIAL', material)
+        self.assertEqual(ui.visible_texture_slots(material), ('_MainTex', '_UnknownTex'))
 
 
 if __name__ == '__main__':

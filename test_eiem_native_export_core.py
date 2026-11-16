@@ -229,6 +229,23 @@ class NativeExportCoreTests(unittest.TestCase):
                 exporter.write_format3_native_assets(
                     Path(folder) / 'missing.dll', 'Smoke', [], [], [], output)
 
+    def test_typed_meshes_follow_readable_manifest_names(self):
+        import configparser
+        manifest = configparser.ConfigParser(interpolation=None)
+        manifest.read_dict({
+            'PartRing': {'mesh': 'MeshRing', 'material': 'MaterialRing'},
+            'MeshRing': {'path': 'meshes/ring.effres'},
+        })
+        source = dict(partId='PartRing_0123456789abcdef', meshId='Mesh_PartRing_0123456789abcdef',
+                      path='meshes/ring.effres', material='MaterialRing_0123456789abcdef')
+        actual = exporter.published_native_meshes([source], manifest)
+        self.assertEqual(actual[0]['partId'], 'PartRing')
+        self.assertEqual(actual[0]['meshId'], 'MeshRing')
+        self.assertEqual(actual[0]['material'], 'MaterialRing')
+        self.assertEqual(source['partId'], 'PartRing_0123456789abcdef')
+        with self.assertRaisesRegex(ValueError, 'published Mesh Part'):
+            exporter.published_native_meshes([dict(source, path='meshes/missing.effres')], manifest)
+
     def test_typed_format3_records_reject_shared_part_with_different_mesh_schemas(self):
         class Format3:
             @staticmethod
@@ -415,6 +432,154 @@ class NativeExportCoreTests(unittest.TestCase):
             self.assertEqual(output_dds.read_bytes(), raw_dds)
             parsed = exporter.texture_compression.parse_source_dds(output_dds.read_bytes())
             self.assertEqual(parsed['pixels'], payload)
+
+    def test_imported_dds_profile_survives_collect_and_format3_publication(self):
+        import configparser
+        raw_dds = dds_bc7(4, 4, bytes(range(16)), dxgi=99)
+        original = dict(identity='slot-texture', logicalPath='assets/original.png',
+                        name='Original', details=dict(format='BC5', colorSpace=1))
+        declared = dict(identity='declared-texture', logicalPath='assets/declared.png',
+                        name='Declared', details=dict(format='BC7', colorSpace=1))
+        native = dict(details=dict(textures=[dict(property='_BaseMap', pointer=dict(
+            isNull=False, identity='slot-texture'))]), native=dict(typeHash='12' * 16))
+        source = source_stub(native, [original, declared])
+        source.resolve = lambda kind, path, asset: native if kind == 'Material' else declared
+        addon = SimpleNamespace(image_absolute_path=lambda image: image.filepath,
+            material_override_payload=lambda *args, **kwargs: (['texture._BaseMap=slot'], None))
+        with tempfile.TemporaryDirectory() as folder:
+            dds = Path(folder) / 'flow.dds'
+            dds.write_bytes(raw_dds)
+            image = Material('Flow', dict(eiem_section='TextureFlow',
+                eiem_target_path=declared['logicalPath'], eiem_target_asset=declared['name'],
+                eiem_linear='true'))
+            image.filepath = str(dds)
+            material = Material('Body', dict(eiem_source='assets/body.mat', eiem_name='Body'))
+            textures = {}
+            record = exporter.collect_material(addon, source, material, {'slot': image},
+                textures, folder, None, texture_only=True)
+            texture = textures[record['textureEdits'][0]['texture']]
+            self.assertEqual((texture['sourcePath'], texture['sourceAsset'], texture['colorSpace']),
+                             (declared['logicalPath'], declared['name'], 0))
+            root = Path(folder) / 'published'
+            root.mkdir()
+            exporter.pack_modules()[0]['author_format3'].write_format3_directory(
+                root, 'Smoke', [], {}, list(textures.values()), [], [], [], [])
+            ini = configparser.ConfigParser(interpolation=None)
+            ini.read(root / 'mod.ini', encoding='utf-8')
+            values = next(ini[s] for s in ini.sections() if s.startswith('Texture'))
+            self.assertEqual(values['source.path'], declared['logicalPath'])
+            self.assertEqual(values['source.asset'], declared['name'])
+            self.assertEqual(values['linear'], 'true')
+            self.assertEqual((root / values['dds']).read_bytes(), raw_dds)
+            self.assertFalse(list((root / 'textures').glob('*.effres')))
+        self.texture_compressor_mock.assert_not_called()
+
+    def test_declared_png_profile_is_shared_across_original_material_slots(self):
+        from PIL import Image
+        slots = {
+            'First': dict(identity='first', logicalPath='assets/first.png', name='First',
+                          details=dict(format='BC7', colorSpace=1)),
+            'Second': dict(identity='second', logicalPath='assets/second.png', name='Second',
+                           details=dict(format='BC5', colorSpace=0)),
+        }
+        declared = dict(identity='declared', logicalPath='assets/flow.png', name='Flow',
+                        details=dict(format='BC7', colorSpace=1))
+        def resolve(kind, path, asset):
+            if kind == 'Texture2D':
+                return declared
+            return dict(details=dict(textures=[dict(property='_BaseMap', pointer=dict(
+                isNull=False, identity=slots[asset]['identity']))]), native=dict(typeHash='12' * 16))
+        source = SimpleNamespace(resolve=resolve,
+            resolve_identity=lambda identity: next(row for row in slots.values() if row['identity'] == identity))
+        addon = SimpleNamespace(image_absolute_path=lambda image: image.filepath,
+            material_override_payload=lambda *args, **kwargs: (['texture._BaseMap=slot'], None))
+        with tempfile.TemporaryDirectory() as folder:
+            png = Path(folder) / 'flow.png'
+            Image.new('RGBA', (4, 4), (32, 64, 128, 255)).save(png)
+            image = Material('Flow', dict(eiem_section='TextureFlow', eiem_linear='true',
+                eiem_target_path=declared['logicalPath'], eiem_target_asset=declared['name']))
+            image.filepath = str(png)
+            textures, cache = {}, {}
+            records = [exporter.collect_material(addon, source,
+                Material(name, dict(eiem_source='assets/' + name + '.mat', eiem_name=name)),
+                {'slot': image}, textures, folder, None, texture_only=True,
+                texture_cache=cache) for name in slots]
+            ids = [record['textureEdits'][0]['texture'] for record in records]
+            self.assertEqual(ids[0], ids[1])
+            self.assertEqual(len(textures), 1)
+            texture = textures[ids[0]]
+            self.assertEqual((texture['sourcePath'], texture['format'], texture['colorSpace']),
+                             (declared['logicalPath'], 'BC7', 0))
+            self.texture_compressor_mock.assert_called_once()
+            self.assertEqual(self.texture_compressor_mock.call_args.args[5], 0)
+            image['eiem_linear'] = 'false'
+            changed = exporter.collect_material(addon, source,
+                Material('First', dict(eiem_source='assets/First.mat', eiem_name='First')),
+                {'slot': image}, textures, folder, None, texture_only=True, texture_cache=cache)
+            changed_id = changed['textureEdits'][0]['texture']
+            self.assertNotEqual(changed_id, ids[0])
+            self.assertEqual(textures[changed_id]['colorSpace'], 1)
+            self.assertEqual(self.texture_compressor_mock.call_count, 2)
+
+    def test_declared_dds_template_does_not_require_original_slot_texture(self):
+        native = dict(details=dict(textures=[dict(property='_BaseMap', pointer=dict(
+            isNull=True))]), native=dict(typeHash='12' * 16))
+        declared = dict(logicalPath='assets/flow.png', name='Flow',
+                        details=dict(format='BC7', colorSpace=1))
+        source = SimpleNamespace(resolve=lambda kind, *args: native if kind == 'Material' else declared)
+        addon = SimpleNamespace(image_absolute_path=lambda image: image.filepath,
+            material_override_payload=lambda *args, **kwargs: (['texture._BaseMap=slot'], None))
+        with tempfile.TemporaryDirectory() as folder:
+            dds = Path(folder) / 'flow.dds'
+            dds.write_bytes(dds_bc7(4, 4, b'D' * 16))
+            image = Material('Flow', dict(eiem_linear='true', eiem_target_path=declared['logicalPath'],
+                                         eiem_target_asset=declared['name']))
+            image.filepath = str(dds)
+            textures = {}
+            record = exporter.collect_material(addon, source,
+                Material('Body', dict(eiem_source='assets/body.mat', eiem_name='Body')),
+                {'slot': image}, textures, folder, None, texture_only=True)
+            self.assertEqual(textures[record['textureEdits'][0]['texture']]['colorSpace'], 0)
+
+    def test_explicit_dds_profile_without_offline_template_keeps_declaration(self):
+        native = dict(details=dict(textures=[dict(property='_BaseMap', pointer=dict(isNull=True))]),
+                      native=dict(typeHash='12' * 16))
+        source = SimpleNamespace(resolve=lambda kind, *args: native,
+                                 find_all=lambda *args: ())
+        addon = SimpleNamespace(image_absolute_path=lambda image: image.filepath,
+            material_override_payload=lambda *args, **kwargs: (['texture._BaseMap=slot'], None))
+        with tempfile.TemporaryDirectory() as folder:
+            dds = Path(folder) / 'flow.dds'
+            raw = dds_bc7(4, 4, b'D' * 16)
+            dds.write_bytes(raw)
+            image = Material('Flow', dict(eiem_linear='1',
+                eiem_target_path='assets/current-only.png', eiem_target_asset='CurrentOnly'))
+            image.filepath = str(dds)
+            textures = {}
+            record = exporter.collect_material(addon, source,
+                Material('Body', dict(eiem_source='assets/body.mat', eiem_name='Body')),
+                {'slot': image}, textures, folder, None, texture_only=True)
+            result = textures[record['textureEdits'][0]['texture']]
+            self.assertEqual((result['sourcePath'], result['sourceAsset'], result['colorSpace']),
+                ('assets/current-only.png', 'CurrentOnly', 0))
+            self.assertEqual(Path(result['ddsSourcePath']).read_bytes(), raw)
+        self.texture_compressor_mock.assert_not_called()
+
+    def test_explicit_texture_declaration_rejects_incomplete_and_ambiguous_source(self):
+        native = dict(details=dict(textures=[dict(property='_BaseMap', pointer=dict(isNull=True))]))
+        image = Material('Flow', dict(eiem_target_path='assets/flow.png', eiem_linear='true'))
+        with self.assertRaisesRegex(ValueError, '逻辑来源不完整'):
+            exporter._texture_author_profile(object(), native, '_BaseMap', image)
+        image['eiem_target_asset'] = 'Flow'
+        def ambiguous(*args):
+            raise ValueError('Texture2D source has 2 matches')
+        source = SimpleNamespace(find_all=lambda *args: [{}, {}], resolve=ambiguous)
+        with self.assertRaisesRegex(ValueError, '2 matches'):
+            exporter._texture_author_profile(source, native, '_BaseMap', image)
+        source = SimpleNamespace(find_all=lambda *args: ())
+        image['eiem_linear'] = 'invalid'
+        with self.assertRaisesRegex(ValueError, 'Linear 设置无效'):
+            exporter._texture_author_profile(source, native, '_BaseMap', image)
 
     def test_export_pipeline_has_no_published_path_rewrite(self):
         self.assertFalse(hasattr(exporter, '_update_texture_image_paths'))
@@ -1142,7 +1307,8 @@ class NativeExportCoreTests(unittest.TestCase):
             self.assertEqual(record['textureEdits'][0]['property'],'_EmissionMap')
             texture=textures[record['textureEdits'][0]['texture']]
             self.assertEqual(texture['sourceAsset'],'Base_D')
-            self.assertEqual(texture['colorSpace'],1)
+            # The explicit author setting wins over the fallback slot template.
+            self.assertEqual(texture['colorSpace'],0)
             self.texture_compressor_mock.assert_called_once()
             self.texture_compressor_mock.reset_mock()
             reused={}
@@ -1174,7 +1340,7 @@ class NativeExportCoreTests(unittest.TestCase):
                 material_override_payload=lambda *args, **kwargs: (
                     ['texture._BaseMap=slot'], None))
             texture = dict(identity='source-texture', logicalPath='assets/body_d', name='Body_D',
-                           details=dict(format='BC7', colorSpace=1))
+                           details=dict(format='BC5', colorSpace=1))
             native = dict(details=dict(textures=[dict(property='_BaseMap', pointer=dict(
                 isNull=False, identity='source-texture'))]), native=dict(typeHash='12' * 16))
             source = SimpleNamespace(resolve=lambda *args: native,
@@ -1194,6 +1360,9 @@ class NativeExportCoreTests(unittest.TestCase):
             self.assertIsNone(exported['ddsSourcePath'])
             self.assertEqual(self.texture_compressor_mock.call_args.args[0],
                              bytes((17, 33, 65, 255)) * 4)
+            self.assertEqual(self.texture_compressor_mock.call_args.args[4], 'BC7',
+                             'painting a DDS must retain its own encoding, not the slot template format')
+            self.assertEqual(exported['format'], 'BC7')
             self.assertTrue(self.texture_compressor_mock.call_args.kwargs['flip_y'])
 
     def test_export_staging_closes_frozen_resources_before_cleanup(self):

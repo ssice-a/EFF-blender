@@ -22,6 +22,20 @@ for file in Path(source_root).rglob('effect.json'):
     assert editor.synchronize(root).export()['objects']==baselines[root.name], 'UI synchronization changed the import defaults'
     root.location.x=len(roots)*4
     root.eff_effect.compiler=str(Path(addon_path).resolve().parents[1]/'tools/AnimeStudio/AnimeStudio.GUI/bin/Debug/net9.0-windows/AnimeStudio.GUI.exe')
+mono_case=next(((candidate_root,target,identity) for candidate_root in roots
+    for target in editor.objects(candidate_root)
+    for identity in json.loads(target.get('eff_effect_components','[]'))
+    if editor.editor(candidate_root).objects[identity]['classId']==114
+    and editor.editor(candidate_root).schema(identity,['m_Enabled'])['type']=='UInt8'),None)
+assert mono_case,'source sample should cover UInt8-backed Behaviour.m_Enabled'
+mono_root,mono_target,mono_identity=mono_case;mono_edit=editor.editor(mono_root)
+mono_before=mono_edit.value(mono_identity,['m_Enabled'])
+assert bpy.ops.eiem.effect_bool_toggle('EXEC_DEFAULT',object_name=mono_target.name,
+    identity=mono_identity,path=json.dumps(['m_Enabled']))=={'FINISHED'}
+assert mono_edit.value(mono_identity,['m_Enabled'])==(0 if mono_before else 1)
+assert bpy.ops.eiem.effect_bool_toggle('EXEC_DEFAULT',object_name=mono_target.name,
+    identity=mono_identity,path=json.dumps(['m_Enabled']))=={'FINISHED'}
+assert mono_edit.value(mono_identity,['m_Enabled'])==mono_before
 bpy.context.scene.frame_set(60)
 assert all(editor.synchronize(root).export()['objects']==baselines[root.name] for root in roots),'moving the mount root changed a native child transform'
 assert any(o.get('预览粒子数',0)>0 for o in bpy.data.objects if o.get('eff_preview'))
@@ -60,7 +74,7 @@ for root in roots:
     assert not signature_calls, 'idle preview timer scanned effect signatures'
     editor.preview.author_signature=original_signature
     try:
-        update=type('Update',(),{'id':obj})()
+        update=type('Update',(),{'id':obj,'is_updated_geometry':False})()
         editor.preview.asset_changed(bpy.context.scene,type('Depsgraph',(),{'updates':[update]})())
         root['预览错误']='stale error';obj[key]=1.15
         assert editor.preview.live_update()==editor.preview.POLL_INTERVAL
@@ -110,32 +124,38 @@ for root in roots:
     assert len(edit.value(identity,['EmissionModule','m_Bursts']))==edit.value(identity,['EmissionModule','m_BurstCount'])
     # A layout recorder proves fields are inline props, not click-to-edit operators.
     class Layout:
-        def __init__(self,expanded=False):self.errors=[];self.props=[];self.labels=[];self.operators=[];self.expanded=expanded
+        def __init__(self,expanded=False):self.errors=[];self.props=[];self.labels=[];self.operators=[];self.operator_calls=[];self.expanded=expanded
         def row(self,**kwargs):return self
         def column(self,**kwargs):return self
+        def split(self,**kwargs):return self
         def box(self):return self
         def template_color_ramp(self,*args,**kwargs):pass
         def separator(self,**kwargs):pass
         def panel(self,*args,**kwargs):return self,None if kwargs.get('default_closed') and not self.expanded else self
         def prop(self,*args,**kwargs):self.props.append(kwargs.get('text',''))
         def prop_search(self,*args,**kwargs):pass
-        def operator(self,*args,**kwargs):self.operators.append(kwargs.get('text',''));return type('Op',(),{})()
+        def operator(self,*args,**kwargs):
+            self.operators.append(kwargs.get('text',''));op=type('Op',(),{})()
+            self.operator_calls.append((args[0],kwargs,op));return op
         def label(self,**kwargs):
             self.labels.append(kwargs.get('text',''))
             if kwargs.get('icon')=='ERROR':self.errors.append(kwargs['text'])
     bpy.context.view_layer.objects.active=obj
     collapsed=Layout(False);editor.EFF_PT_effect_object.draw(type('Panel',(),{'layout':collapsed})(),bpy.context)
-    assert len(collapsed.props)<20 and '发射数量' not in collapsed.labels, (collapsed.props,collapsed.labels)
+    assert len(collapsed.props)<20 and editor.effect_ui.module_name('EmissionModule') not in collapsed.labels, (collapsed.props,collapsed.labels)
     layout=Layout(True);editor.EFF_PT_effect_object.draw(type('Panel',(),{'layout':layout})(),bpy.context)
+    assert layout.use_property_split is False,'effect parameters should use a consistent left-aligned layout'
     assert not layout.errors,layout.errors
-    assert '发射器基础' in layout.labels and '发射数量' in layout.labels and '发射形状与范围' in layout.labels,layout.labels
-    assert any(p.startswith('出生寿命 (s)') for p in layout.props) and '每秒发射数' in layout.props
+    assert all(editor.effect_ui.module_name(module) in layout.labels for module in ('InitialModule','EmissionModule','ShapeModule')),layout.labels
+    assert any(p.startswith('出生寿命 (s)') for p in layout.props) and editor.effect_ui.name('rateOverTime') in layout.props
     mode_key=editor.field_key(identity,['InitialModule','startLifetime','minMaxState'])
     choice=obj.eff_effect_choices[mode_key];previous=choice.value
     choice.value='3';assert obj[mode_key]==3
     choice.value=previous
     assert not any(x in layout.labels for x in ('float','int','UInt32','编辑列表'))
-    assert len(layout.props)<1000, len(layout.props)
+    # Fully expanded now includes the referenced Material's native fields.
+    # The initial folded view must stay small regardless of source asset size.
+    assert len(collapsed.props)<len(layout.props)/10, (len(collapsed.props),len(layout.props))
     keys=root.eff_effect.toggle_keys
     original_active=bpy.context.view_layer.objects.active
     for value in ('F7','CTRL+J'):
@@ -143,7 +163,7 @@ for root in roots:
     root.select_set(True);bpy.context.view_layer.objects.active=root
     collapsed_root=Layout(False)
     editor.EFF_PT_effect_object.draw(type('Panel',(),{'layout':collapsed_root})(),bpy.context)
-    assert len(collapsed_root.props)<20 and '发射数量' not in collapsed_root.labels, (collapsed_root.props,collapsed_root.labels)
+    assert len(collapsed_root.props)<20 and editor.effect_ui.module_name('EmissionModule') not in collapsed_root.labels, (collapsed_root.props,collapsed_root.labels)
     root_layout=Layout(True)
     editor.EFF_PT_effect_object.draw(type('Panel',(),{'layout':root_layout})(),bpy.context)
     assert '特效显隐按键' in root_layout.labels,root_layout.labels
@@ -166,6 +186,13 @@ for root in roots:
     for module in editor.effect_ui.MODULES:
         editor.effect_ui.Draw(_sys.modules[editor.__name__],obj,edit,identity).module(Layout(True),module)
     renderer=next(i for i in json.loads(obj['eff_effect_components']) if edit.objects[i]['classId']==199)
+    mask_path=['m_RenderingLayerMask'];mask_before=edit.value(renderer,mask_path)
+    assert bpy.ops.eiem.effect_mask_toggle('EXEC_DEFAULT',object_name=obj.name,identity=renderer,
+        path=json.dumps(mask_path),bit=1)=={'FINISHED'}
+    assert edit.value(renderer,mask_path)==mask_before ^ (1<<1)
+    assert bpy.ops.eiem.effect_mask_toggle('EXEC_DEFAULT',object_name=obj.name,identity=renderer,
+        path=json.dumps(mask_path),bit=1)=={'FINISHED'}
+    assert edit.value(renderer,mask_path)==mask_before
     enabled_key=editor.field_key(renderer,['m_Enabled']);old_enabled=obj[enabled_key]
     obj[enabled_key]=False;editor.preview.refresh(root,editor.synchronize(root))
     particle_mesh=next(o for o in root.children_recursive if o.get('eff_preview_key')==root['eff_effect_id']+identity)
@@ -173,7 +200,24 @@ for root in roots:
     obj[enabled_key]=old_enabled;editor.preview.refresh(root,editor.synchronize(root))
     resource_layout=Layout(True)
     editor.effect_ui.Draw(_sys.modules[editor.__name__],obj,edit,renderer).renderer(resource_layout)
-    assert any('材质 1' in label for label in resource_layout.labels),resource_layout.labels
+    assert any('m_Materials 1 [PPtr<Material>]' in label for label in resource_layout.labels),resource_layout.labels
+    material_identity=editor.preview._target(edit,renderer,['m_Materials',0])
+    assert material_identity and edit.objects[material_identity]['classId']==21
+    material_author=editor.assets.material_object(root,material_identity)
+    assert material_author is not None
+    material_layout=Layout(True);material_draw_calls=[]
+    original_material_draw=editor.material_bridge.draw
+    editor.material_bridge.draw=lambda target_layout,author:material_draw_calls.append((target_layout,author))
+    try:
+        editor.effect_ui.Draw(_sys.modules[editor.__name__],obj,edit,renderer).reference(
+            material_layout,['m_Materials',0])
+    finally:
+        editor.material_bridge.draw=original_material_draw
+    assert material_draw_calls==[(material_layout,material_author)],material_draw_calls
+    assert '原生 Material 序列化字段' in material_layout.labels,material_layout.labels
+    mask_layout=Layout(True)
+    editor.effect_ui.Draw(_sys.modules[editor.__name__],obj,edit,renderer).prop(mask_layout,mask_path)
+    assert any(call[0]=='eiem.effect_mask_toggle' for call in mask_layout.operator_calls),mask_layout.operator_calls
     # Sorting edited key times must update the ID props, or the next sync would
     # silently assign the old values back to different native keys.
     curve_path=['InitialModule','startSpeed','maxCurve','m_Curve']

@@ -68,8 +68,8 @@ def validate_skeleton(nodes):
         _finite(scale, "skeleton scale")
         if abs(sum(float(value) * float(value) for value in rotation) - 1.0) > 0.001:
             raise ValueError("author skeleton rotation is not normalized: " + path)
-        if min(float(value) for value in scale) <= 0:
-            raise ValueError("author skeleton scale is not positive: " + path)
+        if any(float(value) == 0 for value in scale):
+            raise ValueError("author skeleton bind transform is singular: " + path)
     return nodes
 
 
@@ -140,8 +140,6 @@ def _sample(sample):
     _finite(sample, "bone animation sample")
     if abs(sum(value * value for value in sample[3:7]) - 1.0) > 0.001:
         raise ValueError("bone animation rotation is not normalized")
-    if min(sample[7:]) <= 0:
-        raise ValueError("bone animation scale is not positive")
     return sample
 
 

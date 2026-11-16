@@ -25,6 +25,10 @@ def write_effect_directory(staging, mod_id, effects, author_format3,
     author_files = {}
     identities = set()
     author_names = set()
+    # Resource assembly is shared with model Mods; effect logic owns references,
+    # never a private copy of meshes, materials or texture pixels.
+    from . import eiem_effect_author_resources
+    extra_resources = eiem_effect_author_resources.merge_resource_sets(effects)
     for source in effects:
         effect = dict(source)
         effect_id = str(effect.get('id', '')).strip()
@@ -63,7 +67,7 @@ def write_effect_directory(staging, mod_id, effects, author_format3,
                 _require(saved_attachment.get(field, '') == effect.get(field, ''),
                          '特效作者快照来源证明不一致：' + effect_id + '/' + field)
 
-        native = effect.pop('_native', None)
+        native = effect.pop('_native', None) or effect.get('native')
         if native is None:
             build = effect.get('build')
             _require(build, '特效尚未构建：' + effect_id)
@@ -81,9 +85,10 @@ def write_effect_directory(staging, mod_id, effects, author_format3,
         author_files[author_name] = bytes(author_data)
         package_effects.append(effect)
 
-    author_format3.write_format3_directory(
+    written = author_format3.write_format3_directory(
         staging, mod_id, [], {}, [], [], [], [], package_effects,
-        author_files=author_files, mod_type='effect')
+        author_files=author_files, mod_type='effect', extra_resources=extra_resources)
+    eiem_effect_author_resources.finalize_author_resources(staging, effects, written)
     manifest = author_format3.read_format3_directory(staging)
     _require(manifest.get('modType') == 'effect',
              'Format 3 writer did not produce an effect-only Mod')

@@ -1,11 +1,16 @@
-"""Shared animation clips for Shape Keys and Armature Actions."""
+"""Shared animation clips and channel adapters for EFF actions."""
 import math
 import re
 import uuid
+import sys
 from types import SimpleNamespace
 import bpy
 from mathutils import Matrix
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
+if __package__:
+    from . import eiem_animation_ui as animation_ui
+else:
+    import eiem_animation_ui as animation_ui
 
 SHARED_FIELDS=('label','enabled','start','end','loop','autoplay','speed','speed_variable','sample_rate','hotkey')
 _syncing=False
@@ -27,6 +32,11 @@ def sync_settings(clip, context):
                 if other.identity!=clip.identity or other.as_pointer()==clip.as_pointer(): continue
                 for field in SHARED_FIELDS: setattr(other,field,getattr(clip,field))
                 other.name=clip.label
+        for material in bpy.data.materials:
+            for other in getattr(material,'eiem_material_animations',()):
+                if other.identity!=clip.identity or other.as_pointer()==clip.as_pointer(): continue
+                for field in SHARED_FIELDS: setattr(other,field,getattr(clip,field))
+                other.name=clip.label
     finally: _syncing=False
 
 def group_members(identity):
@@ -43,7 +53,7 @@ def group_members(identity):
 def bone_group_members(identity):
     members=[]
     for obj in sorted(bpy.data.objects,key=lambda o:o.name):
-        if obj.type!='ARMATURE': continue
+        if obj.type not in {'ARMATURE','EMPTY'}: continue
         clips=[c for c in getattr(obj,'eiem_bone_animations',()) if c.identity==identity]
         if len(clips)>1: raise ValueError('骨架包含重复播放组：'+obj.name)
         if clips: members.append((obj,clips[0]))
@@ -57,7 +67,169 @@ def all_groups():
     for obj in bpy.data.objects:
         for clip in getattr(obj,'eiem_bone_animations',()):
             if clip.identity and clip.identity not in groups: groups[clip.identity]=clip
+    for material in bpy.data.materials:
+        for clip in getattr(material,'eiem_material_animations',()):
+            if clip.identity and clip.identity not in groups: groups[clip.identity]=clip
     return sorted(groups.values(),key=lambda c:(c.label.casefold(),c.identity))
+
+def material_group_members(identity):
+    return [(material,clip) for material in sorted(bpy.data.materials,key=lambda item:item.name.casefold())
+            for clip in getattr(material,'eiem_material_animations',()) if clip.identity==identity]
+
+
+def source_actions(identity):
+    actions={clip.action for _owner,clip in group_members(identity)+bone_group_members(identity)
+             if clip.action}
+    actions.update(action for material,clip in material_group_members(identity)
+                   if (action:=_addon.material_animation.source_action(material,clip)))
+    return actions
+
+def action_channels(identity):
+    """Project actual Action channels, without maintaining a second channel list."""
+    rows=[]
+    for kind,members in (('SHAPE',group_members(identity)),('BONE',bone_group_members(identity))):
+        for owner,clip in members:
+            if not clip.action or (kind=='SHAPE' and not owner.data.shape_keys):continue
+            found=shape_curves(owner,clip) if kind=='SHAPE' else bone_curves(owner,clip)
+            for name in found:
+                rows.append(dict(kind=kind,owner=owner,clip=clip,name=name,action=clip.action))
+    for material in dict.fromkeys(m for m,_clip in material_group_members(identity)):
+        animation=material.animation_data
+        for clip,track in _addon.material_animation.action_tracks(material,strict=False):
+            if clip.identity!=identity:continue
+            name=track['source_key'].split('.',1)[-1] or track['property']
+            rows.append(dict(kind='MATERIAL',owner=material,clip=clip,name=name,
+                             action=_addon.material_animation.source_action(material,clip)))
+    return rows
+
+def selected_channel_plan(objects,identity='',source_action=None):
+    """Validate all selected channel sources before changing any animation."""
+    objects=list(objects);plan=[]
+    shape_members={owner.data.as_pointer():clip for owner,clip in group_members(identity)} if identity else {}
+    bone_members={owner.as_pointer():clip for owner,clip in bone_group_members(identity)} if identity else {}
+    for obj in unique_meshes(objects):
+        keys=obj.data.shape_keys;animation=keys.animation_data if keys else None
+        if (animation and animation.action
+                and (source_action is None or animation.action==source_action)):
+            descriptor=current_descriptor(obj)
+            existing=shape_members.get(obj.data.as_pointer())
+            added=[name for name in descriptor[1] if existing is None or
+                   name not in {channel.name for channel in existing.channels}]
+            if not added:continue
+            plan.append(dict(kind='SHAPE',owner=obj,descriptor=descriptor,
+                             existing=existing,new_channels=added,
+                             action=descriptor[0].action,start=descriptor[2],end=descriptor[3]))
+    for obj in dict.fromkeys(objects):
+        animation=obj.animation_data
+        if (obj.type in {'ARMATURE','EMPTY'} and animation and animation.action
+                and (source_action is None or animation.action==source_action)):
+            descriptor=current_bone_descriptor(obj)
+            existing=bone_members.get(obj.as_pointer())
+            added=[name for name in descriptor[1] if existing is None or
+                   name not in {channel.name for channel in existing.channels}]
+            if not added:continue
+            plan.append(dict(kind='BONE',owner=obj,descriptor=descriptor,
+                             existing=existing,new_channels=added,
+                             action=descriptor[0].action,start=descriptor[2],end=descriptor[3]))
+    materials={slot.material for obj in objects if obj.type=='MESH'
+               for slot in obj.material_slots if slot.material}
+    for material in sorted(materials,key=lambda item:item.name.casefold()):
+        if not material.animation_data or not material.animation_data.action:continue
+        if source_action is not None and material.animation_data.action!=source_action:continue
+        tracks=_addon.material_animation.discover_action_tracks(material)
+        existing={(clip.source_path,clip.property) for clip in material.eiem_material_animations
+                  if clip.identity==identity and _addon.material_animation.source_action(material,clip)==material.animation_data.action
+                  and clip.slot_handle==getattr(material.animation_data.action_slot,'handle',0)}
+        tracks=[track for track in tracks if
+                (next(iter(track['curves'].values())).data_path,track['property']) not in existing]
+        frames=[point.co.x for track in tracks for curve in track['curves'].values()
+                for point in curve.keyframe_points]
+        if frames:
+            plan.append(dict(kind='MATERIAL',owner=material,tracks=tracks,
+                             action=material.animation_data.action,start=min(frames),end=max(frames)))
+    return plan
+
+def apply_channel_plan(plan,identity,settings):
+    """Commit mixed channel contributions together, retaining source Actions."""
+    global _syncing
+    previous_syncing=_syncing;saved=[];saved_channels=[];_syncing=True
+    try:
+        for row in plan:
+            owner=row['owner'];kind=row['kind']
+            if row.get('existing') is not None:
+                clip=row['existing'];saved_channels.append((clip,len(clip.channels)))
+                for name in row['new_channels']:
+                    channel=clip.channels.add();channel.name=name;channel.enabled=True
+                continue
+            container=owner.data if kind=='SHAPE' else owner
+            attr={'SHAPE':'eiem_shape_animations','BONE':'eiem_bone_animations',
+                  'MATERIAL':'eiem_material_animations'}[kind]
+            index_attr={'SHAPE':'eiem_shape_animation_index','BONE':'eiem_bone_animation_index',
+                        'MATERIAL':'eiem_material_animation_index'}[kind]
+            clips=getattr(container,attr)
+            saved.append((container,attr,len(clips),index_attr,getattr(container,index_attr)))
+            if kind=='SHAPE':append_member(owner,identity,row['descriptor'],settings)
+            elif kind=='BONE':append_bone_member(owner,identity,row['descriptor'],settings)
+            else:_addon.material_animation.import_action(owner,identity,settings,tracks=row['tracks'])
+        return sum(len(row['tracks']) if row['kind']=='MATERIAL' else len(row['new_channels'])
+                   for row in plan)
+    except Exception:
+        for clip,count in reversed(saved_channels):
+            while len(clip.channels)>count:clip.channels.remove(len(clip.channels)-1)
+        for container,attr,count,index_attr,index in reversed(saved):
+            clips=getattr(container,attr)
+            while len(clips)>count:clips.remove(len(clips)-1)
+            setattr(container,index_attr,index)
+        raise
+    finally:_syncing=previous_syncing
+
+def create_action(objects,source_action=None):
+    plan=selected_channel_plan(objects,source_action=source_action)
+    if not plan:raise ValueError('所选对象没有可加入的 Action 关键帧')
+    name=plan[0]['action'].name
+    stem=re.sub(r'[^A-Za-z0-9_]','_',name).strip('_') or 'Action'
+    if stem[0].isdigit():stem='Action_'+stem
+    used={clip.identity for clip in all_groups()};identity=stem;suffix=2
+    while identity in used:identity=stem+'_'+str(suffix);suffix+=1
+    start=min(row['start'] for row in plan);end=max(row['end'] for row in plan)
+    settings=dict(label=name,enabled=True,start=start,end=max(end,start+1),
+                  loop=True,autoplay=False,speed=1,speed_variable='',sample_rate=60,hotkey='')
+    apply_channel_plan(plan,identity,settings)
+    return next(clip for clip in all_groups() if clip.identity==identity)
+
+def add_action_channels(clip,objects):
+    plan=selected_channel_plan(objects,clip.identity)
+    if not plan:return 0
+    return apply_channel_plan(plan,clip.identity,{field:getattr(clip,field) for field in SHARED_FIELDS})
+
+def action_source_objects(action):
+    """Find real users of an Action; resolving bindings is an explicit UI action."""
+    result=[]
+    for obj in bpy.data.objects:
+        targets=[obj]
+        if obj.type=='MESH':
+            if obj.data.shape_keys:targets.append(obj.data.shape_keys)
+            targets.extend(slot.material for slot in obj.material_slots if slot.material)
+        if any(target.animation_data and target.animation_data.action==action for target in targets):
+            result.append(obj)
+    return result
+
+def remove_action_channel(identity,kind,owner_name,channel_name):
+    if kind=='MATERIAL':
+        material=bpy.data.materials.get(owner_name)
+        if material is None:raise ValueError('通道材质已删除')
+        _addon.material_animation.remove_track(material,identity,channel_name)
+        return
+    members=group_members(identity) if kind=='SHAPE' else bone_group_members(identity)
+    owner,clip=next(((obj,clip) for obj,clip in members if obj.name==owner_name),(None,None))
+    if clip is None:raise ValueError('动作通道已删除')
+    index=next((i for i,item in enumerate(clip.channels) if item.name==channel_name),None)
+    if index is None:raise ValueError('动作通道已删除')
+    clip.channels.remove(index)
+    if not clip.channels:
+        if kind=='SHAPE':remove_member(owner,identity)
+        else:remove_bone_member(owner,identity)
+
 
 def active_clip(context):
     groups=all_groups();identity=context.scene.eiem_animation_group
@@ -67,7 +239,7 @@ def active_clip(context):
     if not identity and obj and obj.type=='MESH':
         clips=obj.data.eiem_shape_animations;index=obj.data.eiem_shape_animation_index
         if 0<=index<len(clips): return clips[index]
-    if not identity and obj and obj.type=='ARMATURE':
+    if not identity and obj and obj.type in {'ARMATURE','EMPTY'}:
         clips=obj.eiem_bone_animations;index=obj.eiem_bone_animation_index
         if 0<=index<len(clips): return clips[index]
     return groups[0] if groups else None
@@ -102,7 +274,7 @@ def current_descriptor(obj):
     return local,found,min(frames),max(frames)
 
 def current_bone_descriptor(obj):
-    if obj.type!='ARMATURE' or not obj.data.bones: raise ValueError(obj.name+' 不是有效骨架')
+    if obj.type not in {'ARMATURE','EMPTY'} or (obj.type=='ARMATURE' and not obj.data.bones): raise ValueError(obj.name+' 不是有效骨架/挂点')
     animation=obj.animation_data
     if not animation or not animation.action: raise ValueError(obj.name+'：请先给骨骼变换插入关键帧')
     local=SimpleNamespace(action=animation.action,
@@ -137,9 +309,9 @@ def create_group(objects):
     members=unique_meshes(objects)
     armatures=[];seen=set()
     for obj in objects:
-        if obj.type=='ARMATURE' and obj.as_pointer() not in seen:
+        if obj.type in {'ARMATURE','EMPTY'} and obj.as_pointer() not in seen:
             seen.add(obj.as_pointer());armatures.append(obj)
-    if not members and not armatures: raise ValueError('请选择带形态键或骨骼动画的网格/骨架')
+    if not members and not armatures: raise ValueError('请选择带动画的网格、骨架或挂点 Empty')
     # Validate the entire selection before touching any member's settings.
     shape_descriptors=[current_descriptor(o) for o in members]
     bone_descriptors=[current_bone_descriptor(o) for o in armatures]
@@ -180,7 +352,7 @@ def add_bone_members(clip,objects):
     current={o.as_pointer() for o,c in bone_group_members(clip.identity)}
     members=[];seen=set()
     for obj in objects:
-        if obj.type=='ARMATURE' and obj.as_pointer() not in current and obj.as_pointer() not in seen:
+        if obj.type in {'ARMATURE','EMPTY'} and obj.as_pointer() not in current and obj.as_pointer() not in seen:
             seen.add(obj.as_pointer());members.append(obj)
     descriptors=[current_bone_descriptor(o) for o in members]
     settings={field:getattr(clip,field) for field in SHARED_FIELDS};added=[];_syncing=True
@@ -206,16 +378,8 @@ def remove_bone_member(obj,identity):
 def remove_group(identity):
     for obj,clip in group_members(identity): remove_member(obj,identity)
     for obj,clip in bone_group_members(identity): remove_bone_member(obj,identity)
-
-def validate_export_members(objects,armatures=()):
-    selected={o.data.as_pointer() for o in objects};groups={c.identity:c.label for o in objects for c in o.data.eiem_shape_animations}
-    selected_bones={o.as_pointer() for o in armatures}
-    groups.update((c.identity,c.label) for o in armatures for c in o.eiem_bone_animations)
-    for identity,label in groups.items():
-        missing=[o.name for o,c in group_members(identity) if o.data.as_pointer() not in selected]
-        if missing: raise ValueError('播放组“'+label+'”必须一起导出全部网格，缺少：'+', '.join(missing))
-        missing=[o.name for o,c in bone_group_members(identity) if o.as_pointer() not in selected_bones]
-        if missing: raise ValueError('播放组“'+label+'”必须一起导出全部骨架，缺少：'+', '.join(missing))
+    for material in {material for material,_clip in material_group_members(identity)}:
+        _addon.material_animation.remove_track(material,identity)
 
 def curves(action, slot_handle, target_id_type='KEY'):
     if action is None: return []
@@ -244,6 +408,9 @@ def shape_curves(obj, clip):
 def bone_curves(obj,clip):
     found={}
     action_curves=curves(clip.action,clip.slot_handle,'OBJECT')
+    if obj.type=='EMPTY':
+        tracks=[c for c in action_curves if c.data_path in {'location','rotation_quaternion','rotation_euler','scale'}]
+        return {'Transform':tracks} if tracks else {}
     for bone in obj.pose.bones:
         prefix=bone.path_from_id()
         tracks=[curve for curve in action_curves if curve.data_path.startswith(prefix+'.') and
@@ -262,6 +429,7 @@ def add_current(obj):
 
 def export_clips(obj, addon, include_hotkeys=True):
     result=[];keys=obj.data.shape_keys
+    if not keys:return result
     for clip in obj.data.eiem_shape_animations:
         if not clip.enabled: continue
         if not clip.action: raise ValueError('形态动画缺少 Action：'+clip.label)
@@ -271,16 +439,14 @@ def export_clips(obj, addon, include_hotkeys=True):
         fps=bpy.context.scene.render.fps/bpy.context.scene.render.fps_base
         duration=(clip.end-clip.start)/fps;count=max(2,math.ceil(duration*clip.sample_rate)+1)
         found=shape_curves(obj,clip);channels={}
-        for item in clip.channels:
-            if not item.enabled: continue
-            if item.name not in found: raise ValueError('动画频道不在所选 Action 中：'+item.name)
-            key=keys.key_blocks[item.name];control=next((c for c in obj.data.eiem_shape_controls if c.shape==item.name),None)
-            if control is None:control=addon.add_shape_control(obj,item.name)
-            if not control.enabled:raise ValueError('动画频道的形态控制已禁用：'+item.name)
-            values=[float(found[item.name].evaluate(clip.start+(clip.end-clip.start)*i/(count-1))) for i in range(count)]
-            if not all(math.isfinite(v) and control.minimum-1e-6<=v<=control.maximum+1e-6 for v in values): raise ValueError('动画权重超出形态键范围：'+item.name)
+        for name,curve in found.items():
+            key=keys.key_blocks[name];control=next((c for c in obj.data.eiem_shape_controls if c.shape==name),None)
+            if control is None:control=addon.add_shape_control(obj,name)
+            if not control.enabled:raise ValueError('动画频道的形态控制已禁用：'+name)
+            values=[float(curve.evaluate(clip.start+(clip.end-clip.start)*i/(count-1))) for i in range(count)]
+            if not all(math.isfinite(v) and control.minimum-1e-6<=v<=control.maximum+1e-6 for v in values): raise ValueError('动画权重超出形态键范围：'+name)
             channels[addon.shape_channel_name(obj,key)]=values
-        if not channels: raise ValueError('播放组没有启用的动画频道：'+clip.label)
+        if not channels:continue
         result.append(dict(id=clip.identity,label=clip.label,key=clip.hotkey if include_hotkeys else '',duration=duration,speed=clip.speed,speedVariable=clip.speed_variable or None,loop=clip.loop,autoplay=clip.autoplay,sample_rate=clip.sample_rate,channels=channels))
     return result
 
@@ -291,18 +457,17 @@ def export_bone_clips(obj,addon,skeleton_id,include_hotkeys=True):
     path_by_name={bone.name:record[0] for bone,record,source in records}
     for clip in obj.eiem_bone_animations:
         if not clip.enabled: continue
-        if not clip.action: raise ValueError('骨骼动画缺少 Action：'+clip.label)
+        if not clip.action: raise ValueError('骨骼/挂点动画缺少 Action：'+clip.label)
         animation=obj.animation_data
         if animation and (animation.drivers or any(not track.mute for track in animation.nla_tracks)):
-            raise ValueError('骨骼动画暂不导出驱动器或 NLA，请先烘焙为独立 Action')
+            raise ValueError('骨骼/挂点动画暂不导出驱动器或 NLA，请先烘焙为独立 Action')
         if clip.end<=clip.start or not math.isfinite(clip.speed) or clip.speed<=0 or clip.sample_rate<1:
             raise ValueError('动画范围、采样率或速度无效：'+clip.label)
         found=bone_curves(obj,clip)
-        selected=[channel.name for channel in clip.channels if channel.enabled]
-        if not selected or any(name not in found for name in selected):
-            raise ValueError('骨骼播放组没有有效频道：'+clip.label)
+        selected=list(found)
+        if not selected:continue
         missing=[name for name in selected if name not in path_by_name]
-        if missing: raise ValueError('骨骼动画找不到骨架路径：'+missing[0])
+        if missing: raise ValueError('骨骼/挂点动画找不到骨架路径：'+missing[0])
         duration=(clip.end-clip.start)/fps
         count=max(2,math.ceil(duration*clip.sample_rate)+1)
         tracks={name:[] for name in selected}
@@ -315,7 +480,7 @@ def export_bone_clips(obj,addon,skeleton_id,include_hotkeys=True):
             if hasattr(clip.action,'slots'):
                 slot=next((item for item in clip.action.slots
                            if item.handle==clip.slot_handle and item.target_id_type=='OBJECT'),None)
-                if slot is None:raise ValueError('骨骼动画缺少匹配的 Action 插槽：'+clip.label)
+                if slot is None:raise ValueError('骨骼/挂点动画缺少匹配的 Action 插槽：'+clip.label)
                 animation.action_slot=slot
             depsgraph=bpy.context.evaluated_depsgraph_get()
             for index in range(count):
@@ -331,13 +496,13 @@ def export_bone_clips(obj,addon,skeleton_id,include_hotkeys=True):
                     local=basis.inverted()@local@basis
                     position,rotation,scale=local.decompose()
                     rebuilt=Matrix.LocRotScale(position,rotation,scale)
-                    if (min(scale)<=0 or max(abs(local[r][c]-rebuilt[r][c])
+                    if (max(abs(local[r][c]-rebuilt[r][c])
                                              for r in range(4) for c in range(4))>1e-4):
-                        raise ValueError('骨骼动画包含不可表达的剪切或缩放：'+name)
+                        raise ValueError('骨骼/挂点动画包含不可表达的剪切或缩放：'+name)
                     rotation.normalize()
                     sample=tuple(position)+(rotation.x,rotation.y,rotation.z,rotation.w)+tuple(scale)
                     if not all(math.isfinite(value) for value in sample):
-                        raise ValueError('骨骼动画包含无效 TRS：'+name)
+                        raise ValueError('骨骼/挂点动画包含无效 TRS：'+name)
                     tracks[name].append(sample)
         finally:
             animation.action=original_action
@@ -379,7 +544,7 @@ class EFF_PG_bone_animation(bpy.types.PropertyGroup):
     speed_variable: StringProperty(options={'HIDDEN'})
     label: StringProperty(name='名称',default='动画片段',update=sync_settings)
     enabled: BoolProperty(name='导出',default=True,update=sync_settings)
-    action: PointerProperty(name='骨骼 Action',type=bpy.types.Action,poll=compatible_bone_action)
+    action: PointerProperty(name='骨骼 / 挂点 Action',type=bpy.types.Action,poll=compatible_bone_action)
     slot_handle: IntProperty(name='Action 插槽')
     start: FloatProperty(name='起始帧',default=1,update=sync_settings)
     end: FloatProperty(name='结束帧',default=60,update=sync_settings)
@@ -393,7 +558,7 @@ class EFF_PG_bone_animation(bpy.types.PropertyGroup):
     channels: CollectionProperty(type=EFF_PG_animation_channel)
 
 class EFF_OT_shape_animation(bpy.types.Operator):
-    bl_idname='eiem.shape_animation';bl_label='从所选网格/骨架创建动画组';bl_options={'REGISTER','UNDO'}
+    bl_idname='eiem.shape_animation';bl_label='从所选网格/骨架创建动画组';bl_options={'REGISTER','UNDO','INTERNAL'}
     remove: BoolProperty(default=False)
     refresh: BoolProperty(default=False)
     use_range: BoolProperty(default=False)
@@ -412,6 +577,13 @@ class EFF_OT_shape_animation(bpy.types.Operator):
                 frames.extend(p.co.x for member,c in bone_group_members(clip.identity)
                               for curves_for_bone in bone_curves(member,c).values()
                               for curve in curves_for_bone for p in curve.keyframe_points)
+                for material,track in material_group_members(clip.identity):
+                    if not track.source_path:continue
+                    source=_addon.material_animation.source_action(material,track)
+                    if source is None:continue
+                    curves=[curve for curve in _addon.material_animation.action_curves(material,source,track.slot_handle)
+                            if curve.data_path==track.source_path]
+                    frames.extend(point.co.x for curve in curves for point in curve.keyframe_points)
                 if not frames:raise ValueError('所选动作没有动画关键帧')
                 clip.start=min(frames);clip.end=max(max(frames),clip.start+1)
             elif self.refresh:
@@ -445,19 +617,17 @@ class EFF_OT_animation_key(bpy.types.Operator):
         except (ValueError,IndexError) as error:self.report({'WARNING'},str(error));return {'RUNNING_MODAL'}
         context.workspace.status_text_set(text=None);return {'FINISHED'}
 
-class EFF_UL_shape_animations(bpy.types.UIList):
-    def draw_item(self,context,layout,data,item,icon,active_data,active_propname,index):layout.prop(item,'label',text='',emboss=False,icon='ACTION')
 
 class EFF_OT_animation_group_select(bpy.types.Operator):
-    bl_idname='eiem.animation_group_select';bl_label='选择形态动画组'
+    bl_idname='eiem.animation_group_select';bl_label='选择 EFF 动作'
     identity: StringProperty()
     def execute(self,context):
         try:set_active_group(context,self.identity);return {'FINISHED'}
         except ValueError as error:self.report({'ERROR'},str(error));return {'CANCELLED'}
 
 class EFF_OT_animation_members(bpy.types.Operator):
-    bl_idname='eiem.animation_members';bl_label='形态动画组网格';bl_options={'REGISTER','UNDO'}
-    operation: EnumProperty(items=[('ADD','加入选中网格',''),('SELECT','选中全部成员',''),('EDIT','编辑此网格',''),('REMOVE','移出播放组',''),('ADD_BONES','加入选中骨架',''),('EDIT_BONE','编辑此骨架',''),('REMOVE_BONE','移出此骨架','')])
+    bl_idname='eiem.animation_members';bl_label='形态动画组网格';bl_options={'REGISTER','UNDO','INTERNAL'}
+    operation: EnumProperty(items=[('ADD','加入选中网格',''),('SELECT','选中全部成员',''),('EDIT','编辑此网格',''),('REMOVE','移出播放组',''),('ADD_BONES','加入选中骨架/挂点',''),('EDIT_BONE','编辑此骨架',''),('REMOVE_BONE','移出此骨架','')])
     target_name: StringProperty()
     def execute(self,context):
         try:
@@ -476,7 +646,7 @@ class EFF_OT_animation_members(bpy.types.Operator):
                 bone_targets={o.as_pointer() for o,c in bone_members}
                 for o in context.view_layer.objects:
                     o.select_set((o.type=='MESH' and o.data.as_pointer() in targets) or
-                                 (o.type=='ARMATURE' and o.as_pointer() in bone_targets))
+                                 (o.type in {'ARMATURE','EMPTY'} and o.as_pointer() in bone_targets))
             elif self.operation=='EDIT':
                 if not target or target.name not in context.view_layer.objects: raise ValueError('该网格不在当前视图层')
                 target.select_set(True);context.view_layer.objects.active=target
@@ -521,18 +691,19 @@ def start_preview(context,clip):
     # Check every member before replacing the first Action. An invalid slot or
     # removed channel must not leave a partial preview in the author's scene.
     for obj,member in members:
-        keys=obj.data.shape_keys;found=shape_curves(obj,member);selected=[i.name for i in member.channels if i.enabled]
-        if not selected or any(n not in found for n in selected): raise ValueError(obj.name+'：请先选择有效动画频道')
+        keys=obj.data.shape_keys
+        if not keys or not member.action:continue
+        found=shape_curves(obj,member);selected=list(found)
+        if not selected:continue
         if keys.as_pointer() in seen: raise ValueError('多个动画成员共用 Shape Keys 数据，请先建立独立副本')
         seen.add(keys.as_pointer());planned.append((keys,found,selected))
     for obj,member in bone_members:
-        if not member.action: raise ValueError(obj.name+'：骨骼动画缺少 Action')
-        found=bone_curves(obj,member);selected=[item.name for item in member.channels if item.enabled]
-        if not selected or any(name not in found for name in selected):
-            raise ValueError(obj.name+'：请先选择有效骨骼频道')
+        if not member.action: raise ValueError(obj.name+'：骨骼/挂点动画缺少 Action')
+        found=bone_curves(obj,member);selected=list(found)
+        if not selected:continue
         if obj.as_pointer() in seen: raise ValueError('动画组重复包含同一对象：'+obj.name)
         seen.add(obj.as_pointer());planned_bones.append((obj,found,selected))
-    if not planned and not planned_bones: raise ValueError('播放组没有动画成员')
+    if not planned and not planned_bones: raise ValueError('播放组没有形态键或骨骼/挂点轨道可供离线预览')
     preview=bpy.data.actions.new('EFF 动画组预览');scene=context.scene
     saved=dict(scene=scene,start=scene.frame_start,end=scene.frame_end,frame=scene.frame_current,subframe=scene.frame_subframe,preview=preview,members=[])
     cls._saved=saved
@@ -569,6 +740,7 @@ def start_preview(context,clip):
         stop_preview(context);raise
 
 class EFF_OT_animation_preview(bpy.types.Operator):
+    bl_options={'INTERNAL'}
     bl_idname='eiem.animation_preview';bl_label='预览动画组'
     stop: BoolProperty(default=False)
     _saved=None
@@ -583,103 +755,26 @@ class EFF_OT_animation_preview(bpy.types.Operator):
             return {'FINISHED'}
         except (ValueError,IndexError,AttributeError,StopIteration) as error:self.report({'ERROR'},str(error));return {'CANCELLED'}
 
+
 class EFF_PT_shape_animation(bpy.types.Panel):
-    bl_label='统一动画组';bl_idname='EFF_PT_shape_animation';bl_space_type='VIEW_3D';bl_region_type='UI';bl_category='EFF'
+    bl_label='EFF 动画';bl_idname='EFF_PT_shape_animation';bl_space_type='VIEW_3D';bl_region_type='UI';bl_category='EFF'
     @classmethod
     def poll(cls,context):return context.scene is not None
     def draw(self,context):
-        l=self.layout;l.operator('eiem.shape_animation',icon='ADD');groups=all_groups();c=active_clip(context)
-        listing=l.box();listing.label(text='全部动画组（'+str(len(groups))+'）')
-        if not c: listing.label(text='选择已设置形态键 Action 的网格和/或骨骼 Action 的骨架');return
-        for group in groups:
-            row=listing.row(align=True)
-            op=row.operator('eiem.animation_group_select',text=group.label,icon='ACTION',depress=group.identity==c.identity);op.identity=group.identity
-            row.label(text=str(len(group_members(group.identity)))+' 网格 / '+str(len(bone_group_members(group.identity)))+' 骨架')
-            row.label(text=group.hotkey or '无按键')
-        l.prop(c,'label');l.prop(c,'enabled')
-        members=group_members(c.identity);bone_members=bone_group_members(c.identity)
-        box=l.box();box.label(text='形态键轨道（'+str(len(members))+' 个网格）')
-        for member,local in members:
-            detail=box.box();row=detail.row(align=True);row.prop(local,'expanded',text=member.name,icon='TRIA_DOWN' if local.expanded else 'TRIA_RIGHT',emboss=False)
-            op=row.operator('eiem.animation_members',text='',icon='GREASEPENCIL');op.operation='EDIT';op.target_name=member.name
-            op=row.operator('eiem.animation_members',text='',icon='X');op.operation='REMOVE';op.target_name=member.name
-            if not local.expanded: continue
-            detail.prop(local,'action')
-            if local.action and hasattr(local.action,'slots'):
-                for slot in local.action.slots:
-                    if slot.target_id_type=='KEY':
-                        row=detail.row();row.label(text=slot.name_display)
-                        op=row.operator('eiem.animation_slot',text='使用此插槽',depress=slot.handle==local.slot_handle);op.handle=slot.handle;op.target_name=member.name
-            op=detail.operator('eiem.shape_animation',text='读取动作频道',icon='FILE_REFRESH');op.refresh=True;op.target_name=member.name
-            for item in local.channels: detail.prop(item,'enabled',text=item.name)
-            overlaps=[]
-            channels={i.name for i in local.channels if i.enabled}
-            for other in member.data.eiem_shape_animations:
-                if other.identity!=c.identity and other.enabled and channels&{i.name for i in other.channels if i.enabled}: overlaps.append(other.label)
-            if overlaps: detail.label(text='同频道组互斥：'+', '.join(overlaps),icon='INFO')
-        detail=box.row(align=True);detail.operator('eiem.animation_members',text='加入选中网格',icon='ADD').operation='ADD'
-        detail.operator('eiem.animation_members',text='选中全部成员',icon='RESTRICT_SELECT_OFF').operation='SELECT'
-        bone_box=l.box();bone_box.label(text='骨骼轨道（'+str(len(bone_members))+' 个骨架）')
-        for member,local in bone_members:
-            detail=bone_box.box();row=detail.row(align=True)
-            row.prop(local,'expanded',text=member.name,icon='TRIA_DOWN' if local.expanded else 'TRIA_RIGHT',emboss=False)
-            op=row.operator('eiem.animation_members',text='',icon='GREASEPENCIL');op.operation='EDIT_BONE';op.target_name=member.name
-            op=row.operator('eiem.animation_members',text='',icon='X');op.operation='REMOVE_BONE';op.target_name=member.name
-            if not local.expanded: continue
-            detail.prop(local,'action')
-            if local.action and hasattr(local.action,'slots'):
-                for slot in local.action.slots:
-                    if slot.target_id_type=='OBJECT':
-                        row=detail.row();row.label(text=slot.name_display)
-                        op=row.operator('eiem.animation_slot',text='使用此插槽',depress=slot.handle==local.slot_handle)
-                        op.handle=slot.handle;op.target_name=member.name;op.bone=True
-            op=detail.operator('eiem.animation_bone_channels',text='读取动作频道',icon='FILE_REFRESH');op.target_name=member.name
-            for item in local.channels: detail.prop(item,'enabled',text=item.name)
-        row=bone_box.row(align=True);row.operator('eiem.animation_members',text='加入选中骨架',icon='ADD').operation='ADD_BONES'
-        r=l.row(align=True);r.prop(c,'start');r.prop(c,'end');l.operator('eiem.shape_animation',text='使用动作范围').use_range=True
-        l.separator();l.label(text='全组共用播放设置')
-        l.prop(c,'hotkey');l.operator('eiem.animation_key');l.prop(c,'loop');l.prop(c,'autoplay');l.prop(c,'advanced')
-        if c.advanced:l.prop(c,'speed');l.prop(c,'sample_rate')
-        r=l.row();r.operator('eiem.animation_preview',text='预览',icon='PLAY');r.operator('eiem.animation_preview',text='停止',icon='PAUSE').stop=True
-        l.operator('eiem.shape_animation',text='删除播放组',icon='REMOVE').remove=True
-        l.label(text='形态键与骨骼轨道共用片段时间轴、采样率和播放控制')
-class EFF_OT_animation_slot(bpy.types.Operator):
-    bl_idname='eiem.animation_slot';bl_label='选择形态动画插槽';bl_options={'REGISTER','UNDO'}
-    handle:IntProperty()
-    target_name:StringProperty()
-    bone:BoolProperty(default=False)
-    def execute(self,context):
-        clip=active_clip(context)
-        obj=(next((o for o,c in (bone_group_members(clip.identity) if self.bone else group_members(clip.identity)) if o.name==self.target_name),None) if self.target_name else context.object) if clip else None
-        local=(bone_member_clip(clip.identity,obj) if self.bone else member_clip(clip.identity,obj)) if obj and clip else None
-        if not local:return {'CANCELLED'}
-        local.slot_handle=self.handle;return {'FINISHED'}
+        animation_ui.draw(self.layout,context,sys.modules[__name__])
 
-class EFF_OT_animation_bone_channels(bpy.types.Operator):
-    bl_idname='eiem.animation_bone_channels';bl_label='读取骨骼动画频道';bl_options={'REGISTER','UNDO'}
-    target_name:StringProperty()
-    def execute(self,context):
-        try:
-            clip=active_clip(context)
-            obj=next((o for o,c in bone_group_members(clip.identity) if o.name==self.target_name),None) if clip else None
-            local=bone_member_clip(clip.identity,obj) if obj else None
-            if not local:raise ValueError('骨架不在当前动画组')
-            local.channels.clear()
-            for name in bone_curves(obj,local):item=local.channels.add();item.name=name
-            return {'FINISHED'}
-        except (ValueError,IndexError,AttributeError,StopIteration) as error:
-            self.report({'ERROR'},str(error));return {'CANCELLED'}
 
-_classes=(EFF_PG_animation_channel,EFF_PG_shape_animation,EFF_PG_bone_animation,EFF_OT_shape_animation,EFF_OT_animation_key,EFF_UL_shape_animations,EFF_OT_animation_group_select,EFF_OT_animation_members,EFF_OT_animation_preview,EFF_OT_animation_slot,EFF_OT_animation_bone_channels,EFF_PT_shape_animation)
+_classes=(EFF_PG_animation_channel,EFF_PG_shape_animation,EFF_PG_bone_animation,EFF_OT_shape_animation,EFF_OT_animation_key,EFF_OT_animation_group_select,EFF_OT_animation_members,EFF_OT_animation_preview,EFF_PT_shape_animation)
 def register(addon):
     global _addon
     _addon=addon
+    animation_ui.register(sys.modules[__name__])
     for cls in _classes:bpy.utils.register_class(cls)
     bpy.types.Mesh.eiem_shape_animations=CollectionProperty(type=EFF_PG_shape_animation)
     bpy.types.Mesh.eiem_shape_animation_index=IntProperty(default=0,min=0)
     bpy.types.Object.eiem_bone_animations=CollectionProperty(type=EFF_PG_bone_animation)
     bpy.types.Object.eiem_bone_animation_index=IntProperty(default=0,min=0)
-    bpy.types.Scene.eiem_animation_group=StringProperty(name='当前形态动画组')
+    bpy.types.Scene.eiem_animation_group=StringProperty(name='当前 EFF 动作')
 def unregister():
     if EFF_OT_animation_preview._saved:
         bpy.ops.eiem.animation_preview(stop=True)
@@ -687,3 +782,4 @@ def unregister():
     del bpy.types.Mesh.eiem_shape_animation_index;del bpy.types.Mesh.eiem_shape_animations
     del bpy.types.Scene.eiem_animation_group
     for cls in reversed(_classes):bpy.utils.unregister_class(cls)
+    animation_ui.unregister()

@@ -4,6 +4,8 @@ EFF panels appear in the 3D View sidebar. Move the pointer over a 3D View, press
 
 EFF Blender is the authoring add-on for AnimeStudio source packages. Install its release archive from [EFF Blender Releases](https://github.com/ssice-a/EFF-blender/releases).
 
+For effects, selecting a root exports its complete current effect. Selecting emitters exports those emitters, their descendants and referenced sub-emitters, while preserving the transforms needed for placement. Selecting the root together with a child exports the complete root. This does not change scene visibility or emitter enable flags. Copying an emitter preserves its edited Materials, Meshes and images; unchanged game resources retain logical references.
+
 The supported Blender version and current authoring workflow are documented in the [EFF main repository](https://github.com/ssice-a/EFF), including the [Mod tutorial](https://github.com/ssice-a/EFF/blob/main/Mod%20Tutorial.md) and [shared tools and index setup](https://github.com/ssice-a/EFF/blob/main/docs/shared-tools-and-indexes.md).
 
 After installing the add-on, select the AnimeStudio unpack index location in **3D View > N > EFF > AnimeStudio 解包索引**. This is separate from add-on installation and does not require selecting the extracted-output directory. Blender targets 5.2; shared executable tools are downloaded from EFF Releases to the user-selected resource root.

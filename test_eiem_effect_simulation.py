@@ -40,6 +40,42 @@ class SimulationTests(unittest.TestCase):
         self.assertEqual(len(p),10)
         for row in p:self.assertAlmostEqual(row['position'][2],2*row['age'])
         data['InitialModule']['maxNumParticles']=0;self.assertEqual(sim.particles(data,1),[])
+
+    def test_birth_capacity_cache_reuses_admissions_and_preserves_backward_seek(self):
+        data=particle_data(1000)
+        data['InitialModule'].update(maxNumParticles=1,startLifetime=constant(.37))
+        sim._capacity_schedule.cache_clear()
+        original=copy.deepcopy(data)
+        before=sim.particles(data,3,seed=7)
+        schedule=sim._capacity_schedule.cache_info()
+        # Rejected and expired births must not be seeded again on every frame.
+        from unittest.mock import patch
+        real_random=sim.random.Random
+        with patch.object(sim.random,'Random',wraps=real_random) as random_constructor:
+            after=sim.particles(data,3.01,seed=7)
+            self.assertLess(random_constructor.call_count,20)
+        self.assertEqual(sim._capacity_schedule.cache_info().misses,schedule.misses)
+        self.assertEqual(sim.particles(data,3,seed=7),before)
+        sim._capacity_schedule.cache_clear()
+        self.assertEqual(sim.particles(data,3.01,seed=7),after)
+        self.assertEqual(data,original)
+
+    def test_capacity_cache_incremental_matches_cold_curves_bursts_and_rejections(self):
+        data=particle_data(40)
+        data['InitialModule'].update(maxNumParticles=3,
+            startLifetime=dict(minMaxState=3,scalar=1.2,minScalar=.2))
+        data['EmissionModule']['m_Bursts']=[dict(time=0,cycleCount=4,repeatInterval=.2,
+            probability=.8,countCurve=dict(minMaxState=3,scalar=8,minScalar=2))]
+        frames=(0,.1,.21,.51,1.3,2,2.5,3.2,.2,2.8)
+        sim._capacity_schedule.cache_clear()
+        incremental=[sim.particles(data,t,seed=11) for t in frames]
+        for t,expected in zip(frames,incremental):
+            sim._capacity_schedule.cache_clear()
+            self.assertEqual(sim.particles(data,t,seed=11),expected,t)
+        data['InitialModule']['startLifetime']=constant(.1)
+        changed=sim.particles(data,2.5,seed=11)
+        sim._capacity_schedule.cache_clear()
+        self.assertEqual(sim.particles(data,2.5,seed=11),changed)
     def test_seek_identity_never_depends_on_lifetime_window(self):
         data=particle_data(7.3);a=sim.particles(data,10);b=sim.particles(data,10.2)
         first={p['id']:p for p in a}

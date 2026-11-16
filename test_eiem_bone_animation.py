@@ -14,6 +14,8 @@ nodes = [
     ("WeaponRoot/Tip", 0, (0, 0, 1), (0, 0, 0, 1), (1, 1, 1)),
 ]
 assert bone.decode_skeleton(bone.encode_skeleton(nodes))["nodes"] == nodes
+mirrored = [nodes[0], (*nodes[1][:4], (-1, 2, 3))]
+assert bone.decode_skeleton(bone.encode_skeleton(mirrored))["nodes"] == mirrored
 
 clip = {
     "id": "weapon_swing",
@@ -29,6 +31,9 @@ clip = {
 decoded = bone.decode_animation(bone.encode_animation(clip))
 assert decoded["id"] == clip["id"] and decoded["skeleton"] == clip["skeleton"]
 assert bone.sample_track(decoded["tracks"][0]["samples"], 0.5)[1] == 0.25
+scaled = dict(clip, tracks=[dict(path='WeaponRoot/Tip', samples=[
+    (0,0,0,0,0,0,1,-1,2,3), (0,0,0,0,0,0,1,0,0,0)])])
+assert bone.decode_animation(bone.encode_animation(scaled))['tracks'][0]['samples'] == scaled['tracks'][0]['samples']
 
 for invalid in (
     [("WeaponRoot", -1, (0, 0, 0), (0, 0, 0, 1), (1, 1, 1)),

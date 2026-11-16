@@ -181,7 +181,10 @@ def draw_summary(layout,draw,path):
     button.axes=True
     for helper in helpers(api().root_of(draw.obj)):
         if helper.get('eff_curve_target')==draw.obj and helper.name in _errors:
-            layout.label(text=_errors[helper.name],icon='ERROR');break
+            layout.label(text=_errors[helper.name],icon='ERROR')
+            reset=layout.operator('eiem.effect_curve_reset',text='丢弃未同步修改 / 重新载入',icon='FILE_REFRESH')
+            reset.object_name=draw.obj.name;reset.identity=helper.get('eff_curve_identity','')
+            break
 
 
 def fcurves(helper):
@@ -212,6 +215,17 @@ def helpers(root=None):
 def metadata(helper):return json.loads(helper[MARKER])
 
 
+def selected_keyframes(helper):
+    rows={row['rna_path']:row for row in metadata(helper)['rows']}
+    result=[]
+    for curve in fcurves(helper):
+        row=rows.get(curve.data_path)
+        if row is None:continue
+        for index,point in enumerate(curve.keyframe_points):
+            if point.select_control_point:result.append((row,index,point))
+    return result
+
+
 def project(helper,rows,record):
     """A disposable, hidden Action projection; never animates an author field."""
     existing={f.data_path:f for f in fcurves(helper)}
@@ -222,7 +236,7 @@ def project(helper,rows,record):
         if len(prop.encode('utf-8'))>63:prop=prop.encode('utf-8')[:54].decode('utf-8',errors='ignore')+' '+hashlib.sha1(prop.encode('utf-8')).hexdigest()[:6]
         path='["'+bpy.utils.escape_identifier(prop)+'"]';paths.add(path)
         helper[prop]=float(row['data']['m_Curve'][0]['value']*row['factor'] if row['data']['m_Curve'] else 1)
-        helper.id_properties_ui(prop).update(description=labels(row['attribute'])[0]+'；纵轴已乘倍率')
+        helper.id_properties_ui(prop).update(description=labels(row['attribute'])[0]+'；纵轴按实际单位显示，不限制在 0–1')
         f=existing.get(path)
         old=previous.get(tuple(row['path']))
         if f is not None and old and all(old.get(k)==row.get(k) for k in ('data','factor','zero')) and geometry(f)==old['projection']:
@@ -255,16 +269,22 @@ def create_projection(context,obj,identity,path,axes=False):
     editor.document.require(root,'请选择特效发射器')
     if not identity:identity=next((i for i in json.loads(obj.get('eff_effect_components','[]')) if editor.editor(root).objects[i]['classId']==198),'')
     editor.document.require(identity in json.loads(obj.get('eff_effect_components','[]')) and editor.editor(root).objects[identity]['classId']==198,'请选择特效发射器')
-    edit=editor.synchronize(root)
+    overlapping=[h for h in helpers(root) if h.get('eff_curve_target')==obj and metadata(h)['identity']==identity]
+    try:edit=editor.synchronize(root)
+    except ValueError:
+        # A rejected graph edit must not destroy the only route back into the
+        # editor. Reuse its projection so the author can correct or reset it.
+        if overlapping and overlapping[0].name in _errors:return overlapping[0]
+        raise
     paths=json.loads(obj[PATHS]) if obj.get(PATHS) is not None else active_paths(obj,edit,identity)
     if path:
         for p in axis_paths(edit,identity,path) if axes else [path]:
             if p not in paths and channels(obj,edit,identity,p):paths.append(p)
     record=dict(version=2,identity=identity,paths=paths)
     rows=rows_for(obj,edit,identity,paths)
-    overlapping=[h for h in helpers(root) if h.get('eff_curve_target')==obj and metadata(h)['identity']==identity]
     if overlapping:
         helper=overlapping[0]
+        helper['eff_curve_emitter_node']=obj.get('eff_effect_node','')
         project(helper,rows,record)
         for retired in overlapping[1:]:
             for window in bpy.context.window_manager.windows:
@@ -279,6 +299,7 @@ def create_projection(context,obj,identity,path,axes=False):
     helper=bpy.data.objects.new(obj.name+' · 特效曲线',None)
     collection.objects.link(helper);helper.hide_set(True);helper.hide_render=True
     helper['eff_curve_target']=obj;helper['eff_curve_root']=root
+    helper['eff_curve_emitter_node']=obj.get('eff_effect_node','')
     try:project(helper,rows,record)
     except Exception:
         close_projection(helper,flush=False);raise
@@ -418,7 +439,7 @@ def poll_updates():
                 edit=api().synchronize(root)
                 nodes={h['eff_curve_target'].as_pointer() for h in helpers(root) if h.get('eff_curve_target')}
                 api().preview.refresh(root,edit,nodes)
-                api().preview.curve_refreshed(root,nodes)
+                api().preview.curve_refreshed(root,nodes,edit)
                 for window in bpy.context.window_manager.windows:
                     for area in window.screen.areas:area.tag_redraw()
         except (ValueError,ReferenceError,RuntimeError):pass
@@ -501,12 +522,21 @@ class EFF_OT_effect_curve_edit(bpy.types.Operator):
 
 class EFF_OT_effect_curve_reset(bpy.types.Operator):
     bl_idname='eiem.effect_curve_reset';bl_label='丢弃图中未同步修改，重新载入原生值';bl_options={'UNDO'}
+    object_name:StringProperty(options={'HIDDEN'})
+    identity:StringProperty(options={'HIDDEN'})
     def execute(self,context):
         helper=graph_helper(context)
+        if not helper:
+            obj=bpy.data.objects.get(self.object_name) if self.object_name else context.object
+            root=api().root_of(obj) if obj else None
+            helper=next((candidate for candidate in helpers(root)
+                         if candidate.get('eff_curve_target')==obj and
+                         (not self.identity or metadata(candidate)['identity']==self.identity)),None) if root else None
         if not helper:return {'CANCELLED'}
         record=metadata(helper);obj=helper['eff_curve_target'];root=helper['eff_curve_root']
         edit=api().editor(root)
         project(helper,rows_for(obj,edit,record['identity'],record_paths(edit,record)),record)
+        remember(obj,record_paths(edit,record))
         _errors.pop(helper.name,None);return {'FINISHED'}
 
 
@@ -614,8 +644,22 @@ class EFF_PT_effect_curves(bpy.types.Panel):
         layout.label(text='发射器：'+obj.name,icon='OUTLINER_OB_EMPTY')
         row=layout.row(align=True);row.operator('eiem.effect_curve_add',text='添加属性…',icon='ADD');row.operator('eiem.effect_curve_collect',text='加入已有曲线')
         row=layout.row(align=True);row.operator('eiem.effect_curve_visibility',text='只看选中曲线');row.operator('eiem.effect_curve_visibility',text='显示全部').all=True
-        layout.label(text='Shift 多选曲线；G X / G Y 移动')
+        layout.label(text='Shift 多选曲线；G X 改进度，G Y 按实际单位改数值')
         layout.label(text='Ctrl+右键加点；选中点按 X 删除')
+        header,body=layout.panel('eff_curve_key_coordinates',default_closed=False)
+        header.label(text='关键帧坐标')
+        if body:
+            selected=selected_keyframes(helper)
+            if not selected:
+                body.label(text='选中曲线控制点后，可查看并输入坐标。')
+                body.label(text='Blender 原生入口：N → Item',icon='INFO')
+            else:
+                for row,index,point in selected:
+                    box=body.box();box.label(text=row['title']+' · K'+str(index+1))
+                    x_name,y_name=labels(row['attribute']);box.label(text=x_name+' → '+y_name)
+                    coordinates=box.row(align=True)
+                    coordinates.prop(point,'co',index=0,text='X')
+                    coordinates.prop(point,'co',index=1,text='Y')
         paths=record_paths(edit,record)
         if not paths:layout.label(text='列表为空，点“添加属性…”开始。',icon='INFO')
         groups=list(dict.fromkeys(p[0] for p in paths))

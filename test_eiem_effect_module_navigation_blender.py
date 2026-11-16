@@ -83,11 +83,11 @@ for source in sorted(Path(source_root).rglob('effect.json')):
     settings = copy.deepcopy(edit.value(identity, ['UVModule']))
     node[key] = True
     editor.synchronize(root)
-    assert any(r[:2] == ('label', '贴图序列帧') for r in draw(node))
+    assert any(r[:2] == ('label', editor.effect_ui.module_name('UVModule')) for r in draw(node))
     node[key] = False
     editor.synchronize(root)
     disabled = draw(node)
-    assert any(r[:2] == ('label', '贴图序列帧') for r in disabled), 'unchecking UVModule removed its header'
+    assert any(r[:2] == ('label', editor.effect_ui.module_name('UVModule')) for r in disabled), 'unchecking UVModule removed its header'
     assert ('prop', '["' + key + '"]', True) in disabled, 'disabled module lost its usable enable checkbox'
     assert edit.value(identity, ['UVModule']) == {**settings, 'enabled': False}, 'disabling erased module settings'
     picker = type('ModulePicker', (), {'object_name': node.name})()
@@ -111,7 +111,7 @@ for source in sorted(Path(source_root).rglob('effect.json')):
         node[key] = False
         editor.synchronize(root)
         off = draw(node)
-        titles = set(t for t, _ in editor.effect_ui.MODULES.values())
+        titles = {editor.effect_ui.module_name(name) for name in editor.effect_ui.MODULES}
         assert [r[1] for r in on if r[0] == 'label' and r[1] in titles] == [
             r[1] for r in off if r[0] == 'label' and r[1] in titles], module
         assert ('prop', '["' + key + '"]', True) in off, module
@@ -158,7 +158,7 @@ for root in (o for o in bpy.data.objects if o.get('eff_effect_document')):
         edit.objects[i]['classId'] == 198 for i in json.loads(o.get('eff_effect_components', '[]'))))
     identity = next(i for i in json.loads(node['eff_effect_components']) if edit.objects[i]['classId'] == 198)
     assert edit.value(identity, ['UVModule', 'enabled']) is False
-    assert any(r[:2] == ('label', '贴图序列帧') for r in draw(node))
+    assert any(r[:2] == ('label', editor.effect_ui.module_name('UVModule')) for r in draw(node))
     node[editor.field_key(identity, ['UVModule', 'enabled'])] = True
     assert editor.synchronize(root).value(identity, ['UVModule', 'enabled']) is True
 

@@ -85,6 +85,21 @@ def set_resource_root(path):
     return path
 
 
+def anime_studio():
+    value = _read_settings().get('animeStudio')
+    return Path(value).expanduser().resolve() if isinstance(value, str) and value else None
+
+
+def set_anime_studio(path):
+    path = Path(path).expanduser().resolve(strict=True)
+    if not path.is_file():
+        raise ValueError('AnimeStudio executable is missing: ' + str(path))
+    value = _read_settings()
+    value.update(format=SETTINGS_FORMAT, animeStudio=str(path))
+    _write_settings(value)
+    return path
+
+
 def _read_json(url):
     request = Request(url, headers={
         'Accept': 'application/vnd.github+json',

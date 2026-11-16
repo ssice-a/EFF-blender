@@ -16,7 +16,13 @@ editor = addon.eiem_blender_addon.effect_editor
 root = editor.import_source(bpy.context, source)
 initial_edits = copy.deepcopy(editor.editor(root).export()['objects'])
 edit = editor.synchronize(root)
-node = next(o for o in editor.objects(root) if o.name.startswith('leaves_01'))
+initial_emitters=[o for o in editor.objects(root) if any(
+    edit.objects[i]['classId']==198 for i in json.loads(o.get('eff_effect_components','[]')))]
+initial_emitter_count=len(initial_emitters)
+node=next(o for o in initial_emitters if any(
+    edit.objects[i]['classId']==198 and
+    edit.value(i,['RotationModule','curve','maxCurve','m_Curve'])
+    for i in json.loads(o.get('eff_effect_components','[]'))))
 identity = next(i for i in json.loads(node['eff_effect_components']) if edit.objects[i]['classId'] == 198)
 assert edit.export()['objects']==initial_edits, 'preparing degree controls changed native values'
 
@@ -83,13 +89,17 @@ assert any(o.get('eff_preview_key') == root['eff_effect_id'] + clone_ps for o in
 assert bpy.ops.eiem.effect_emitter_add(template=clone['eff_effect_node'], name='临时发射器') == {'FINISHED'}
 temporary = bpy.context.object
 temporary_ids = {temporary['eff_effect_node'], *json.loads(temporary['eff_effect_components'])}
-assert bpy.ops.eiem.effect_emitter_remove(object_name=temporary.name) == {'FINISHED'}
+temporary_identity=temporary['eff_effect_node']
+bpy.data.objects.remove(temporary,do_unlink=True)
+edit=editor.synchronize(root)
 assert not temporary_ids & set(editor.editor(root).objects)
 assert not any(o.get('eff_effect_node') in temporary_ids for o in bpy.data.objects)
+assert not any(o.get('eff_preview') and o.get('eff_preview_key','').startswith(root['eff_effect_id']+temporary_identity)
+               for o in bpy.data.objects)
 
 # Remove a source emitter as well. Source records are preserved as inactive
 # native tombstones by the compiler, with no surviving Blender/preview node.
-other = next(o for o in editor.objects(root) if o.name.startswith('leaves_02'))
+other = next(o for o in initial_emitters if o!=node)
 removed_go = other['eff_effect_node']
 removed_ps = next(i for i in json.loads(other['eff_effect_components']) if edit.objects[i]['classId'] == 198)
 # A rejected deletion must leave both the native state and Blender node intact.
@@ -108,7 +118,18 @@ assert not any(o.get('eff_preview_key') == root['eff_effect_id'] + removed_ps fo
 document = editor.assets.export_document(root, edit)
 assert len(document['emitters']['added']) == 5
 assert document['emitters']['removed'] == [removed_go]
-assert len([n for n in edit.state['catalog']['hierarchy'] if any(edit.objects[i]['classId']==198 for i in n['components'])]) == 2
+# A Mod reimport reconstructs declared emitters from JSON. Native renderer
+# UInt8 arrays must retain their bytes, rather than iterating encoding keys.
+restored_state = editor.document.load_source(source)
+editor.document.apply_edit(restored_state, document)
+restored_edit = editor.document.Editor(restored_state)
+clone_renderer = next(i for i in clone_ids if edit.objects[i]['classId'] == 199)
+assert restored_edit.value(clone_renderer, ['m_VertexStreams']) == edit.value(clone_renderer, ['m_VertexStreams'])
+for component in clone_ids:
+    for field_path, kind, value in editor.native_fields(restored_edit, component):
+        if kind in editor.document.INTS:
+            assert isinstance(value, (int, float)), (component, field_path, value)
+assert len([n for n in edit.state['catalog']['hierarchy'] if any(edit.objects[i]['classId']==198 for i in n['components'])]) == initial_emitter_count
 # Raw hierarchy mutation cannot masquerade as a declared emitter operation.
 transform = next(n['transform'] for n in edit.state['catalog']['hierarchy'] if n['identity'] == edit.state['catalog']['root'])
 edit.value(transform)['m_Children'].append(dict(m_FileID=0,m_PathID=1234567))

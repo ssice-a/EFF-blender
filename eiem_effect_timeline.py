@@ -6,7 +6,6 @@ Animator transitions, scripts and ACL buffers with unsupported layouts remain
 explicit diagnostics; selecting a clip never invents a complete skill sequence.
 """
 import bisect
-import copy
 import math
 import struct
 import zlib
@@ -161,7 +160,9 @@ class Timeline:
                 warnings.append('PPtr 动画轨道尚未回放')
                 continue
             if binding['typeID'] == 4 and binding['attribute'] in (1, 2, 3):
-                transform = transforms.setdefault(row['transform'], copy.deepcopy(edit.value(row['transform'])))
+                if row['transform'] not in transforms:
+                    transforms[row['transform']] = dict(edit.value(row['transform']))
+                transform = transforms[row['transform']]
                 field = {1: 'm_LocalPosition', 2: 'm_LocalRotation', 3: 'm_LocalScale'}[binding['attribute']]
                 transform[field] = dict(zip('xyzw', sampled))
             elif binding['customType'] == 22:
@@ -175,16 +176,30 @@ class Timeline:
                         if not target:
                             warnings.append('动画材质属性未解析：%s' % binding['attribute'])
                             continue
-                        data = materials.setdefault(mid, copy.deepcopy(edit.value(mid)))
+                        if mid not in materials:
+                            source = edit.value(mid)
+                            materials[mid] = dict(source)
+                            # Only the sampled property changes. Copying the
+                            # complete native Material per Renderer/binding
+                            # duplicates thousands of untouched fields.
+                            materials[mid]['m_SavedProperties'] = dict(source['m_SavedProperties'])
+                        data = materials[mid]
                         name, group, index = target
+                        saved = data['m_SavedProperties']
+                        saved[group] = list(saved[group])
+                        saved[group][index] = dict(saved[group][index])
                         value = data['m_SavedProperties'][group][index]
                         component = (binding['attribute'] >> 28) & 3
                         if binding['attribute'] & 0x80000000 and group == 'm_Floats':
                             value['second'] = sampled[0]
                         elif group == 'm_Colors':
+                            value['second'] = dict(value['second'])
                             value['second']['rgba'[component]] = sampled[0]
                         elif group == 'm_TexEnvs':
-                            value['second']['m_Scale' if component < 2 else 'm_Offset']['xy'[component % 2]] = sampled[0]
+                            field = 'm_Scale' if component < 2 else 'm_Offset'
+                            value['second'] = dict(value['second'])
+                            value['second'][field] = dict(value['second'][field])
+                            value['second'][field]['xy'[component % 2]] = sampled[0]
                         else:
                             warnings.append('动画属性类型尚未支持：' + name)
             else:

@@ -214,6 +214,64 @@ def uv_transform(module,particle,uv):
     return ((uv[0]+frame%nx)/nx,(uv[1]+ny-1-frame//nx)/ny)
 
 
+class _CapacitySchedule:
+    """Exact birth admission shared by frames; independent of particle motion.
+
+    Retain admitted births for deterministic backward seeks. Rejected births
+    are processed only when advancing the horizon, not on every redraw. The
+    existing 50000-birth bound and LRU bound also cap retained history.
+    """
+    def __init__(self, serialized, seed):
+        self.data=json.loads(serialized);self.seed=seed
+        self.until=-1.;self.ordinal=0;self.birth_count=0
+        self.deaths=[];self.accepted=[]
+
+    def advance(self, time):
+        if time<=self.until:return
+        data=self.data;duration=data['duration'];rate=data['rate']
+        cycle_total=max(0,duration*integrate(rate,1))
+        if data['looping']:
+            total=int(time/duration)*cycle_total+max(0,duration*integrate(rate,(time%duration)/duration))
+        else:total=max(0,duration*integrate(rate,min(1,time/duration)))
+        last=int(total+1e-9)
+        if last>50001:raise ValueError('离线发射量超出预览预算；原生数据未修改')
+        births=[];serialized=json.dumps(rate,sort_keys=True,separators=(',',':'))
+        for ordinal in range(self.ordinal+1,last+1):
+            born=(ordinal/max(1e-12,scalar(rate)) if not isinstance(rate,dict) or rate.get('minMaxState',0)==0
+                  else emission_birth(serialized,duration,data['looping'],ordinal))
+            births.append((born,ordinal))
+        # A burst may repeat past the end of its system cycle. Keep considering
+        # those old cycles; filtering by birth time avoids admitting them twice.
+        cycles=range(int(time/duration)+1) if data['looping'] else (0,)
+        for cycle in cycles:
+            for bi,burst in enumerate(data['bursts']):
+                rng=random.Random(self.seed+cycle*3571+bi)
+                if rng.random()>burst.get('probability',1):continue
+                for repeat in range(max(1,burst.get('cycleCount',1))):
+                    born=cycle*duration+burst.get('time',0)+repeat*burst.get('repeatInterval',0)
+                    if 0<=born<=time:
+                        # Consume prior repeats too: their random counts cannot
+                        # change when seeking in smaller increments.
+                        count=max(0,int(scalar(burst.get('countCurve',{}),r=rng.random())))
+                        if self.until<born:
+                            if count>50000 or self.birth_count+len(births)+count>50000:
+                                raise ValueError('离线 burst 数量超出预览预算；原生数据未修改')
+                            births.extend((born,-(1+cycle*1000000000000+bi*10000000+repeat*100000+n)) for n in range(count))
+        for born,identity in sorted(births):
+            rng=random.Random(self.seed*7919+identity)
+            rr=rng.random();life=scalar(data['lifetime'],(born%duration)/duration,rr)
+            while self.deaths and self.deaths[0]<=born+1e-9:heapq.heappop(self.deaths)
+            if life<=0 or len(self.deaths)>=data['limit']:continue
+            heapq.heappush(self.deaths,born+life)
+            self.accepted.append((born,identity,life,rr))
+        self.ordinal=last;self.birth_count+=len(births);self.until=time
+
+
+@lru_cache(maxsize=16)
+def _capacity_schedule(serialized, seed):
+    return _CapacitySchedule(serialized,seed)
+
+
 def particles(data, time, seed=1):
     if time < 0:
         return []
@@ -231,45 +289,23 @@ def particles(data, time, seed=1):
     duration=max(1e-6,data.get('lengthInSec',5))
     prewarm=duration if data.get('prewarm') and data.get('looping') else 0
     time+=prewarm
-    # Capacity rejects new births; it never replaces still-living particles.
-    # Replaying from origin also makes arbitrary timeline seeks deterministic.
-    begin=0
-    births=[]
-    # Count from system origin, never reset the accumulator at the lifetime window.
-    rate=emission.get('rateOverTime',{});cycle_total=max(0,duration*integrate(rate,1))
-    def cumulative(t):
-        t=max(0,t)
-        if not data.get('looping',False):return max(0,duration*integrate(rate,min(1,t/duration)))
-        cycles=int(t/duration);return cycles*cycle_total+max(0,duration*integrate(rate,(t%duration)/duration))
-    first=int(cumulative(begin))+1;last=int(cumulative(time)+1e-9)
-    if last-first>50000:raise ValueError('离线发射量超出预览预算；原生数据未修改')
-    serialized=json.dumps(rate,sort_keys=True,separators=(',',':'))
-    for ordinal in range(first,last+1):
-        if not isinstance(rate,dict) or rate.get('minMaxState',0)==0:
-            births.append((ordinal/max(1e-12,scalar(rate)),ordinal));continue
-        births.append((emission_birth(serialized,duration,bool(data.get('looping')),ordinal),ordinal))
-    cycles=range(max(0,int(begin/duration)-1),int(time/duration)+1) if data.get('looping',False) else (0,)
-    for cycle in cycles:
-        for bi,burst in enumerate(emission.get('m_Bursts',[])):
-            rng=random.Random(seed+cycle*3571+bi)
-            if rng.random()>burst.get('probability',1):
-                continue
-            for repeat in range(max(1,burst.get('cycleCount',1))):
-                born=cycle*duration+burst.get('time',0)+repeat*burst.get('repeatInterval',0)
-                if begin<=born<=time:
-                    count=max(0,int(scalar(burst.get('countCurve',{}),r=rng.random())))
-                    if count>50000 or len(births)+count>50000:raise ValueError('离线 burst 数量超出预览预算；原生数据未修改')
-                    births.extend((born,-(1+cycle*1000000000000+bi*10000000+repeat*100000+n)) for n in range(count))
-    result=[];deaths=[]
-    for born,identity in sorted(births):
-        rng=random.Random(seed*7919+identity)
-        rr=rng.random();emitter_phase=(born%duration)/duration;life=scalar(initial.get('startLifetime',{}),emitter_phase,rr)
-        while deaths and deaths[0]<=born+1e-9:heapq.heappop(deaths)
-        if life<=0 or len(deaths)>=limit:continue
-        heapq.heappush(deaths,born+life)
+    admission=dict(duration=duration,looping=bool(data.get('looping')),limit=limit,
+                   lifetime=initial.get('startLifetime',{}),rate=emission.get('rateOverTime',{}),
+                   bursts=emission.get('m_Bursts',[]))
+    serialized=json.dumps(admission,sort_keys=True,separators=(',',':'))
+    # Negative burst offsets can introduce births retroactively when a new
+    # cycle starts. Preserve origin-replay behavior for that unusual authoring
+    # case rather than letting an incremental cache change capacity admission.
+    retroactive=any(b.get('time',0)<0 or b.get('repeatInterval',0)<0 for b in admission['bursts'])
+    schedule=_CapacitySchedule(serialized,seed) if retroactive else _capacity_schedule(serialized,seed)
+    schedule.advance(time)
+    result=[]
+    for born,identity,life,rr in schedule.accepted:
         age=time-born
         if life<=0 or not 0<=age<life:
             continue
+        rng=random.Random(seed*7919+identity);rng.random()
+        emitter_phase=(born%duration)/duration
         phase=age/life
         pos,direction=shape_point(data.get('ShapeModule',{}),rng)
         start=scalar(initial.get('startSpeed',{}),emitter_phase,rng.random())

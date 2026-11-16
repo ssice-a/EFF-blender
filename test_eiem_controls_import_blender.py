@@ -310,10 +310,15 @@ variable=$value
             self.assertEqual(expression[0], "greater")
 
         material_clip = self.material.eiem_material_animations[0]
+        self.assertEqual(material_clip.identity, "walk")
         self.assertEqual(material_clip.runtime_id, "walk")
         self.assertEqual(material_clip.property, "_Glow")
         self.assertAlmostEqual(material_clip.value, 0.1)
         self.assertIsNotNone(self.material.animation_data.action)
+        self.assertEqual(material_clip.action, self.material.animation_data.action)
+        self.assertTrue(material_clip.source_bound)
+        self.assertEqual(material_clip.slot_handle,
+                         self.material.animation_data.action_slot.handle)
         self.assertEqual(self.material.animation_data.action_slot.handle,
                          next(slot.handle for slot in self.material.animation_data.action.slots
                               if slot.target_id_type == "MATERIAL"))
@@ -336,6 +341,10 @@ variable=$value
                 visibilityBindings=[], visibilityExpression=preserved_visibility(
                     self.package_collection, identity)))
         self.material.eiem_material_animations[0].speed = 2.0
+        self.material.eiem_material_animations[0].sample_rate = 2
+        for obj in self.meshes.values():
+            self.assertEqual(obj.data.eiem_shape_animations[0].speed, 2.0)
+            self.assertEqual(obj.data.eiem_shape_animations[0].sample_rate, 2)
         material_clips = package.eiem_material_animation.export_clips(
             self.material, "MaterialGlow", addon)
         preserved = addon.native_export.preserved_controls_for_objects(list(self.meshes.values()))

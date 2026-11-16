@@ -28,7 +28,29 @@ PREFIXES = ('eiem_float.', 'eiem_int.', 'eiem_value4.', 'eiem_color.',
 
 def material_for(author):
     if author is None:return None
-    return next((m for m in bpy.data.materials if m.eff_effect_author == author), None)
+    material = author.eff_effect_material
+    if material and material.eff_effect_author == author and not material.get('eff_preview_instance'):
+        return material
+    return next((m for m in bpy.data.materials if m.eff_effect_author == author
+                 and not m.get('eff_preview_instance')), None)
+
+
+def ensure_material(root, edit, identity):
+    """Keep author materials owned by their resource, including billboards.
+
+    Per-emitter preview instances occupy mesh slots; the editable shared
+    material may have none. The resource's forward ID pointer makes Blender
+    save it, instead of dropping its paths and controls on the next load.
+    """
+    assets = _module("eiem_effect_assets")
+    author = assets.material_object(root, identity)
+    if author is None:return None
+    material = material_for(author)
+    if material is None:
+        material = bpy.data.materials.new(edit.objects[identity].get('name') or author.name)
+        material.eff_effect_author = author
+    setup(material, root, edit, identity)
+    return material
 
 
 def _text(value):
@@ -58,11 +80,16 @@ def properties(edit, identity):
         for kind, field in (('texture_scale', 'm_Scale'), ('texture_offset', 'm_Offset')):
             result['eiem_' + kind + '.' + name] = ','.join(_text(slot[field][k]) for k in 'xy')
         target = preview._target(edit, identity, ['m_SavedProperties', 'm_TexEnvs', index, 'second', 'm_Texture'])
-        result['eiem_texture.' + name] = _source(edit, target) if target else ''
+        field = '$.m_SavedProperties.m_TexEnvs[' + str(index) + '].second.m_Texture'
+        binding = next((r.get('gameLogical') for r in edit.objects[identity].get('references', [])
+                        if r.get('field') == field and r.get('gameLogical')), None)
+        result['eiem_texture.' + name] = binding['path'] if binding else _source(edit, target) if target else ''
     return result
 
 
 def setup(material, root, edit, identity):
+    if material.eff_effect_author and material.eff_effect_author.eff_effect_material != material:
+        material.eff_effect_author.eff_effect_material = material
     if material.get('eff_material_editor_version') == 1:return
     assets = _module("eiem_effect_assets")
     preview = _module("eiem_effect_preview")
@@ -82,8 +109,15 @@ def setup(material, root, edit, identity):
     material['eiem_section'] = 'Material' + root['eff_effect_id'] + '_' + identity.rsplit(':', 1)[-1].replace('-', 'n')
     shader = preview._target(edit, identity, ['m_Shader'])
     if shader:
-        tree, _ = assets.NativeAssets(edit, root['eff_effect_id']).tree(shader)
-        material['eiem_shader'] = tree['m_ParsedForm']['m_Name'].data
+        try:
+            shader_name = edit.objects[shader].get('shaderName')
+            if not shader_name:
+                shader_name = assets.NativeAssets(edit, root['eff_effect_id']).reader.shader_name(shader)
+            material['eiem_shader'] = shader_name
+        except (OSError, ValueError):
+            # Game-owned shader snapshots only improve offline preview.
+            # Portable logical bindings remain exportable without the donor.
+            pass
     material['eff_material_source_textures'] = document.dumps({k: v for k, v in properties(edit, identity).items() if k.startswith('eiem_texture.')})
     material['eff_material_last'] = document.dumps(values)
     material['eff_material_editor_version'] = 1
@@ -108,6 +142,8 @@ def signature(author):
 
 
 def _schema(edit, identity):
+    if edit.objects[identity].get('gameSource'):
+        return _module('eiem_effect_native').Reader(edit).tree(identity)[0].schema
     path = Path(edit.state['source']) / edit.objects[identity]['schema']
     stat = path.stat()
     stamp = stat.st_mtime_ns, stat.st_size
@@ -119,6 +155,7 @@ def _schema(edit, identity):
 
 
 def _json_value(value):
+    if value.schema.type == 'bool':return bool(value.data)
     if value.schema.type == 'Array':return [_json_value(item) for item in value.items()]
     if isinstance(value.data, dict):
         if list(value.data) == ['Array']:return _json_value(value.data['Array'])
@@ -139,6 +176,13 @@ def synchronize(root, edit, api):
             key = 'eiem_texture.' + slot.name
             if key in previous and str(material.get(key, '')) != previous[key] and slot.image:
                 slot.image = None
+        resources = _module('eiem_effect_game_resources')
+        for index, row in enumerate(edit.value(identity).get('m_SavedProperties', {}).get('m_TexEnvs', [])):
+            key = 'eiem_texture.' + row['first']
+            value = str(material.get(key, '')).strip()
+            if resources.valid_logical_path(value) and value != previous.get(key):
+                resources.bind_logical(edit, identity,
+                    ['m_SavedProperties', 'm_TexEnvs', index, 'second', 'm_Texture'], value, expected='Texture')
         native = properties(edit, identity)
         overrides = {k[5:]: str(material[k]) for k in material.keys()
                      if (k.startswith(PREFIXES) or k == 'eiem_render_queue') and str(material[k]) != previous.get(k, native.get(k))}
@@ -171,8 +215,8 @@ def texture_path(root, identity, slot):
     value = str(material.get(key, '')).strip()
     sources = json.loads(material.get('eff_material_source_textures', '{}'))
     if not value or value == sources.get(key, ''):return None
-    document.require(not value.replace('\\', '/').lower().startswith(('assets/', 'packages/')),
-                     '替换贴图请选择本地文件；游戏逻辑引用请恢复来源值：' + slot)
+    resources = _module('eiem_effect_game_resources')
+    if resources.valid_logical_path(value):return None
     path = Path(bpy.path.abspath(value, library=material.library))
     document.require(path.is_file(), '贴图文件不存在：' + str(path))
     return path.resolve()

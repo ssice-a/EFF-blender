@@ -122,13 +122,14 @@ bpy.ops.wm.open_mainfile(filepath=str(output / 'native-gradients.blend'))
 root, node = bpy.data.objects[root_name], bpy.data.objects[node_name]
 assert sync().state == expected
 
-# Dragging never rebuilds field rows, nodes or elements; idle sync does no writes.
-ed.preview.live_update(); samples = []
+# Dragging uses the same author flush as panel redraw/export and must not rebuild
+# field rows, nodes or elements.
+samples = []
 fields = node['eff_effect_fields']; tree = ramps.tree_for(node); count = len(tree.nodes)
 element = ramp('alpha').elements[1]; element_id = element.as_pointer()
 for i in range(12):
     element.position = .6 + i*.001
-    started = time.perf_counter(); ed.preview.live_update(); samples.append(time.perf_counter()-started)
+    started = time.perf_counter(); sync(); samples.append(time.perf_counter()-started)
     assert value()['atime1'] == round(float(element.position) * 65535)
     assert node['eff_effect_fields'] == fields and len(tree.nodes) == count
     assert ramp('alpha').elements[1].as_pointer() == element_id

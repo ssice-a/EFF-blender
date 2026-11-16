@@ -15,7 +15,7 @@ assert len(clip.channels)==2 and clip.start==1 and clip.end==31
 clip.channels[1].enabled=False
 manual=b.value;old_action=obj.data.shape_keys.animation_data.action;slot=obj.data.shape_keys.animation_data.action_slot
 result=addon.shape_animation.export_clips(obj,addon)
-assert result[0]['duration']==1 and list(result[0]['channels'])==['展翅']
+assert result[0]['duration']==1 and list(result[0]['channels'])==['展翅','收拢']
 assert abs(result[0]['channels']['展翅'][30]-1)<1e-6
 assert b.value==manual and obj.data.shape_keys.animation_data.action==old_action and obj.data.shape_keys.animation_data.action_slot==slot
 other=bpy.data.actions.new('Object action');other.slots.new(id_type='OBJECT',name='Object')
@@ -28,11 +28,11 @@ before=(bpy.context.scene.frame_start,bpy.context.scene.frame_end,bpy.context.sc
 play_result=bpy.ops.eiem.animation_preview()
 assert play_result=={'FINISHED'}
 preview=obj.data.shape_keys.animation_data.action
-assert preview!=old_action and len(addon.shape_animation.curves(preview,obj.data.shape_keys.animation_data.action_slot.handle))==1
+assert preview!=old_action and len(addon.shape_animation.curves(preview,obj.data.shape_keys.animation_data.action_slot.handle))==2
 assert bpy.ops.eiem.animation_preview(stop=True)=={'FINISHED'}
 assert obj.data.shape_keys.animation_data.action==old_action and obj.data.shape_keys.animation_data.action_slot==slot
 assert before==(bpy.context.scene.frame_start,bpy.context.scene.frame_end,bpy.context.scene.frame_current,tuple(k.value for k in obj.data.shape_keys.key_blocks))
-print('PASS real Blender shape animation: Shape Keys Action/slot, two curves, checked channel only, scene FPS/duration, samples, original Action/values retained, Object Action rejected')
+print('PASS real Blender shape animation: Shape Keys Action/slot, all Action curves, scene FPS/duration, samples, original Action/values retained, Object Action rejected')
 
 module=addon.shape_animation
 module.remove_group(clip.identity)
@@ -67,11 +67,9 @@ for field,value in [('label','同步衣装'),('hotkey','F8'),('start',1),('end',
     setattr(clip,field,value);assert getattr(other,field)==value
 clip.enabled=True
 assert other.action==old_action and other.slot_handle!=clip.slot_handle and len(other.channels)==1
+# Each owner contributes its own channels; other Action slots are not required.
 left=module.export_clips(obj,addon)[0];right=module.export_clips(second,addon)[0]
 assert left['id']==right['id'] and left['duration']==right['duration'] and left['channels']['展翅'][0]!=right['channels']['展翅'][0]
-try:module.validate_export_members([obj]);raise AssertionError('Incomplete multi-mesh export accepted')
-except ValueError:pass
-module.validate_export_members([obj,second])
 alias=bpy.data.objects.new('Second alias',second.data);bpy.context.collection.objects.link(alias)
 assert len(module.group_members(identity))==2
 third=animated_mesh('Third');third.select_set(True)
@@ -97,8 +95,8 @@ assert bpy.ops.eiem.animation_preview(stop=True)=={'FINISHED'}
 assert before_scene==(bpy.context.scene.frame_start,bpy.context.scene.frame_end,bpy.context.scene.frame_current)
 for keys,action,slot,values in before_members:assert keys.animation_data.action==action and keys.animation_data.action_slot==slot and tuple(k.value for k in keys.key_blocks)==values
 other.channels[0].name='missing'
-try:module.start_preview(bpy.context,clip);raise AssertionError('Invalid member preview accepted')
-except ValueError:pass
+module.start_preview(bpy.context,clip)
+module.stop_preview(bpy.context)
 assert not module.EFF_OT_animation_preview._saved and obj.data.shape_keys.animation_data.action==old_action
 other.channels[0].name='展翅'
 first_id=identity
@@ -126,7 +124,9 @@ layout=Layout()
 from types import SimpleNamespace
 module.EFF_PT_shape_animation.draw(SimpleNamespace(layout=layout),bpy.context)
 assert len([o for o in layout.operators if o[0]=='eiem.animation_group_select'])==2
-assert len([p for p in layout.props if p[1]=='action'])==2
+assert len(module.action_channels(second_id))==3
+assert not any(o[0] in {'eiem.animation_material_import','eiem.animation_members','eiem.shape_animation','eiem.animation_preview'} for o in layout.operators)
+assert any(o[0]=='eiem.animation' and o[2].operation=='ADD' for o in layout.operators)
 assert bpy.ops.eiem.animation_group_select(identity=first_id)=={'FINISHED'}
 assert module.active_clip(bpy.context).identity==first_id
 assert bpy.ops.eiem.shape_animation(remove=True)=={'FINISHED'}
@@ -161,9 +161,6 @@ assert bone_rows[0]['id']==mixed_id and decoded['skeleton']=='skel_fixture'
 assert decoded['tracks'][0]['path']=='WeaponRoot/FxAnchor' and len(decoded['tracks'][0]['samples'])==31
 shape_rows=module.export_clips(obj,addon)
 assert shape_rows[0]['id']==bone_rows[0]['id'] and shape_rows[0]['duration']==bone_rows[0]['duration']
-module.validate_export_members([obj],[rig])
-try:module.validate_export_members([obj]);raise AssertionError('Missing unified Armature member accepted')
-except ValueError:pass
 old_rig_action=rig.animation_data.action;old_rig_slot=rig.animation_data.action_slot
 assert bpy.ops.eiem.animation_preview()=={'FINISHED'}
 assert rig.animation_data.action!=old_rig_action and rig.animation_data.action_slot.target_id_type=='OBJECT'
@@ -172,6 +169,6 @@ assert rig.animation_data.action==old_rig_action and rig.animation_data.action_s
 module.remove_group(mixed_id)
 assert not obj.data.eiem_shape_animations and not rig.eiem_bone_animations
 print('PASS mixed animation group: Shape Key and authored Skeleton Action share identity, settings, sample timeline, export and preview restoration')
-print('PASS multi-mesh group: atomic creation, separate KEY slots, shared playback settings, membership, complete-export validation, synchronized preview and restoration')
+print('PASS multi-mesh group: atomic creation, separate KEY slots, shared playback settings, membership, scoped export, synchronized preview and restoration')
 print('PASS unified animation manager without active mesh, per-member inline Action/channel editing and multiple groups sharing one mesh/channel')
 addon.unregister()

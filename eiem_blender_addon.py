@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 50, 7),
+    "version": (0, 50, 36),
     "blender": (5, 2, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
@@ -416,7 +416,7 @@ read_mesh = format_io.read_mesh
 read_skeleton = format_io.read_skeleton
 validate_skeleton_nodes = format_io.validate_skeleton_nodes
 
-def load_material(root, section, values, textures=None):
+def load_material(root, section, values, textures=None, material_import=None):
     # Material names and INI sections are local to their source package. Two
     # imported Mods can legitimately contain ``MaterialBody``; reusing the
     # global Blender name used to overwrite the first Mod's material silently.
@@ -442,7 +442,7 @@ def load_material(root, section, values, textures=None):
     texture_bindings = {}
     for key in ordered_keys:
         value = values[key]
-        if key in ("path", "target.path", "target.asset", "overrides"):
+        if key in ("path", "target.path", "target.asset", "overrides", "_native_bindings"):
             continue
         if key.startswith("texture.") and textures and value in textures:
             texture_bindings[key] = str(textures[value].get("eiem_section", value))
@@ -463,7 +463,7 @@ def load_material(root, section, values, textures=None):
     # clones the original game material for every property left untouched.
     baseline = {
         key: str(value) for key, value in values.items()
-        if key not in ("path", "target.path", "target.asset", "overrides")
+        if key not in ("path", "target.path", "target.asset", "overrides", "_native_bindings")
     }
     for key, value in texture_bindings.items():
         baseline[key] = value
@@ -471,6 +471,13 @@ def load_material(root, section, values, textures=None):
         baseline = {"source": values.get("source", "")}  # file is already an authored delta, not a game snapshot
     material["eiem_baseline_json"] = json.dumps(
         baseline, sort_keys=True, separators=(",", ":"))
+    if values.get('_native_bindings'):
+        material['eff_material_import'] = values['_native_bindings']
+    elif (Path(root) / 'source/manifest.json').is_file():
+        from .eiem_effect_scene_material import Import
+        material_import = material_import or Import()
+        if material_import.available(root):
+            material_import.capture(material)
     return material
 
 
@@ -526,12 +533,14 @@ def import_material_file(path, obj):
             image["eiem_native_resource_path"] = texture_values.get("path", "")
             image["eiem_source"] = texture_values.get("source", "")
             image["eiem_name"] = texture_values.get("name", disk.stem)
-            image["eiem_target_path"] = texture_values.get("target.path", "")
-            image["eiem_target_asset"] = texture_values.get("target.asset", "")
+            image["eiem_target_path"] = texture_values.get("source.path") or texture_values.get("target.path", "")
+            image["eiem_target_asset"] = texture_values.get("source.asset") or texture_values.get("target.asset", "")
             for key, default in (("linear", "false"), ("mipmaps", "true"), ("filter", "1"),
                                  ("wrap", "0"), ("aniso", "1"), ("mip_bias", "0")):
+                if key == "linear" and kind == "format3" and key not in texture_values:
+                    continue  # An omitted override inherits its logical template.
                 image["eiem_" + key] = texture_values.get(key, default)
-            image.colorspace_settings.name = "Non-Color" if image["eiem_linear"].lower() == "true" else "sRGB"
+            image.colorspace_settings.name = "Non-Color" if image.get("eiem_linear", "false").lower() in ("true", "1") else "sRGB"
             images[texture_id] = image
         used_sections = {str(m.get("eiem_section", m.name)).lower() for m in bpy.data.materials}
         used_sections.update(m.name.lower() for m in bpy.data.materials)
@@ -1197,6 +1206,10 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
     if kind == "unknown":
         raise ValueError("目录既不是 AnimeStudio EFFSOURCE 解包包，也不是 Format 3 运行时 Mod。")
     is_source_package = kind == "source"
+    if not is_source_package:
+        modules, _ = native_export.pack_modules()
+        from importlib import import_module
+        parser = import_module(modules['author_format3'].__package__ + '.effect_assembly').expand(root, parser)
     resources = {section: dict(parser.items(section)) for section in parser.sections()}
     control_state = None
     if not is_source_package and parser.get("Mod", "controls", fallback="") == "ini":
@@ -1285,24 +1298,31 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
         image["eiem_native_resource_path"] = values.get("path", "")
         image["eiem_source"] = values.get("source", "")
         image["eiem_name"] = values.get("name", image.name)
-        image["eiem_target_path"] = values.get("target.path", values.get("source.path", ""))
-        image["eiem_target_asset"] = values.get("target.asset", values.get("source.asset", ""))
-        image["eiem_linear"] = values.get("linear", "false")
+        image["eiem_target_path"] = values.get("source.path") or values.get("target.path", "")
+        image["eiem_target_asset"] = values.get("source.asset") or values.get("target.asset", "")
+        if is_source_package or "linear" in values:
+            image["eiem_linear"] = values.get("linear", "false")
         image["eiem_mipmaps"] = values.get("mipmaps", "true")
         image["eiem_filter"] = values.get("filter", "1")
         image["eiem_wrap"] = values.get("wrap", "0")
         image["eiem_aniso"] = values.get("aniso", "1")
         image["eiem_mip_bias"] = values.get("mip_bias", "0")
-        image.colorspace_settings.name = "Non-Color" if image["eiem_linear"].lower() == "true" else "sRGB"
+        image.colorspace_settings.name = "Non-Color" if image.get("eiem_linear", "false").lower() in ("true", "1") else "sRGB"
         textures[section] = image
     materials = {}
+    from .eiem_effect_scene_material import Import
+    material_import = Import()
     for section, values in resources.items():
         if section.lower().startswith("material") and values.get("path"):
             material_values = format_io.read_package_material(root, section, values, kind)
-            for key, texture_id in material_values.items():
+            for key, texture_id in list(material_values.items()):
                 if key.startswith("texture.") and texture_id not in textures:
+                    declaration = resources.get(texture_id, {})
+                    if declaration.get('source.path') and not declaration.get('dds'):
+                        material_values[key] = declaration['source.path']
+                        continue
                     raise ValueError("Material references a missing Texture: " + texture_id)
-            material = load_material(root, section, material_values, textures)
+            material = load_material(root, section, material_values, textures, material_import)
             material["eiem_material_file"] = values["path"]
             materials[section] = material
     # A Format 3 Mod stores Mesh bindings independently from the shared
@@ -1327,6 +1347,8 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
             skeleton_payloads[section] = payload
     meshes = {}
     mesh_payloads = {}
+    rendered_meshes = {v.get('mesh') for s, v in resources.items()
+                       if s.lower().startswith(('render', 'part')) and v.get('mesh')}
     for section, values in resources.items():
         if not section.lower().startswith("mesh") or not values.get("path"):
             continue
@@ -1349,6 +1371,11 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
         obj["eiem_author_package"] = str(Path(root).resolve())
         obj["eiem_import_id"] = import_id
         mesh_resource_collection(mesh_collection, section, payload).objects.link(obj)
+        if effect_attachments and section not in rendered_meshes:
+            # An effect's reusable Mesh is an asset, not an extra scene model.
+            # The effect author restores its editable particle template below.
+            obj.hide_render = True
+            obj.hide_set(True)
         meshes[section] = obj
         mesh_payloads[section] = payload
         # Keep the source palette available for a lossless round trip. Vertex
@@ -1539,11 +1566,25 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
         }
         part_meshes = {section: meshes.get(values.get("mesh", ""))
                        for section, values in resources.items() if section.startswith("Part")}
+        mount_cache={}
         for section, values, author_id in effect_attachments:
             author_values = resources[author_id]
             workspace, attachment, _source = format_io.materialize_format3_effect_author_resource(
                 safe_path(root, author_values["path"]), author_id, author_values["path"], cache_root)
+            from . import eiem_effect_author_resources
+            from .eiem_effect_scene_material import migrate_origins
+            migrate_origins(effect_editor.document.Editor(workspace))
+            eiem_effect_author_resources.overlay_resources(workspace, root, parser)
             attachment = format_io.format3_effect_attachment(section, values, attachment)
+            if control_state and values.get('hierarchy'):
+                graph=dict(control_state['hierarchies'][values['hierarchy']])
+                graph['animations']=(attachment.get('authorHierarchy') or {}).get('animations',[])
+                for clip in graph['animations']:
+                    live=control_state['animations'].get(clip['id'])
+                    if live:
+                        for field in ('label','duration','speed','speedVariable','loop','autoplay','key'):clip[field]=live[field]
+                        clip['sample_rate']=live['sampleRate']
+                attachment['authorHierarchy']=graph;attachment['mountNode']=values['node']
             # Keep the source attachment identity when it is not already in
             # this Blender scene. It makes an export/import cycle content
             # stable while still avoiding collisions when importing a copy.
@@ -1556,6 +1597,7 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
                 attachment, ensure_ascii=False, separators=(",", ":"))
             effect_root.name = attachment.get("label") or section
             effect_root.eff_effect.enabled = True
+            effect_root.eff_effect.all_lods = attachment.get('lodCoverage', 'all') == 'all'
             effect_root.eff_effect.build_path = ""
             effect_root.eff_effect.usage = (
                 effect_editor.REPLACE_GAME_PREFAB
@@ -1609,6 +1651,8 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
                                  if item.get("eiem_path", item.name) == bone_path), None)
                     if bone:
                         effect_root.eff_effect.bone = bone.name
+            from . import eiem_effect_mounts
+            eiem_effect_mounts.restore(effect_root,attachment,mount_cache,skeleton_collection,effect_editor.BASIS)
             effect_root.eff_effect.toggle_keys.clear()
             for key in attachment.get("keys", []):
                 effect_root.eff_effect.toggle_keys.add().key = str(key)
@@ -2709,7 +2753,7 @@ def skeleton_author_nodes(obj):
             authored_world = basis.inverted() @ bone.matrix_local @ basis
             local = source_world[bone.parent.name].inverted() @ authored_world if bone.parent else authored_world
             position, rotation, scale = local.decompose()
-            if min(scale) <= 0 or max(abs(local[r][c]-Matrix.LocRotScale(position,rotation,scale)[r][c])
+            if any(v == 0 for v in scale) or max(abs(local[r][c]-Matrix.LocRotScale(position,rotation,scale)[r][c])
                                      for r in range(4) for c in range(4)) > 1e-4:
                 raise ValueError("新增骨骼含不可表达的缩放或剪切：" + bone.name)
             p, q, s = tuple(position), (rotation.x,rotation.y,rotation.z,rotation.w), tuple(scale)
@@ -2843,7 +2887,16 @@ def canonical_texture_section(image, images_by_section):
     if owner is None or owner is image:
         images_by_section[preferred] = image
         return preferred
-    if texture_images_equal(owner, image):
+    # Identical pixels do not identify an authored Texture: two imports can
+    # use different logical templates or sampler settings for the same DDS.
+    profile_keys = ("eiem_source", "eiem_target_path", "eiem_target_asset", "eiem_linear",
+                    "eiem_mipmaps", "eiem_filter", "eiem_wrap", "eiem_aniso",
+                    "eiem_mip_bias")
+    same_profile = all(owner.get(key) == image.get(key) for key in profile_keys)
+    owner_path = image_absolute_path(owner)
+    if (same_profile and path and owner_path and
+            Path(path).is_file() and Path(owner_path).is_file() and
+            texture_images_equal(owner, image)):
         return preferred
     current = str(image.get("eiem_section", "")).strip()
     return current or unique_texture_section(identity, images_by_section)
@@ -2857,12 +2910,6 @@ def texture_output_filename(image):
     if not stem:
         raise ValueError("Texture image has no usable filename: " + image.name)
     return stem + ".png"
-
-
-def texture_property_uses_linear_data(property_name):
-    """Return whether a shader property stores vector data rather than colour."""
-    name = str(property_name).lower()
-    return "bump" in name or "normal" in name
 
 
 def native_texture_family(section):
@@ -2908,7 +2955,6 @@ def resolve_material_texture(material, property_name, value, images_by_section,
     section = unique_texture_section(requested, images_by_section)
     template = images_by_section.get(original_bindings.get(property_name, ""))
     defaults = {
-        "eiem_linear": "true" if texture_property_uses_linear_data(property_name) else "false",
         "eiem_mipmaps": "true",
         "eiem_filter": "1", "eiem_wrap": "0", "eiem_aniso": "1",
         "eiem_mip_bias": "0",
@@ -2919,12 +2965,10 @@ def resolve_material_texture(material, property_name, value, images_by_section,
     image["eiem_name"] = requested.stem
     image["eiem_target_path"] = ""
     image["eiem_target_asset"] = ""
+    if template and "eiem_linear" in template:
+        image["eiem_linear"] = template["eiem_linear"]
     for key, default in defaults.items():
-        # Imported legacy packages did not record Texture2D.linear.  In
-        # particular they report a native bump map as false by default, which
-        # must not make a newly assigned normal map use sRGB sampling.
-        image[key] = (default if key == "eiem_linear" else
-                      template.get(key, default) if template else default)
+        image[key] = template.get(key, default) if template else default
     images_by_section[section] = image
     original_bindings[property_name] = section
     return section
@@ -2942,19 +2986,47 @@ def _validated_mod_folder_name(value):
     return name
 
 
+def default_export_mod_name(context=None):
+    """A useful folder name without requiring an extra text-entry step."""
+    context = context or bpy.context
+    saved = str(bpy.data.filepath or '')
+    root = effect_editor.root_of(getattr(context, 'object', None))
+    name = Path(saved).stem if saved else (root.name if root else 'EFF_Mod')
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(' .')
+    if name.upper() in {'CON', 'PRN', 'AUX', 'NUL'} or re.fullmatch(r'(COM|LPT)[1-9]', name.upper()):
+        name = 'EFF_' + name
+    return name or 'EFF_Mod'
+
+
+def selected_export_mod_directory(directory, filepath=None):
+    """Accept both entering a Mod folder and selecting it from its parent."""
+    selected = Path(directory).expanduser().resolve()
+    if (selected / 'mod.ini').is_file():
+        return selected
+    if filepath:
+        chosen = Path(bpy.path.abspath(os.path.expandvars(str(filepath)))).expanduser().resolve()
+        if chosen.parent == selected and (chosen / 'mod.ini').is_file():
+            return chosen
+    return None
+
+
 def mod_export_directory(directory, filepath=None, mod_name=None):
     """Resolve the package root from the export dialog.
 
-    ``mod_name`` is the explicit UI value and takes precedence over Blender's
-    filename field. The legacy filename fallback remains for direct callers
-    and older scripts; new exports therefore never depend on a typed filename.
+    An existing selected Mod is the destination itself. Otherwise an explicit
+    or generated name creates a child of the selected parent directory.
+    The legacy filename fallback remains for callers omitting ``mod_name``.
     """
     raw_filepath = str(filepath or "").strip()
     selected = Path(
         directory or (os.path.dirname(raw_filepath) if raw_filepath else "")
         or os.getcwd()).expanduser().resolve()
     if mod_name is not None:
-        return (selected / _validated_mod_folder_name(mod_name)).resolve()
+        existing = selected_export_mod_directory(selected, raw_filepath)
+        if existing:
+            return existing
+        return (selected / _validated_mod_folder_name(
+            str(mod_name or '').strip() or default_export_mod_name())).resolve()
     if not raw_filepath:
         return selected
     candidate = Path(bpy.path.abspath(os.path.expandvars(raw_filepath))).expanduser().resolve()
@@ -3003,7 +3075,7 @@ def selected_eiem_resources(context=None,allow_empty=False):
 def selected_export_resources(context=None):
     context=context or bpy.context
     meshes,rigs=selected_eiem_resources(context,allow_empty=True)
-    effects=effect_editor.export_roots(context.selected_objects,meshes,sys.modules[__name__])
+    effects=effect_editor.export_selections(context.selected_objects,meshes,sys.modules[__name__])
     physics = selected_eiem_physics(context)
     if not meshes:
         if physics:
@@ -3091,9 +3163,6 @@ def material_override_payload(material, images_by_section, force=False):
                 else:
                     changed = value != original and not import_alias
             if changed:
-                if (current_image is not None and
-                        texture_property_uses_linear_data(property_name)):
-                    current_image["eiem_linear"] = "true"
                 referenced_images.add(value)
         else:
             # Version 0.3.x scenes do not carry a baseline. Preserve their
@@ -3124,6 +3193,8 @@ def material_override_payload(material, images_by_section, force=False):
     if shader:
         values.append("shader=" + shader)
     values.extend("%s=%s" % item for item in overrides)
+    if material.get('eff_material_import'):
+        values.append(';EFF_MATERIAL_IMPORT=' + material['eff_material_import'])
     return values, referenced_images
 
 
@@ -4285,17 +4356,19 @@ def draw_update_status(layout):
         layout.prop(prefs, 'update_channel', text='更新来源')
     row = layout.row(align=True)
     row.enabled = (_update_state["status"] not in ('checking', 'downloading', 'prepared') and
+                   _update_install_state.get('status') not in ('prepared', 'waitingForBlenderExit') and
                    _shared_tools_check_state['status'] != 'checking')
     row.operator("eiem.check_update", text="检查更新", icon="FILE_REFRESH")
     status = _update_state["status"]
     if status == "checking":
         layout.label(text="正在检查更新…")
     elif status == "latest":
-        layout.label(text="已是最新版本")
+        layout.label(text=_update_state.get('message') or "已是最新版本")
     elif status == "available":
         layout.label(text=_update_state.get('label') or "发现新版本 " + _update_state["tag"])
         row = layout.row(align=True)
-        if _update_state.get('channel') == 'MAIN':
+        if (_update_state.get('channel') == 'MAIN' and
+                _update_install_state.get('status') not in ('prepared', 'waitingForBlenderExit')):
             row.operator('eiem.install_update', text='下载并准备更新', icon='IMPORT')
         row.operator("eiem.open_update_release", text='查看更改', icon="URL")
     elif status == "ignored":
@@ -4303,12 +4376,36 @@ def draw_update_status(layout):
         layout.operator("eiem.check_update", text="仍要查看此版本").force = True
     elif status == "error":
         layout.label(text="更新失败：" + _update_state["message"], icon="ERROR")
+    elif status == 'unknown':
+        layout.label(text=_update_state.get('message') or '无法确认更新版本，已停止自动更新', icon='ERROR')
     elif status == 'downloading':
         layout.label(text=_update_state.get('message') or '正在下载并校验更新包…')
-    elif status == 'prepared':
+    elif status == 'prepared' and not _update_install_state:
         layout.label(text='更新已校验，保存工程后关闭全部 Blender')
         layout.label(text='关闭后自动安装并备份，下次启动生效')
+    draw_update_install_status(layout)
     draw_shared_tools_update_status(layout)
+
+
+def draw_update_install_status(layout):
+    state = _update_install_state
+    if not state:
+        return
+    box = layout.box()
+    status = state.get('status')
+    icon = ('ERROR' if status in ('failed', 'unknown') else
+            'TIME' if status in ('prepared', 'waitingForBlenderExit') else
+            'CHECKMARK' if status == 'installed' else 'INFO')
+    box.label(text=state.get('message', ''), icon=icon)
+    if status == 'waitingForBlenderExit':
+        pids = state.get('waitingPids', [])
+        for start in range(0, len(pids), 8):
+            box.label(text='仍在运行的 Blender PID：' + ', '.join(map(str, pids[start:start + 8])))
+        if not pids:
+            box.label(text='旧任务未记录 PID，或助手正在完成退出检查；详情见日志')
+    if state.get('log'):
+        box.label(text='日志：' + state['log'])
+        box.operator('wm.path_open', text='打开更新日志目录', icon='FILE_FOLDER').filepath = str(Path(state['log']).parent)
 
 
 def draw_shared_tools_update_status(layout, include_path=False):
@@ -4487,6 +4584,8 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
         # Only quick update (EXEC_DEFAULT) supplies an exact package root.
         # A normal picker must also clear overrides remembered by older sessions.
         self.package_directory = ''
+        if not context.scene.eiem_export_mod_name.strip():
+            context.scene.eiem_export_mod_name = default_export_mod_name(context)
         try:
             meshes, _, effects, physics = selected_export_resources(context)
             levels = self._lod_levels(meshes)
@@ -4494,16 +4593,34 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
             self.scope_message += " / LOD: " + (
                 ",".join(str(level) for level in levels) or "无")
             self.scope_message += ' / %d 个特效'%len(effects)
+            scoped=sum(len(s.emitters) for s in effects if s.emitters is not None)
+            if scoped:self.scope_message += '（指定 %d 个发射器及其依赖）'%scoped
         except ValueError as error:
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
         previous=getattr(context.scene,'eiem_export_last_directory','')
         if previous and not self.filepath:self.filepath=previous
+        self.check(context)
         return ExportHelper.invoke(self, context, event)
+
+    def check(self, context):
+        """Keep the name in step with a Mod entered in the file picker."""
+        directory = self.directory or os.path.dirname(self.filepath)
+        if directory:
+            existing = selected_export_mod_directory(bpy.path.abspath(directory), self.filepath)
+            if existing and context.scene.eiem_export_mod_name != existing.name:
+                context.scene.eiem_export_mod_name = existing.name
+                return True
+        return False
 
     def draw(self, context):
         self.layout.label(text=self.scope_message)
-        self.layout.prop(context.scene, "eiem_export_mod_name", text='Mod 文件夹名')
+        directory = self.directory or os.path.dirname(self.filepath)
+        existing = directory and selected_export_mod_directory(bpy.path.abspath(directory), self.filepath)
+        name_row = self.layout.row()
+        name_row.enabled = not existing
+        name_row.prop(context.scene, "eiem_export_mod_name", text='Mod 文件夹名')
+        self.layout.label(text='更新所选 Mod 目录' if existing else '名称留空时自动生成')
         self.layout.prop(context.scene, "eiem_source_baseline", text='原生来源目录')
         self.layout.prop(self, "include_switches")
         draw_lod_options(self.layout, self)
@@ -4531,6 +4648,7 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
 
     def _finish(self,context,stats):
         context.scene.eiem_export_last_directory=self._destination
+        context.scene.eiem_export_mod_name=Path(self._destination).name
         self.report({'INFO'},'已导出 %d 个 Mesh、%d 个材质、%d 张贴图、%d 个特效（%.2f 秒）'%(
             stats['meshes'],stats['materials'],stats['textures'],stats.get('effects',0),stats['exportSeconds']))
 
@@ -4558,11 +4676,35 @@ class EFF_OT_export_update(bpy.types.Operator):
 
 
 _update_state = {"status": "idle", "tag": "", "url": "", "message": ""}
+_update_install_state = {}
 _update_worker = None
 _shared_tools_state = {'status': 'idle', 'message': ''}
 _shared_tools_worker = None
 _shared_tools_check_state = {'status': 'idle', 'message': ''}
 _shared_tools_check_worker = None
+
+
+def _poll_update_install_status():
+    remembered = (_update_state.get('job') if _update_state['status'] == 'prepared' else
+                  _update_install_state.get('job'))
+    state = release_check.read_install_status(Path(__file__).resolve().parent, remembered)
+    changed = state != _update_install_state
+    _update_install_state.clear()
+    _update_install_state.update(state)
+    pending = state.get('status') in ('prepared', 'waitingForBlenderExit')
+    if not pending and _update_state['status'] == 'prepared':
+        _update_state.update(status='idle', message='', job='')
+    if changed:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                area.tag_redraw()
+    return 1.0 if pending else None
+
+
+def _resume_update_install_monitor():
+    if not bpy.app.timers.is_registered(_poll_update_install_status):
+        if _poll_update_install_status() is not None:
+            bpy.app.timers.register(_poll_update_install_status, first_interval=1.0, persistent=True)
 
 
 def _addon_preferences(context):
@@ -4666,7 +4808,8 @@ class EFF_OT_check_update(bpy.types.Operator):
         global _update_worker, _shared_tools_check_worker
         if ((_update_worker and _update_worker.is_alive()) or
                 (_shared_tools_check_worker and _shared_tools_check_worker.is_alive()) or
-                (_shared_tools_worker and _shared_tools_worker.is_alive())):
+                (_shared_tools_worker and _shared_tools_worker.is_alive()) or
+                _update_install_state.get('status') in ('prepared', 'waitingForBlenderExit')):
             return {'CANCELLED'}
         prefs = _addon_preferences(context)
         ignored = prefs.ignored_release_tag if prefs else ""
@@ -4682,7 +4825,7 @@ class EFF_OT_check_update(bpy.types.Operator):
                           if channel == 'MAIN' else release_check.check_release(bl_info['version'], ignored, force))
                 if channel == 'RELEASE':
                     result['channel'] = 'RELEASE'
-                _update_state.update(result, message="")
+                _update_state.update(result)
             except Exception as error:
                 _update_state.update(status="error", message=str(error)[:120])
 
@@ -4719,7 +4862,8 @@ class EFF_OT_install_update(bpy.types.Operator):
 
     def execute(self, context):
         global _update_worker
-        if _update_state['status'] != 'available' or _update_state.get('channel') != 'MAIN':
+        if (_update_state['status'] != 'available' or _update_state.get('channel') != 'MAIN' or
+                _update_install_state.get('status') in ('prepared', 'waitingForBlenderExit')):
             return {'CANCELLED'}
         directory = Path(__file__).absolute().parent
         try:
@@ -4733,6 +4877,7 @@ class EFF_OT_install_update(bpy.types.Operator):
         _update_state.update(status='downloading', message='正在下载并校验更新包…')
 
         def work():
+            job = None
             try:
                 def progress(done, total):
                     _update_state['message'] = '下载更新 %.1f / %.1f MB' % (done / 1048576, total / 1048576)
@@ -4743,6 +4888,16 @@ class EFF_OT_install_update(bpy.types.Operator):
                                      creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), close_fds=True)
                 _update_state.update(status='prepared', message='', job=str(job))
             except Exception as error:
+                if job is not None:
+                    try:
+                        failed = json.loads(job.read_text('utf-8-sig'))
+                        failed.update(status='failed', error=str(error))
+                        release_check.save_install_job(job, failed)
+                        with (job.parent / 'install.log').open('a', encoding='utf-8') as log:
+                            log.write('Could not start update helper: ' + str(error) + '\n')
+                    except (OSError, ValueError):
+                        pass
+                    _update_state['job'] = str(job)
                 _update_state.update(status='error', message=str(error)[:180])
         _update_worker = threading.Thread(target=work, name='EFF update download', daemon=True)
         _update_worker.start()
@@ -4750,7 +4905,12 @@ class EFF_OT_install_update(bpy.types.Operator):
             for window in bpy.context.window_manager.windows:
                 for area in window.screen.areas:
                     area.tag_redraw()
-            return 0.25 if _update_state['status'] == 'downloading' else None
+            if _update_state['status'] == 'downloading':
+                return 0.25
+            if _update_state.get('job'):
+                _update_install_state.clear()
+                _resume_update_install_monitor()
+            return None
         bpy.app.timers.register(redraw, first_interval=0.1)
         return {'FINISHED'}
 
@@ -4842,11 +5002,11 @@ def register():
     if _eiem_export_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_eiem_export_load_post)
     for cls in classes: bpy.utils.register_class(cls)
-    material_editor.register()
     shape_animation.register(sys.modules[__name__])
-    material_animation.register()
+    material_animation.register(sys.modules[__name__])
     physics_authoring.register(globals())
     effect_editor.register()
+    material_editor.register()
     bpy.types.Mesh.eiem_shape_controls = CollectionProperty(type=EFF_PG_shape_control)
     bpy.types.Object.eiem_material_switches = CollectionProperty(type=EFF_PG_material_switch)
     bpy.types.Collection.eiem_switch_state_index = IntProperty(
@@ -4859,25 +5019,29 @@ def register():
         description='包含 source/manifest.json 的解包目录；留空则使用对象导入来源')
     bpy.types.Scene.eiem_export_mod_name = StringProperty(
         name="Mod folder name", default="",
-        description="Create or refresh the selected Mod folder")
+        description="留空自动使用工程或特效名称；进入已有 Mod 目录时自动使用该目录名并更新")
     bpy.types.Scene.eiem_export_last_directory = StringProperty(
         name='上次 Mod 导出目录',subtype='DIR_PATH',options={'HIDDEN'})
     bpy.types.TOPBAR_MT_file_import.append(menu_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_export)
+    _update_install_state.clear()
+    _resume_update_install_monitor()
 
 
 def unregister():
+    if bpy.app.timers.is_registered(_poll_update_install_status):
+        bpy.app.timers.unregister(_poll_update_install_status)
     if _eiem_export_dirty_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(
             _eiem_export_dirty_depsgraph_update)
     if _eiem_export_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_eiem_export_load_post)
     _eiem_export_load_post(None)
+    material_editor.unregister()
     effect_editor.unregister()
     physics_authoring.unregister()
     shape_animation.unregister()
     material_animation.unregister()
-    material_editor.unregister()
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_export)
     del bpy.types.Scene.eiem_switch_active

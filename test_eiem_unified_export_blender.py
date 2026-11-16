@@ -38,7 +38,8 @@ def hashes(destination):
 
 target=output/'effects-only'
 select(first,second,emitter)
-meshes,rigs,roots=addon.selected_export_resources()
+meshes,rigs,selections,_=addon.selected_export_resources()
+roots=fx.export_roots(selections)
 assert not meshes and len(roots)==2
 addon.plan_mesh_only_export=lambda *a,**k:(_ for _ in ()).throw(AssertionError('effect-only touched geometry planning'))
 real_native=addon.native_export.export_native_package
@@ -102,14 +103,15 @@ assert len(ini_reader.read_package(empty)['effects'])==2
 # Explicitly selecting a disabled attachment still selects that effect.
 second.eff_effect.enabled=False
 assert second in fx.export_roots([second])
-# The same selection resolver distinguishes resource Meshes from character
-# geometry, and includes enabled effects attached to selected character Mesh.
+# Resource Meshes and mount ownership never imply effect selection.
 particle=emitter.eff_effect.particle_mesh
-select(particle)
-assert addon.selected_export_resources()[2]==[second]
+assert fx.export_selections([particle])==[]
+select(owner)
+assert addon.selected_export_resources()[2]==[]
 select(owner,second)
-meshes,rigs,roots=addon.selected_export_resources()
-assert meshes==[owner] and roots==sorted([first,second],key=lambda root:root.name)
+meshes,rigs,selections,_=addon.selected_export_resources()
+roots=fx.export_roots(selections)
+assert meshes==[owner] and roots==[second]
 addon.native_export.export_native_package=real_native
 # Restore the actual planner after the effect-only tripwire.
 tree=ast.parse(Path(addon.__file__).read_text('utf-8'))
@@ -120,7 +122,7 @@ began=time.perf_counter()
 assert bpy.ops.eiem.export_package('EXEC_DEFAULT',directory=str(output),lod_all=False,lod0=True)=={'FINISHED'}
 mixed_seconds=time.perf_counter()-began
 read=ini_reader.read_package(mixed)
-assert read['parts'] and len(read['effects'])==2 and all(e['part'] for e in read['effects'])
+assert read['parts'] and len(read['effects'])==1 and all(e['part'] for e in read['effects'])
 assert (mixed/'compiled.bin').is_file()
 # Effect-only updates are intentionally rejected for character packages.
 before_mixed=hashes(mixed);select(first)

@@ -79,9 +79,37 @@ try:
         package_directory=str(internal)) == {'FINISHED'}
     assert dialogs[-1] == '' and destinations[-1] == visible / 'petals'
     assert bpy.ops.eiem.export_package.get_rna_type().properties['package_directory'].is_skip_save
+    # A blank name must be usable without editing an extra field.
+    invoke_in_background = False
+    bpy.context.scene.eiem_export_mod_name = ''
+    assert bpy.ops.eiem.export_package('EXEC_DEFAULT', directory=str(visible)) == {'FINISHED'}
+    assert destinations[-1].parent == visible
+    assert destinations[-1].name and bpy.context.scene.eiem_export_mod_name == destinations[-1].name
+    # Entering an existing package replaces that package, even with an old
+    # remembered name. Do not create existing/old-name or existing/existing.
+    existing = output / 'chosen-existing-mod'
+    existing.mkdir(exist_ok=True)
+    (existing / 'mod.ini').write_text('[Mod]\nformat=3\nid=existing\n', encoding='utf-8')
+    bpy.context.scene.eiem_export_mod_name = 'previous-name'
+    assert bpy.ops.eiem.export_package('EXEC_DEFAULT', directory=str(existing),
+        filepath=str(existing / 'previous-name')) == {'FINISHED'}
+    assert destinations[-1] == existing
+    assert bpy.context.scene.eiem_export_mod_name == existing.name
+    invoke_in_background = True
+    bpy.context.scene.eiem_export_mod_name = 'another-old-name'
+    assert bpy.ops.eiem.export_package('INVOKE_DEFAULT', directory=str(existing),
+        filepath=str(existing / 'another-old-name')) == {'FINISHED'}
+    assert destinations[-1] == existing and bpy.context.scene.eiem_export_mod_name == existing.name
+    # Selecting the directory in its parent (without entering it) is the same
+    # operation; Blender then reports the child as filepath.
+    bpy.context.scene.eiem_export_mod_name = 'stale-name'
+    assert bpy.ops.eiem.export_package('INVOKE_DEFAULT', directory=str(output),
+        filepath=str(existing)) == {'FINISHED'}
+    assert destinations[-1] == existing and bpy.context.scene.eiem_export_mod_name == existing.name
     report = dict(passed=True, normalDialogUsesVisibleDestination=True,
         legacyRememberedOverrideCleared=True, quickExactDestinationPreserved=True,
-        overrideDoesNotPersist=True)
+        overrideDoesNotPersist=True, blankNameGetsDefault=True,
+        selectedExistingModReplacesItself=True)
     (output / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     print('PASS EXPORT DESTINATION ' + json.dumps(report), flush=True)
 finally:

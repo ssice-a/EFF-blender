@@ -3,6 +3,7 @@ import json
 import math
 import re
 import importlib.util
+from functools import lru_cache
 from pathlib import Path
 
 import bpy
@@ -121,6 +122,12 @@ def _get(row):
 
 
 def _put(row, value):
+    if row.key.startswith('eiem_float.') and features.set_uv_angle(
+            row.id_data, features.property_name(row.key), value):
+        return
+    if row.key.startswith('eiem_float.') and features.set_uv_source(
+            row.id_data, features.property_name(row.key), value):
+        return
     if (row.key.startswith('eiem_float.') and property_kind(row.key, value) == 'BOOL'
             and features.profile(row.id_data)):
         features.set_switch(row.id_data, features.property_name(row.key), enabled(value))
@@ -225,7 +232,10 @@ def _get_blend_brightness(material):
 
 def _set_blend_brightness(material, value):
     """Adjust the multiplier without changing picker RGB or native alpha."""
-    target = max(0.0, min(64.0, float(value)))
+    target = float(value)
+    if not math.isfinite(target):
+        raise ValueError('HDR 亮度必须为有限数值')
+    target = max(0.0, target)
     rgb, _ = _blend_tint_state(material)
     _write_blend_tint(material, rgb, _blend_tint_values(material)[3], target)
 
@@ -241,8 +251,8 @@ _CHOICES = {
                ('LEQUAL', '小于等于', '', 4), ('GREATER', '大于', '', 5), ('NEQUAL', '不等于', '', 6),
                ('GEQUAL', '大于等于', '', 7), ('ALWAYS', '总是通过', '', 8)),
 }
-
-
+for _uv_fields in features.VFX_UV.values():
+    _CHOICES[_uv_fields[0]] = features.UV_SET_ITEMS
 def _choices(row, context):
     return _CHOICES.get(features.property_name(row.key), ())
 
@@ -281,9 +291,6 @@ class EFF_PG_material_value(bpy.types.PropertyGroup):
                                get=_get_color, set=_set_color,
                                description='颜色范围为 0–1；混合图颜色与其 HDR 亮度独立，调色保留亮度倍率；其他 HDR 原值可在“原始参数”编辑')
     text: StringProperty(get=lambda s: str(_get(s)), set=_put)
-    uv_expanded: BoolProperty()
-
-
 class EFF_PG_material_feature(bpy.types.PropertyGroup):
     key: StringProperty()
     enabled: BoolProperty(get=_get_enabled, set=_set_enabled,
@@ -292,8 +299,8 @@ class EFF_PG_material_feature(bpy.types.PropertyGroup):
 
 class EFF_PG_material_group(bpy.types.PropertyGroup):
     name: StringProperty()
-    expanded: BoolProperty(default=False)
-    details_expanded: BoolProperty(default=False)
+    expanded: BoolProperty(default=False, options=set())
+    details_expanded: BoolProperty(default=False, options=set())
 
 
 def _row(material, key):
@@ -307,8 +314,13 @@ def _row(material, key):
     return row
 
 
-def _schema(material):
-    keys = [key for key in material.keys()
+@lru_cache(maxsize=128)
+def _structure(material_keys, shader):
+    # Cache strings/classification only, never RNA handles or parameter values.
+    # External imports, undo and profile/key changes naturally change this key.
+    material = dict.fromkeys(material_keys, '')
+    material['eiem_shader'] = shader
+    keys = [key for key in material_keys
             if key.startswith(_PARAMETER_PREFIXES + _TEXTURE_PREFIXES)
             or key == 'eiem_render_queue' or key in _INFO_KEYS]
     keys = list(dict.fromkeys(keys + ['eiem_render_queue']))
@@ -317,9 +329,28 @@ def _schema(material):
     keys = list(dict.fromkeys(keys + ['eiem_texture.' + slot for slot in texture_slots(material)]))
     groups = {group_for(key) for key in keys
               if key.startswith(_PARAMETER_PREFIXES) or key == 'eiem_render_queue'}
-    groups.update(item['key'] for item in features.features(material))
+    items = features.features(material)
+    groups.update(item['key'] for item in items)
     groups.update(('surface', 'extras', 'render'))
-    return keys, groups
+    parameter_keys = tuple(key for key in material_keys if key.startswith(_PARAMETER_PREFIXES))
+    ownership = {key: features.owner(material, key, items) for key in parameter_keys}
+    by_owner = {}
+    for key, owner in ownership.items():
+        if owner is not None:
+            by_owner.setdefault(owner, []).append(key)
+    ownership['_parameter_keys'] = parameter_keys
+    ownership['_keys_by_owner'] = by_owner
+    ownership.update({key: features.owner(material, key, items)
+                      for key in ('eiem_texture.' + slot for slot in texture_slots(material))})
+    return tuple(keys), frozenset(groups), items, ownership
+
+
+def _material_structure(material):
+    return _structure(tuple(material.keys()), str(material.get('eiem_shader', '')))
+
+
+def _schema(material):
+    return _material_structure(material)[:2]
 
 
 def _prepare_material(material):
@@ -330,8 +361,14 @@ def _prepare_material(material):
             if not collection[index].name:
                 collection.remove(index)
     keys, groups = _schema(material)
+    rows = {row.name: row for row in material.eiem_editor_values}
     for key in keys:
-        _row(material, key)
+        row = rows.get(key)
+        if row is None:
+            row = material.eiem_editor_values.add()
+            row.name = key
+        if row.key != key:
+            row.key = key
     for item in features.features(material):
         if material.eiem_editor_features.get(item['key']) is None:
             state = material.eiem_editor_features.add()
@@ -360,10 +397,13 @@ def _prepare_pending():
 
 
 def _controls_ready(material):
-    keys, groups = _schema(material)
-    if (all((row := material.eiem_editor_values.get(key)) is not None and row.key == key for key in keys)
-            and all(material.eiem_editor_groups.get(group) is not None for group in groups)
-            and all(material.eiem_editor_features.get(item['key']) is not None for item in features.features(material))):
+    keys, groups, items, _ = _material_structure(material)
+    rows = {row.name: row.key for row in material.eiem_editor_values}
+    group_names = {row.name for row in material.eiem_editor_groups}
+    feature_names = {row.name for row in material.eiem_editor_features}
+    if (all(rows.get(key) == key for key in keys)
+            and groups.issubset(group_names)
+            and all(item['key'] in feature_names for item in items)):
         return True
     _PENDING_MATERIALS[material.as_pointer()] = material
     if not bpy.app.timers.is_registered(_prepare_pending):
@@ -393,7 +433,8 @@ def draw_value(layout, material, key, simple=False):
     name = features.property_name(key)
     if simple and name in _CHOICES:
         field = 'choice'
-    elif simple and name in ('_BaseMapUVSpeed', '_EmissionMapUVSpeed', '_MainTexUVSpeed', '_BlendTexUVSpeed', '_MaskTexUVSpeed'):
+    elif simple and name in ('_BaseMapUVSpeed', '_EmissionMapUVSpeed',
+                            *(row[1] for row in features.VFX_UV.values())):
         field = 'uv_speed'
     label = features.label(key) if simple else name or '渲染队列'
     _value_layout(layout, label).prop(row, field, text='')
@@ -525,34 +566,22 @@ def _matches(material, key):
 
 def _draw_texture(layout, material, slot):
     key = 'eiem_texture.' + slot
-    if not _matches(material, key):
+    uv_controls = features.uv_controls(material, slot)
+    if not _matches(material, key) and not any(_matches(material, control) for control in uv_controls):
         return
     row = material.eiem_editor_values[key]
     line = _value_layout(layout, features.label(key))
     line.prop(row, 'text', text='')
-    op = line.operator('eiem.material_texture_file', text='', icon='FILE_FOLDER'); op.slot = slot; op.material_name = material.name
-    transforms = [kind + slot for kind in ('eiem_texture_scale.', 'eiem_texture_offset.') if kind + slot in material]
-    if transforms:
-        line.prop(row, 'uv_expanded', text='', icon='TRIA_DOWN' if row.uv_expanded else 'TRIA_RIGHT', emboss=False)
-        if row.uv_expanded:
-            for transform in transforms:
-                _value_layout(layout, '平铺 U/V' if 'scale.' in transform else '偏移 U/V').prop(
-                    material.eiem_editor_values[transform], 'vector2', text='')
+    op = line.operator('eiem.material_texture_file', text='', icon='FILE_FOLDER')
+    op.slot = slot
+    op.material_name = material.name
 
 
 def _draw_textures(layout, material, items):
     box = layout.box()
     box.label(text='贴图')
-    declared = texture_slots(material)
-    visible = {slot for slot in declared if str(material.get('eiem_texture.' + slot, '')).strip()}
-    visible.update(slot for item in items for slot in features.visible_slots(material, item))
-    if features.profile(material) == 'character' and '_BaseMap' in declared:
-        visible.add('_BaseMap')
-    # Keep all bound paths together, including disabled features. Enabling a
-    # feature adds its declared empty rows here instead of inside its panel.
-    for slot in declared:
-        if slot in visible:
-            _draw_texture(box, material, slot)
+    for slot in features.visible_texture_slots(material, items):
+        _draw_texture(box, material, slot)
     box.operator('eiem.material_texture_add', icon='ADD').material_name = material.name
 
 
@@ -566,6 +595,8 @@ def _draw_surface(layout, material, ownership):
         box.prop(material, 'eiem_editor_surface', text='表面模式')
         if features.surface_mode(material) == 1 and 'eiem_float._AlphaClipThreshold' in material:
             draw_value(box, material, 'eiem_float._AlphaClipThreshold', True)
+    elif features.profile(material) == 'vfx':
+        box.prop(material, 'eiem_editor_vfx_surface', text='表面混合')
     owned_keys = ownership.get('_keys_by_owner', {}).get('surface', ())
     for key in owned_keys:
         if key.startswith(_PARAMETER_PREFIXES) and ownership.get(key) == 'surface' and _matches(material, key):
@@ -598,7 +629,8 @@ def _draw_feature(layout, material, item, ownership, items, profile_name):
         box.label(text='E 图 Alpha 控制呼吸参与度；开启时联动角色 VFX')
     if item['key'] == 'main' and profile_name == 'vfx':
         box.label(text='MainTex 默认白；TintColor 是 Shader 主色，亮度与不透明度另有参数。')
-        box.label(text='MainTex UV 速度 XY 按时间、ZW 按 Custom1.X；主图 Alpha 开关独立控制。')
+        box.label(text='每层单独选择 UV0、UV1、PolarUV 或 ScreenUV；速度按游戏时间推进。')
+        box.label(text='MainTex 速度 XY 按时间、ZW 按 Custom1.X；主图 Alpha 开关独立控制。')
     if item['key'] == 'blend' and profile_name == 'vfx':
         box.label(text='BlendTex 默认黑；BlendTint 在 Shader 中标记 HDR / Gamma。')
         box.label(text='BlendTex UV 速度 XY 按时间、ZW 按 Custom1.Y。')
@@ -606,12 +638,22 @@ def _draw_feature(layout, material, item, ownership, items, profile_name):
         box.label(text='Shader 属性说明：Mask 只影响 Alpha。')
         box.label(text='静态遮罩请将 UV 速度和旋转设为 0，并关闭遮罩扰动。')
     primary = features.PRIMARY.get(item['key'], ())
+    packed_uv = set()
+    if profile_name == 'vfx':
+        for slot in item['slots']:
+            fields = features.VFX_UV.get(slot)
+            if fields:
+                packed_uv.update((fields[3], features.VFX_UV_WEIGHTS[slot]))
     keys.sort(key=lambda key: primary.index(features.property_name(key)) if features.property_name(key) in primary else len(primary))
     secondary = []
     for key in keys:
         name = features.property_name(key)
         if (name == item['switch'] or key.startswith('eiem_keyword.')
                 or (name == '_ClearCoatMask' and key.startswith('eiem_float.'))):
+            continue
+        # The selector and static-angle control write these derived GPU values.
+        # Keep direct vector editing in raw/search view instead of crowding each layer.
+        if name in packed_uv and not query:
             continue
         if item['key'] == 'pbr' and active and name in ('_Metallic', '_Specular', '_Smoothness'):
             continue
@@ -621,6 +663,11 @@ def _draw_feature(layout, material, item, ownership, items, profile_name):
                 if item['key'] == 'blend' and profile_name == 'vfx' and name == '_BlendTint':
                     box.prop(material, 'eiem_blend_brightness', text='混合图亮度 (HDR)')
             else:
+                secondary.append(key)
+    for slot in item['slots']:
+        for suffix in ('texture_scale.', 'texture_offset.'):
+            key = 'eiem_' + suffix + slot
+            if key in material and _matches(material, key):
                 secondary.append(key)
     for child in items:
         if child['parent'] == item['key']:
@@ -679,19 +726,8 @@ def draw(layout, material):
             layout.label(text='此 Shader 使用原始参数编辑，保留来源功能')
         _draw_raw(layout, material)
     else:
-        items = features.features(material)
+        _, _, items, ownership = _material_structure(material)
         profile_name = features.profile(material)
-        parameter_keys = tuple(key for key in material.keys()
-                              if key.startswith(_PARAMETER_PREFIXES))
-        ownership = {key: features.owner(material, key, items) for key in parameter_keys}
-        keys_by_owner = {}
-        for key, owner in ownership.items():
-            if owner is not None:
-                keys_by_owner.setdefault(owner, []).append(key)
-        ownership['_parameter_keys'] = parameter_keys
-        ownership['_keys_by_owner'] = keys_by_owner
-        ownership.update({key: features.owner(material, key, items)
-                          for key in ('eiem_texture.' + slot for slot in texture_slots(material)) if key not in ownership})
         _draw_textures(layout, material, items)
         _draw_surface(layout, material, ownership)
         for item in items:
@@ -711,27 +747,35 @@ CLASSES = (EFF_PG_material_value, EFF_PG_material_feature, EFF_PG_material_group
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
-    bpy.types.Material.eiem_editor_values = CollectionProperty(type=EFF_PG_material_value)
     bpy.types.Material.eiem_editor_groups = CollectionProperty(type=EFF_PG_material_group)
     bpy.types.Material.eiem_editor_features = CollectionProperty(type=EFF_PG_material_feature)
     bpy.types.Material.eiem_editor_surface = EnumProperty(items=features.SURFACE_ITEMS,
         get=features.surface_mode, set=_set_surface, description='同步透明参数、Shader 关键字和实际渲染队列；保留贴图和深度写入')
+    bpy.types.Material.eiem_editor_vfx_surface = EnumProperty(items=features.VFX_SURFACE_ITEMS,
+        get=features.surface_mode, set=_set_surface,
+        description='编辑 Shader 原生表面类型与 Alpha/Additive 混合模式；保留深度状态')
     bpy.types.Material.eiem_editor_advanced = BoolProperty(
+        options=set(),
         description='查看全部原始字段；颜色在此以 RGBA 数值编辑，可保留 HDR 值')
     bpy.types.Material.eiem_editor_search = StringProperty()
-    bpy.types.Material.eiem_editor_uv_expanded = BoolProperty()
-    bpy.types.Material.eiem_editor_info_expanded = BoolProperty()
+    bpy.types.Material.eiem_editor_uv_expanded = BoolProperty(options=set())
+    bpy.types.Material.eiem_editor_info_expanded = BoolProperty(options=set())
     bpy.types.Material.eiem_blend_brightness = FloatProperty(
-        name='混合图亮度 (HDR)', min=0.0, max=64.0, soft_max=8.0,
+        name='混合图亮度 (HDR)', min=0.0, soft_max=8.0,
         precision=3, get=_get_blend_brightness, set=_set_blend_brightness,
         description='导出 RGB = 混合图颜色 × 此 HDR 倍率；调亮度保留颜色与 Alpha，调色保留此倍率')
+    # RNA path discovery walks preceding PropertyGroup collections. This is
+    # the large collection (hundreds of fields), so keep all small UI/animation
+    # groups before it. Otherwise every header/clip button scans every value.
+    bpy.types.Material.eiem_editor_values = CollectionProperty(type=EFF_PG_material_value)
 
 
 def unregister():
     if bpy.app.timers.is_registered(_prepare_pending):
         bpy.app.timers.unregister(_prepare_pending)
     _PENDING_MATERIALS.clear()
-    for name in ('eiem_blend_brightness','eiem_editor_advanced','eiem_editor_surface','eiem_editor_features',
+    _structure.cache_clear()
+    for name in ('eiem_blend_brightness','eiem_editor_advanced','eiem_editor_surface','eiem_editor_vfx_surface','eiem_editor_features',
                  'eiem_editor_info_expanded','eiem_editor_uv_expanded','eiem_editor_search',
                  'eiem_editor_groups','eiem_editor_values'):
         delattr(bpy.types.Material,name)

@@ -37,6 +37,39 @@ def material_object(root, identity):
                  identity in json.loads(o.get('eff_effect_components', '[]'))), None)
 
 
+def ensure_material_object(root, edit, identity, populate):
+    """Restore one root's editor from its own native values, without rebinding.
+
+    Called by explicit author operations, never panel draw. An identically
+    sourced material under another effect root owns independent author values.
+    """
+    from . import eiem_effect_material as material_bridge
+    from . import eiem_effect_preview as preview
+    spec = edit.objects.get(identity, {})
+    document.require(spec.get('classId') == 21 and identity in edit.state['values'],
+                     '当前引用没有可编辑的 Material 数据')
+    obj = material_object(root, identity)
+    created = obj is None
+    if created:
+        obj = bpy.data.objects.new(spec.get('name') or 'Effect Material', None)
+        preview._collection(root).objects.link(obj)
+        obj.parent = root
+        obj.empty_display_type = 'CUBE'
+        obj.empty_display_size = .04
+        obj['eff_effect_resource'] = True
+    try:
+        if created:populate(obj, edit, [identity])
+        setup_textures(root, edit, obj, identity)
+        material_bridge.ensure_material(root, edit, identity)
+    except Exception:
+        if created:
+            material = material_bridge.material_for(obj)
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if material and material.users == 0:bpy.data.materials.remove(material)
+        raise
+    return obj
+
+
 def source_meshes(root):
     return {o.get('eff_effect_mesh_source'): o for o in root.children_recursive
             if o.type == 'MESH' and o.get('eff_effect_mesh_source') and not o.get('eff_effect_mesh_variant')}
@@ -49,27 +82,24 @@ def material_identity(root, material):
     return None
 
 
-def renderer_material(root, edit, renderer, index=0):
+def renderer_material(root, edit, renderer, index=0, *, node=None):
     """Mesh slots are the authoring UI; Unity still binds on the Renderer."""
     from . import eiem_effect_preview as preview
-    node = next((o for o in [root] + list(root.children_recursive)
-                 if renderer in json.loads(o.get('eff_effect_components', '[]'))), None)
+    if node is None:
+        node = next((o for o in [root] + list(root.children_recursive)
+                     if renderer in json.loads(o.get('eff_effect_components', '[]'))), None)
     mesh = node.eff_effect.particle_mesh if node and edit.value(renderer).get('m_RenderMode') == 4 else None
-    if mesh and mesh.data.materials and index == 0:
-        # The current particle writer accepts one used face material. Joining
-        # geometry may leave unused slots, so follow the faces rather than slot 0.
-        used = {p.material_index for p in mesh.data.polygons}
-        slot = next(iter(used)) if len(used) == 1 else index
-        mat = mesh.material_slots[slot].material if slot < len(mesh.material_slots) else None
+    if mesh and mesh.data.materials:
+        mat = mesh.material_slots[index].material if index < len(mesh.material_slots) else None
         identity = material_identity(root, mat)
         if identity:
             return identity
     return preview._target(edit, renderer, ['m_Materials', index])
 
 
-def expand_meshes(context, root, edit):
+def expand_meshes(context, root, edit, *, incremental=False):
     """Create the editable source assets once, preserving existing user meshes."""
-    if root.get('eff_effect_assets_version', 0) >= 1:
+    if not incremental and root.get('eff_effect_assets_version', 0) >= 1:
         return
     from . import eiem_effect_preview as preview
     resources = preview._resources(root, edit)
@@ -178,10 +208,21 @@ def expand_meshes(context, root, edit):
         meshes[identity] = obj
         imported.append(obj)
     bindings = {}
+    if incremental:
+        for node in [root] + list(root.children_recursive):
+            mesh = node.eff_effect.particle_mesh
+            ids = json.loads(node.get('eff_effect_components', '[]'))
+            renderer = next((i for i in ids if i in edit.objects and edit.objects[i]['classId'] == 199), None)
+            if mesh and renderer:
+                mids = tuple(preview._target(edit, renderer, ['m_Materials', i])
+                             for i in range(len(edit.value(renderer).get('m_Materials', []))))
+                bindings[(mesh.get('eff_effect_mesh_source'), mids)] = mesh
     for node in [root] + list(root.children_recursive):
         ids = json.loads(node.get('eff_effect_components', '[]'))
         renderer = next((i for i in ids if edit.objects[i]['classId'] == 199), None)
         if not renderer or edit.value(renderer).get('m_RenderMode') != 4:
+            continue
+        if incremental and node.eff_effect.particle_mesh:
             continue
         identity = preview._target(edit, renderer, ['m_Mesh'])
         mesh = meshes.get(identity)
@@ -235,8 +276,14 @@ def mesh_fingerprint(obj):
             data = np.empty(len(collection) * width, dtype=dtype)
             collection.foreach_get(prop, data)
             digest.update(data.tobytes())
-        digest.update(b'EFF_EFFECT_MESH_FINGERPRINT_1')
-        digest.update(np.asarray(obj.matrix_basis.to_3x3(), dtype='<f4').tobytes())
+        if obj.get('eff_effect_mesh_source'):
+            # Preserve existing lossless native baselines; a display Mesh need
+            # not be regeneratable from its imported approximation.
+            digest.update(b'EFF_EFFECT_MESH_FINGERPRINT_1')
+            digest.update(np.asarray(obj.matrix_basis.to_3x3(), dtype='<f4').tobytes())
+        else:
+            digest.update(b'EFF_EFFECT_MESH_FINGERPRINT_3')
+            digest.update(np.asarray(mesh_shape_transform(obj, mesh), dtype='<f4').tobytes())
         values('positions', mesh.vertices, 'co', 3)
         values('loops', mesh.loops, 'vertex_index', 1, '<i4')
         for prop in ('loop_start', 'loop_total', 'material_index', 'use_smooth'):
@@ -354,18 +401,38 @@ def evaluated_mesh(obj, depsgraph):
     return evaluated, mesh
 
 
+def mesh_shape_transform(obj, mesh):
+    """One shape/pivot convention for the GN preview and native export.
+
+    Imported effect assets already have an intentional native-local pivot.
+    A scene Mesh chosen as a particle shape keeps its object origin. Its
+    world stretch (including parent scale/shear) belongs to the shape, while
+    placement and orientation are adopted by the emitter explicitly. This
+    leaves particle rotation in the source object's own axes.
+    Neither the source Mesh nor the emitter's author transform is changed.
+    """
+    if obj.get('eff_effect_mesh_source'):
+        return obj.matrix_basis.to_3x3().to_4x4()
+    rotation = obj.matrix_world.to_quaternion().to_matrix()
+    return (rotation.inverted() @ obj.matrix_world.to_3x3()).to_4x4()
+
+
+def mesh_placement_matrix(obj):
+    """Adopt the source origin/orientation without baking translation twice."""
+    return obj.matrix_world @ mesh_shape_transform(obj, None).inverted()
+
+
 def preview_mesh(obj):
     evaluated, mesh = evaluated_mesh(obj, bpy.context.evaluated_depsgraph_get())
     try:
         mesh.calc_loop_triangles()
-        document.require(mesh.uv_layers.active is not None, '粒子 Mesh 需要 UV 贴图坐标')
-        transform = BASIS.inverted() @ obj.matrix_basis.to_3x3()
+        transform = BASIS.inverted().to_4x4() @ mesh_shape_transform(obj, mesh)
         vertices, faces, uv = [], [], []
         for triangle in mesh.loop_triangles:
             start = len(vertices)
             for loop in triangle.loops:
                 vertices.append(transform @ mesh.vertices[mesh.loops[loop].vertex_index].co)
-                uv.append(tuple(mesh.uv_layers.active.data[loop].uv))
+                uv.append(tuple(mesh.uv_layers.active.data[loop].uv) if mesh.uv_layers.active else (0., 0.))
             # BASIS reflects handedness. Native export uses the same reversal.
             faces.append((start, start + 2, start + 1))
         return vertices, faces, uv, True
@@ -378,9 +445,6 @@ def mesh_snapshot(obj):
     evaluated, mesh = evaluated_mesh(obj, bpy.context.evaluated_depsgraph_get())
     temporary = None
     try:
-        document.require(mesh.uv_layers.active is not None, '粒子 Mesh 需要 UV 贴图坐标')
-        used = {p.material_index for p in mesh.polygons}
-        document.require(len(used) == 1, '当前每个自定义粒子 Mesh 支持一个材质；请将面指定到同一材质槽')
         baked = mesh.copy()
         for semantic,kind in (('tangent','FLOAT_VECTOR'),('tangent_sign','FLOAT')):
             name=addon.resolve_author_attribute(baked,'point',semantic,kind)
@@ -389,16 +453,14 @@ def mesh_snapshot(obj):
         # A Blender-authored UVMap is a valid UV0; normalize only this temporary
         # snapshot so the shared writer can calculate matching tangent frames.
         active=baked.uv_layers.active
-        if active.name!='UV0':
+        if active and active.name!='UV0':
             if baked.uv_layers.get('UV0'):baked.uv_layers['UV0'].name='__EFF_previous_UV0'
             active.name='UV0'
         for key in ('author_uv_slots_json','eff_uv_slots_json'):
             if key in baked:del baked[key]
         # The ordinary Mesh writer handles X reflection. Bake the remaining
         # Y-up conversion and the author's rotation/scale, excluding placement.
-        baked.transform((Matrix(((1, 0, 0), (0, 0, 1), (0, -1, 0))) @ obj.matrix_basis.to_3x3()).to_4x4())
-        for polygon in baked.polygons:
-            polygon.material_index = 0
+        baked.transform(Matrix(((1, 0, 0), (0, 0, 1), (0, -1, 0))).to_4x4() @ mesh_shape_transform(obj, mesh))
         baked['eiem_coordinate_space'] = 'unity-y-up-left-handed'
         baked.update()
         temporary = bpy.data.objects.new('__EFF_particle_export', baked)
@@ -426,6 +488,10 @@ class NativeAssets:
 
     def tree(self, identity):
         spec = self.edit.objects[identity]
+        if spec.get('gameSource'):
+            return self.reader.tree(identity)
+        if spec.get('state') == 'game-reference':
+            return self.reader.tree(identity)
         if spec.get('template'):spec = self.edit.objects[spec['template']]
         cab = spec['native']['cab']
         if cab not in self.rows:
@@ -433,11 +499,13 @@ class NativeAssets:
             self.rows[cab] = row
         return self.reader.tree(identity)
 
-    def add(self, template, label, tree):
+    def add(self, template, label, tree, **author_metadata):
+        template = self.local_template(template)
         spec = self.edit.objects[template]
         template = spec.get('template', template)
         spec = self.edit.objects[template]
         cab = spec['native']['cab']
+        _, original = self.tree(template)
         occupied = {int(row['pathId']) for row in self.rows[cab]['objects']}
         occupied.update(int(row['identity'].rsplit(':', 1)[1])
                         for row in self.edit.state.get('author_assets', [])
@@ -452,12 +520,63 @@ class NativeAssets:
             if pid and pid not in occupied:
                 break
             attempt += 1
-        _, original = self.tree(template)
         identity = cab + ':' + str(pid)
         self.additions.append(dict(identity=identity, template=template,
                                    sourceObjectSha256=document.digest(original),
-                                   payloadBase64=base64.b64encode(self.codec.encode(tree)).decode('ascii')))
+                                   payloadBase64=base64.b64encode(self.codec.encode(tree)).decode('ascii'),
+                                   **author_metadata))
         return identity
+
+    def local_template(self, identity):
+        """Borrow only a schema; author payloads belong to our native files."""
+        spec = self.edit.objects[identity]
+        if not spec.get('gameSource'):
+            return spec.get('template', identity)
+        from . import eiem_effect_resources as resource_set
+        tree, _ = self.reader.tree(identity)
+        row = dict(key='asset', classId=spec['classId'], type=spec['type'],
+                   name=spec.get('name', identity),
+                   schemaSha256=resource_set.schema_hash(self.edit, identity),
+                   schemaShapeSha256=resource_set.schema_shape_hash(self.edit, identity),
+                   value=document._native_plain(tree, encode_bytes=True))
+        return resource_set.templates(self.edit, [row], preserve_defaults=False)['asset']
+
+    def material_data(self, identity):
+        """Move edited donor parameters, retaining its game PPtrs by path."""
+        from . import eiem_effect_preview as preview
+        from . import eiem_effect_game_resources as game_resources
+        spec = self.edit.objects[identity]
+        template = self.local_template(identity)
+        tree, _ = self.tree(template)
+        data = copy.deepcopy(self.edit.value(identity))
+        refs = []
+        for ref in spec.get('references', []):
+            path = [int(i) if i else k for k, i in re.findall(r'\.([^\.\[\]]+)|\[(\d+)\]', ref['field'])]
+            try:
+                ptr = document._json_path(data, ref['field'])
+            except (KeyError, IndexError, TypeError):
+                continue
+            logical = ref.get('gameLogical')
+            if not spec.get('gameSource'):
+                if logical and ptr == dict(m_FileID=ref['fileId'], m_PathID=ref['pathId']):
+                    refs.append(dict(field=ref['field'], **copy.deepcopy(logical)))
+                continue
+            if ptr == dict(m_FileID=0, m_PathID=0) and not logical:
+                continue
+            target = preview._target(self.edit, identity, path)
+            target_spec = self.edit.objects.get(target, {})
+            if not logical:
+                paths = target_spec.get('logicalPaths') or []
+                document.require(paths, '修改的游戏材质引用缺少逻辑来源：' + ref['field'])
+                chosen = sorted(paths, key=lambda p: (p['path'], p.get('name', '')))[0]
+                logical = dict(path=chosen['path'], asset=chosen.get('name', ''),
+                               type=target_spec['type'], previewSource=spec['gameSource'])
+            logical = game_resources.portable_binding(logical, spec['gameSource'], target_spec)
+            refs.append(dict(field=ref['field'], **copy.deepcopy(logical)))
+            parent = data
+            for part in path[:-1]:parent = parent[part]
+            parent[path[-1]] = dict(m_FileID=0, m_PathID=0)
+        return template, tree.schema, data, refs
 
     def add_preview(self, identity, image, color_space):
         row = next(row for row in self.additions if row['identity'] == identity)
@@ -537,7 +656,25 @@ def authored_texture_image(identity, encoded, color_space):
         path.unlink(missing_ok=True)
 
 
-def texture_tree(native, image, settings):
+class ExportSnapshot:
+    """Encode each distinct pixel input once within one export transaction.
+
+    Both author passes still read the actual pixels. A changed image therefore
+    changes the final payload and aborts publication, including painted images.
+    No state is retained across exports or used to hide cold-build work.
+    """
+    def __init__(self):
+        self.textures = {}
+
+    def compress(self, rgba, width, height, mipmaps, format_id, color_space, tool):
+        key = (document.digest(rgba), width, height, mipmaps, format_id, color_space, str(tool))
+        if key not in self.textures:
+            self.textures[key] = texture_compression.compress_rgba(
+                rgba, width, height, mipmaps, format_id, color_space, tool, flip_y=False)
+        return self.textures[key]
+
+
+def texture_tree(native, image, settings, snapshot=None):
     try:
         from . import eiem_shared_resources as shared_resources
     except ImportError:
@@ -560,9 +697,9 @@ def texture_tree(native, image, settings):
         rgb = pixels[:, :, :3]
         pixels[:, :, :3] = np.where(rgb <= .0031308, rgb * 12.92, 1.055 * np.maximum(rgb, 0) ** (1 / 2.4) - .055)
     rgba = np.rint(np.clip(pixels, 0, 1) * 255).astype(np.uint8).tobytes()
-    compressed = texture_compression.compress_rgba(
+    compressed = (snapshot or ExportSnapshot()).compress(
         rgba, width, height, bool(settings.mipmaps), int(native['m_TextureFormat'].data),
-        color_space, shared_resources.native_tool_file('texconv.exe'), flip_y=False)
+        color_space, shared_resources.native_tool_file('texconv.exe'))
     tree = copy.deepcopy(native)
     document.require(tree['m_ImageCount'].data == 1 and tree['m_TextureDimension'].data == 2,
                      '来源必须是二维 Texture2D')
@@ -581,13 +718,25 @@ def texture_tree(native, image, settings):
     return tree
 
 
-def export_document(root, edit):
+def export_document(root, edit, snapshot=None):
     """Snapshot user assets at build/export time; preview remains lightweight."""
     from . import eiem_effect_preview as preview
     from .nativepack import mesh as mesh_codec
-    result = edit.export()
+    # A borrowed Material is editable in the shared UI. Export its changes as
+    # a local clone below; never write them into the donor's native identity.
+    borrowed = {i for i, spec in edit.objects.items()
+                if spec.get('gameSource') and spec['classId'] == 21 and
+                edit.value(i) != edit.state['original'][i]}
+    if borrowed:
+        state = dict(edit.state, values=dict(edit.state['values']))
+        for identity in borrowed:state['values'][identity] = state['original'][identity]
+        result = document.Editor(state).export()
+    else:
+        result = edit.export()
     result['lodCoverage'] = 'all' if root.eff_effect.all_lods else 'source'
     native = NativeAssets(edit, root['eff_effect_id'])
+    from .eiem_effect_scene_material import Materials
+    scene_materials = Materials(native, result, snapshot)
     render_edits = {}
     material_clones = {}
     mesh_clones = {}
@@ -610,7 +759,9 @@ def export_document(root, edit):
         if key not in mesh_clones:
             tree, _ = native.tree(template)
             tree, _ = mesh_codec.native_mesh(tree, snapshot, selected.name)
-            mesh_clones[key] = native.add(template, template + '/mesh/' + signature, tree)
+            from . import eiem_format
+            mesh_clones[key] = native.add(template, template + '/mesh/' + signature, tree,
+                authorDataBase64=base64.b64encode(eiem_format.encode_mesh(snapshot)).decode('ascii'))
         return mesh_clones[key]
     for node in [root] + list(root.children_recursive):
         if node.get('eff_preview'):
@@ -622,11 +773,10 @@ def export_document(root, edit):
         current = copy.deepcopy(edit.value(renderer))
         custom = node.eff_effect.particle_mesh if current.get('m_RenderMode') == 4 else None
         if custom and custom.data.polygons and custom.data.materials:
-            used = {p.material_index for p in custom.data.polygons}
-            document.require(len(used) == 1, '当前每个粒子 Mesh 支持一个面材质；合并后请把所有面指定到需要的 EFF 材质')
-            index = next(iter(used))
-            mat = custom.material_slots[index].material if index < len(custom.material_slots) else None
-            document.require(material_identity(root, mat), '粒子 Mesh 的面材质必须是当前特效导入的 EFF 材质；Blender 普通节点 Shader 不能直接导出到游戏')
+            count = max(p.material_index for p in custom.data.polygons) + 1
+            old = current.get('m_Materials', [])
+            current['m_Materials'] = [old[i] if i < len(old) else dict(m_FileID=0, m_PathID=0)
+                                      for i in range(count)]
         for field in ('m_Mesh', 'm_Mesh1', 'm_Mesh2', 'm_Mesh3'):
             if field not in current or current.get('m_RenderMode') != 4:
                 continue
@@ -642,6 +792,14 @@ def export_document(root, edit):
             target = mesh_target(template, selected)
             if target:current[field] = native.pointer(renderer, target)
         for index in range(len(current.get('m_Materials', []))):
+            mat = custom.material_slots[index].material if custom and index < len(custom.material_slots) else None
+            if mat and not material_identity(root, mat):
+                mid = scene_materials.export(mat)
+                current['m_Materials'][index] = native.pointer(renderer, mid)
+                field = '$.m_Materials[' + str(index) + ']'
+                result['gameReferences'] = [r for r in result.get('gameReferences', [])
+                                           if (r['owner'], r['field']) != (renderer, field)]
+                continue
             mid = renderer_material(root, edit, renderer, index)
             if mid:
                 current['m_Materials'][index] = native.pointer(renderer, mid)
@@ -653,11 +811,10 @@ def export_document(root, edit):
                     image = material_bridge.image(root, mid, slot.name) or slot.image
                     if image and not _unchanged_embedded_preview(slot, image):
                         slots.append((slot, image))
-            if not slots:
+            if not slots and mid not in borrowed:
                 continue
             if mid not in material_clones:
-                tree, _ = native.tree(mid)
-                data = copy.deepcopy(edit.value(mid))
+                template, schema, data, game_refs = native.material_data(mid)
                 for ti, row in enumerate(data.get('m_SavedProperties', {}).get('m_TexEnvs', [])):
                     selected = next(((s, image) for s, image in slots if s.name == row['first']), None)
                     if not selected:
@@ -670,16 +827,38 @@ def export_document(root, edit):
                                     if preview._target(edit, mid, ['m_SavedProperties', 'm_TexEnvs', j, 'second', 'm_Texture'])), None)
                     document.require(tid and edit.objects[tid]['classId'] == 28, '此贴图槽缺少二维纹理结构模板')
                     texture, _ = native.tree(tid)
-                    target = native.add(tid, mid + '/texture/' + slot.name, texture_tree(texture, image, slot))
+                    texture_template = native.local_template(tid)
+                    # Encode new image data on the author's native template;
+                    # borrowed importer/streaming flags belong to the game.
+                    local_texture, _ = native.tree(texture_template)
+                    local_texture = copy.deepcopy(local_texture)
+                    local_texture.set('m_ColorSpace', texture['m_ColorSpace'].data)
+                    paths = edit.objects[tid].get('logicalPaths') or []
+                    logical = paths[0] if paths else {}
+                    target = native.add(texture_template, mid + '/texture/' + slot.name,
+                                        texture_tree(local_texture, image, slot, snapshot),
+                                        sourceTexture=dict(path=logical.get('path', ''), asset=logical.get('name', texture['m_Name'].data)))
                     # VAT float data stays native; an 8-bit PNG is not its preview source.
                     if texture['m_TextureFormat'].data not in (17, 20):
                         native.add_preview(target, image, texture['m_ColorSpace'].data)
-                    row['second']['m_Texture'] = native.pointer(mid, target)
+                    row['second']['m_Texture'] = native.pointer(template, target)
+                    field = '$.m_SavedProperties.m_TexEnvs[' + str(ti) + '].second.m_Texture'
+                    game_refs = [r for r in game_refs if r['field'] != field]
                 # Material JSON has no byte blobs. from_data accepts the same
                 # flattened vector/map representation as effect author JSON.
-                tree = native.codec.from_data(tree.schema, data)
-                material_clones[mid] = native.add(mid, mid + '/material', tree)
+                tree = native.codec.from_data(schema, data)
+                from .eiem_effect_scene_material import material_for_origin
+                source_material = material_for_origin(edit, mid)
+                material_clones[mid] = native.add(template, mid + '/material', tree,
+                                                  sourceMaterial=source_material)
+                result.setdefault('gameReferences', []).extend(
+                    dict(owner=material_clones[mid], **r) for r in game_refs)
             current['m_Materials'][index] = native.pointer(renderer, material_clones[mid])
+            # This Renderer now selects an authored Material. Its unchanged
+            # dependencies have their own logical bindings on that clone.
+            field = '$.m_Materials[' + str(index) + ']'
+            result['gameReferences'] = [r for r in result.get('gameReferences', [])
+                                       if (r['owner'], r['field']) != (renderer, field)]
         if current != edit.value(renderer):
             render_edits[renderer] = current
     # A source Mesh can also be used by a mesh-shaped emitter or a component.
@@ -692,7 +871,13 @@ def export_document(root, edit):
             if ref.get('type') not in ('Mesh', None):
                 continue
             path = [int(index) if index else field for field, index in re.findall(r'\.([^\.\[\]]+)|\[(\d+)\]', ref['field'])]
-            template = preview._target(edit, identity, path)
+            try:
+                template = preview._target(edit, identity, path)
+            except (IndexError, KeyError):
+                # The catalog describes the imported source. Removing a
+                # sprite/sub-emitter array entry also removes its PPtr; it
+                # must not make an otherwise valid particle Mesh unexportable.
+                continue
             selected = imported_meshes.get(template)
             if not selected:
                 continue
@@ -712,12 +897,48 @@ def export_document(root, edit):
         result['objects'] = [o for o in result['objects'] if o['identity'] != identity]
         result['objects'].append(dict(identity=identity, sourceDataSha256=edit.state['hashes'][identity], data=data))
     existing_assets = copy.deepcopy(edit.state.get('author_assets', []))
+    for asset in existing_assets:
+        if edit.objects[asset['identity']]['classId'] == 21:
+            from .eiem_effect_scene_material import material_for_origin
+            if not asset.get('sourceMaterial'):
+                asset['sourceMaterial'] = material_for_origin(edit, asset['identity'])
+            tree, _ = native.tree(asset['identity'])
+            tree = native.codec.from_data(tree.schema, edit.value(asset['identity']))
+            asset['payloadBase64'] = base64.b64encode(native.codec.encode(tree)).decode('ascii')
     additions = existing_assets + native.additions
     identities = [row['identity'].casefold() for row in additions]
     document.require(len(identities) == len(set(identities)), '作者资源身份重复')
     if additions:
         result['assets'] = additions
-    return result
+    from . import eiem_effect_resources as resource_set
+    return resource_set.prune(edit, result)
+
+
+def clipboard_snapshot(root, edit):
+    """Capture the same Mesh/Image/Material author data used by publication."""
+    result = export_document(root, edit)
+    baseline = document.load_source(edit.state['source'])
+    # Logical bindings can extend the source's FileID table. Authored clones
+    # retain those FileIDs after replacing the logical resource's PathID.
+    # The preserved source alone cannot recover this workspace-only mapping.
+    baseline['externalTables'] = copy.deepcopy(edit.state.get('externalTables', {}))
+    document.apply_edit(baseline, result)
+    return document.Editor(baseline)
+
+
+def ensure_pasted_assets(context, root, edit, populate):
+    """Project newly reachable resources without recreating existing author UI."""
+    from . import eiem_effect_preview as preview
+    from . import eiem_effect_resources as resource_set
+    seeds = {identity for node in edit.state['catalog']['hierarchy']
+             for identity in [node['identity'], *node.get('components', [])]}
+    for identity in resource_set.reachable(edit, seeds):
+        spec = edit.objects[identity]
+        if spec['classId'] != 21 or identity not in edit.state['values'] or material_object(root, identity):
+            continue
+        ensure_material_object(root, edit, identity, populate)
+        preview._material_asset(root, edit, identity, preview._resources(root, edit))
+    expand_meshes(context, root, edit, incremental=True)
 
 
 def write_document(root, edit, path):

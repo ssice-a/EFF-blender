@@ -46,6 +46,15 @@ def digest(data):
     return hashlib.sha256(data).hexdigest().upper()
 
 
+def seed(identity):
+    """Keep old UUID sampling while allowing readable imported effect IDs."""
+    value = str(identity)
+    try:
+        return int(value[:8], 16)
+    except ValueError:
+        return int.from_bytes(hashlib.sha256(value.encode('utf-8')).digest()[:4], 'little')
+
+
 def pointer_type_matches(expected, actual):
     return expected == 'Object' or expected == actual or (
         expected == 'Texture' and actual in {'Texture2D', 'Cubemap', 'Texture3D', 'Texture2DArray', 'CubemapArray'})
@@ -190,6 +199,25 @@ class Editor:
             if value.get('m_Enabled'):
                 value['m_Enabled']=0;changed.append(identity)
         return changed
+
+    def keep_emitter_running(self, identity):
+        """Continuous particles also need a continuous game-owned lifetime.
+
+        EffectSetting.isLoop suppresses its duration countdown; ParticleSystem
+        looping wraps emission time without clearing existing particles.
+        """
+        require(self.objects[identity]['classId']==198, '请选择粒子发射器')
+        self.set_scalar(identity,['looping'],True)
+        hierarchy=self.state['catalog'].get('hierarchy',[])
+        nodes={node['transform']:node for node in hierarchy}
+        node=next((n for n in hierarchy if identity in n['components']),None)
+        while node:
+            for component in node['components']:
+                value=self.state['values'].get(component,{})
+                if 'effectLogicCfg' not in value:continue
+                path=['effectLogicCfg','isLoop']
+                self.set_scalar(component,path,True if self.schema(component,path)['type']=='bool' else 1)
+            node=nodes.get(node.get('parent'))
 
     def value(self, identity, path=()):
         value = self.state['values'][identity]
@@ -351,6 +379,10 @@ class Editor:
                    for i in [n['identity']] + n['components']}
         for identity, value in self.state['values'].items():
             if self.objects[identity].get('template') or identity in deleted:continue
+            if self.objects[identity].get('gameSource'):
+                require(value == self.state['original'][identity],
+                        '游戏资源引用的来源参数已改变，请创建作者资源后再编辑：' + self.objects[identity].get('name', identity))
+                continue
             value = copy.deepcopy(value)
             # Native ownership changes are rebuilt by the declared emitter
             # operations, never exposed as unrestricted raw-field edits.
@@ -361,10 +393,31 @@ class Editor:
                 continue
             require(self.objects[identity]['classId'] in EDITABLE, '只读对象被修改')
             changes.append(dict(identity=identity, sourceDataSha256=self.state['hashes'][identity], data=copy.deepcopy(value)))
+        operations = topology.export(self)
+        if __package__:from . import eiem_effect_game_resources as game_resources
+        else:import eiem_effect_game_resources as game_resources
+        bindings = game_resources.bindings(self)
+        edited = {row['identity'] for row in changes}
+        added = {row['identity'] for row in (operations or {}).get('added', [])}
+        added.update(row['identity'] for row in self.state.get('author_assets', []))
+        for owner in sorted({row['owner'] for row in bindings} - edited - added):
+            require(owner in self.objects and owner in self.state['values'],
+                    '游戏资源绑定的对象不在当前来源中：' + owner)
+            require(self.objects[owner].get('classId') in EDITABLE,
+                    '游戏资源绑定的对象不可写：' + owner)
+            changes.append(dict(identity=owner,
+                                sourceDataSha256=self.state['hashes'][owner],
+                                data=copy.deepcopy(self.value(owner))))
         result = dict(format='EFF_EFFECT_EDIT', version=1, sourceManifestSha256=self.state['sourceManifestSha256'],
                     sourceEffectSha256=self.state['sourceEffectSha256'], source=self.state['source'], objects=changes)
-        operations = topology.export(self)
         if operations:result['emitters'] = operations
+        if bindings:result['gameReferences'] = bindings
+        if self.state.get('emitter_scope'):
+            # A scoped import may gain new emitters. Preserve its excluded
+            # source siblings without freezing the active author hierarchy.
+            previous=set(self.state['emitter_scope'])
+            result['emitterScope']=[n['identity'] for n in self.state['catalog']['hierarchy']
+                if n['identity'] in previous or any(self.objects[i]['classId']==198 for i in n['components'])]
         return result
 
 
@@ -400,21 +453,35 @@ def apply_edit(state, edit):
         candidate['values'][identity] = copy.deepcopy(row['data'])
 
     _apply_authored_assets(candidate, edit.get('assets', []), editor)
-    _apply_emitter_edits(candidate, edit.get('emitters'), editor)
+    _apply_emitter_edits(candidate, edit.get('emitters'), editor, edit.get('emitterScope'))
+    if edit.get('gameReferences'):
+        if __package__:from . import eiem_effect_game_resources as game_resources
+        else:import eiem_effect_game_resources as game_resources
+        editor = Editor(candidate)
+        game_resources.restore(editor, edit['gameReferences'])
+    if edit.get('emitterScope'):
+        if __package__:from . import eiem_effect_scope as scope
+        else:import eiem_effect_scope as scope
+        scope.restore(Editor(candidate), edit['emitterScope'])
     state.clear()
     state.update(candidate)
     return state
 
 
-def _native_plain(value):
+def _native_plain(value, *, encode_bytes=False):
+    """Preserve native types; JSON workspaces retain explicit byte encoding."""
+    if value.schema.type == 'bool':
+        return bool(value.data)
     if isinstance(value.data, bytes):
+        if encode_bytes:
+            return {'encoding': 'base64', 'bytes': base64.b64encode(value.data).decode('ascii')}
         return value.data
     if value.schema.type == 'Array':
-        return [_native_plain(item) for item in value.items()]
+        return [_native_plain(item, encode_bytes=encode_bytes) for item in value.items()]
     if isinstance(value.data, dict):
         if list(value.data) == ['Array']:
-            return _native_plain(value.data['Array'])
-        return {key: _native_plain(item) for key, item in value.data.items()}
+            return _native_plain(value.data['Array'], encode_bytes=encode_bytes)
+        return {key: _native_plain(item, encode_bytes=encode_bytes) for key, item in value.data.items()}
     return value.data
 
 
@@ -607,7 +674,7 @@ def _apply_authored_assets(state, rows, editor):
     state['author_assets'] = copy.deepcopy(rows)
 
 
-def _apply_emitter_edits(state, operations, editor):
+def _apply_emitter_edits(state, operations, editor, selected=None):
     if operations is None:
         return
     require(isinstance(operations, dict) and set(operations) == {'added', 'removed'} and
@@ -664,7 +731,10 @@ def _apply_emitter_edits(state, operations, editor):
             '发射器新增 PathID 与作者资源冲突')
         schema_data = state['schemas'][source['schema']]
         schema = type_tree.Schema.compile(schema_data['nodes'])
-        data = _native_plain(type_tree.from_data(schema, data))
+        # Exported native UInt8 arrays use explicit JSON byte encoding. Decode
+        # before TypeTree reconstruction; iterating that dictionary produces
+        # the strings "encoding" and "bytes" as bogus vertex-stream entries.
+        data = _native_plain(type_tree.from_data(schema, _native_input(data)), encode_bytes=True)
         spec = copy.deepcopy(source)
         spec['identity'] = identity
         spec['native'] = dict(native, pathId=path_id)
@@ -699,7 +769,7 @@ def _apply_emitter_edits(state, operations, editor):
         spec['owner'] = owner
         by_owner.setdefault(owner, []).append((identity, template, data, spec))
 
-    source_nodes = {node['identity']: node for node in state['catalog']['hierarchy']}
+    source_nodes = {node['identity']: node for node in state.get('source_hierarchy', state['catalog']['hierarchy'])}
     new_nodes = []
     for go_identity, go_template, go_data, go_spec in pending:
         if go_spec['classId'] != 1:
@@ -707,25 +777,25 @@ def _apply_emitter_edits(state, operations, editor):
         source_node = source_nodes.get(go_template)
         require(source_node is not None, '发射器模板必须是来源树形节点')
         components = by_owner.get(go_identity, [])
+        scaffold = selected is not None and go_identity not in selected
         component_templates = [template for _, template, _, _ in components]
-        require(len(component_templates) == len(source_node['components']) and
-                set(component_templates) == set(source_node['components']) and
+        require(set(component_templates).issubset(source_node['components']) and
                 len(set(component_templates)) == len(component_templates),
                 '新增发射器必须复制完整组件')
         require(sum(spec['classId'] == 4 for _, _, _, spec in components) == 1 and
-                sum(spec['classId'] == 198 for _, _, _, spec in components) == 1 and
-                sum(spec['classId'] == 199 for _, _, _, spec in components) == 1,
+                sum(spec['classId'] == 198 for _, _, _, spec in components) == (0 if scaffold else 1) and
+                sum(spec['classId'] == 199 for _, _, _, spec in components) == (0 if scaffold else 1),
                 '新增发射器缺少 Transform/ParticleSystem/Renderer')
         component_by_template = {template: identity for identity, template, _, _ in components}
         declared = [pointer_identity(go_identity, item.get('component'))
                     for item in go_data.get('m_Component', [])]
-        expected = [component_by_template.get(template) for template in source_node['components']]
+        expected = [identity for identity, _, _, _ in components]
         require(declared == expected, '新增 GameObject 的组件指针不一致')
         transform_identity = next(identity for identity, _, _, spec in components
                                   if spec['classId'] == 4)
         new_nodes.append(dict(identity=go_identity, name=go_data.get('m_Name', ''),
                               transform=transform_identity, parent=None, children=[],
-                              components=[component_by_template[t] for t in source_node['components']]))
+                              components=expected))
 
     node_by_transform = {node['transform']: node for node in hierarchy}
     node_by_transform.update((node['transform'], node) for node in new_nodes)

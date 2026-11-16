@@ -1,10 +1,14 @@
 """Run in factory-startup Blender. Check RNA values and read-only panel drawing."""
+import argparse
 import importlib.util
 from pathlib import Path
 import sys
 import bpy
 
-root=Path(__file__).parent
+parser=argparse.ArgumentParser()
+parser.add_argument('--package-root',type=Path,default=Path(__file__).parent)
+args=parser.parse_args(sys.argv[sys.argv.index('--')+1:] if '--' in sys.argv else [])
+root=args.package_root.resolve()
 spec=importlib.util.spec_from_file_location('EFFMaterialEditorTest',root/'__init__.py',submodule_search_locations=[str(root)])
 package=importlib.util.module_from_spec(spec);sys.modules[spec.name]=package;spec.loader.exec_module(package);package.register()
 editor=package.eiem_blender_addon.material_editor
@@ -40,7 +44,18 @@ class Layout:
     def operator(self,*args,**kwargs):return type('Operation',(),{})()
 
 try:
+    properties=list(bpy.types.Material.bl_rna.properties.keys())
+    for small in ('eiem_editor_groups','eiem_editor_features','eiem_material_animations'):
+        assert properties.index(small)<properties.index('eiem_editor_values'), 'large collection precedes '+small
+    for name in ('expanded','details_expanded'):
+        assert not editor.EFF_PG_material_group.bl_rna.properties[name].is_animatable, 'UI fold state became animatable'
+    assert 'uv_expanded' not in editor.EFF_PG_material_value.bl_rna.properties
     color_property=editor.EFF_PG_material_value.bl_rna.properties['color']
+    hdr = bpy.data.materials.new('Uncapped blend brightness')
+    hdr['eiem_value4._BlendTint'] = '1,0.5,0.25,1'
+    hdr.eiem_blend_brightness = 128
+    assert hdr.eiem_blend_brightness == 128, 'HDR brightness was arbitrarily capped'
+    assert hdr['eiem_value4._BlendTint'] == '128,64,32,1', 'HDR lost its tint'
     assert (color_property.hard_min,color_property.hard_max)==(0.0,1.0)
     assert (color_property.soft_min,color_property.soft_max)==(0.0,1.0)
     editor._prepare_material(queue_mat)
@@ -75,7 +90,7 @@ try:
     fields=[];editor.draw(Layout(fields),mat)
     assert ('eiem_float._UseEmission','boolean') in fields
     assert ('eiem_float._EmissionBrightness','scalar') not in fields
-    assert ('eiem_texture._EmissionMap','text') in fields, 'source emission texture hidden while emission is off'
+    assert ('eiem_texture._EmissionMap','text') in fields, 'unknown shader raw view must show disabled source textures'
     assert ('eiem_texture_scale._HighlightMap','vector2') not in fields, 'unused empty transform was exposed'
     assert '_HighlightMap' in editor.texture_slots(mat)
     row=editor._row(mat,'eiem_float._UseEmission');row.boolean=True
@@ -170,8 +185,14 @@ try:
     assert mat['eiem_float._ClearCoatSmoothness']=='0.94'
     mat['eiem_texture._ClearCoatMask']='preserved-mask.png'
     fields=[];editor.draw(Layout(fields),mat)
-    assert ('eiem_texture._ClearCoatMask','text') in fields, 'bound paths should stay at the top even when a feature is off'
+    assert ('eiem_texture._ClearCoatMask','text') not in fields, 'disabled clearcoat must hide its bound texture path'
+    assert mat['eiem_texture._ClearCoatMask']=='preserved-mask.png', 'hiding a disabled texture must preserve its binding'
     assert ('eiem_float._ClearCoatSmoothness','scalar') not in fields
+    mat.eiem_editor_features['clearcoat'].enabled=True
+    fields=[];editor.draw(Layout(fields),mat)
+    assert ('eiem_texture._ClearCoatMask','text') in fields, 're-enabling clearcoat must restore its bound texture row'
+    assert mat['eiem_texture._ClearCoatMask']=='preserved-mask.png'
+    mat.eiem_editor_features['clearcoat'].enabled=False
     mat['eiem_texture._ClearCoatMask']=''
     mat.eiem_editor_features['vfx'].enabled=True
     mat.eiem_editor_groups['vfx'].expanded=False
@@ -205,11 +226,96 @@ try:
     effect=bpy.data.materials.new('Dedicated VFX Editor Test')
     try:
         effect['eiem_shader']='HGRP/CharacterNPR_VFX'
+        for name,value in (('_SurfaceType','1'),('_EnableAlphaTest','0'),
+                           ('_BlendMode','0'),('_AlphaPremultiply','0'),
+                           ('_SrcBlend','1'),('_DstBlend','10'),
+                           ('_AlphaSrcBlend','1'),('_AlphaDstBlend','10'),
+                           ('_ZWrite','0'),('_ZTest','4')):
+            effect['eiem_float.'+name]=value
+        effect['eiem_keyword._ALPHABLEND_ON']='1'
+        effect['eiem_keyword._ALPHATEST_ON']='0'
         effect['eiem_value4._TintColor']='9999.28906,9794.01562,9999.75781,1'
         effect['eiem_float._UseBlend']='0';effect['eiem_float._UseMask']='0'
-        for slot in ('_MainTex','_BlendTex','_MaskTex'):
+        effect['eiem_float._UseDisturb']='0';effect['eiem_float._EnableNormalMap']='0'
+        effect['eiem_float._UseEmission']='0'
+        for slot, fields in editor.features.VFX_UV.items():
+            effect['eiem_float.'+fields[0]]='0'
+            effect['eiem_value4.'+editor.features.VFX_UV_WEIGHTS[slot]]='1,0,0,0'
+            effect['eiem_value4.'+fields[1]]='0,0,0,0'
+            effect['eiem_float.'+fields[2]]='0'
+            effect['eiem_value4.'+fields[3]]='1,0,0,1'
+        disabled_slots=('_BlendTex','_MaskTex','_DisturbTex1','_NormalMap','_EmissionTex')
+        for slot in ('_MainTex',*disabled_slots,'_UnknownSourceTex'):
+            effect['eiem_texture.'+slot]=slot+'.png'
             effect['eiem_texture_scale.'+slot]='1,1'
+            effect['eiem_texture_offset.'+slot]='0.25,0.5'
         editor._prepare_material(effect)
+        editor._row(effect,'eiem_float._MainTexUVRotate').scalar=90
+        assert abs(float(effect['eiem_value4._MainTexUVRotateMat'].split(',')[1])-1)<1e-6
+        editor._row(effect,'eiem_float._BlendUVSet').choice='UV1'
+        assert effect['eiem_value4._BlendTexUVWeights']=='0,1,0,0'
+        fields=[];editor.draw(Layout(fields),effect)
+        assert ('eiem_float._MainTexUVRotate','scalar') not in fields, 'static angle should stay in secondary parameters'
+        assert ('eiem_float._MainUVSet','choice') in fields
+        assert ('','eiem_editor_vfx_surface') in fields, 'VFX surface mixing selector is missing'
+        assert editor.features.surface_mode(effect)==1, 'source Alpha blend should be recognized'
+        animation=package.eiem_blender_addon.material_animation
+        assert not hasattr(animation, 'add_uv_spin'), 'PolarUV must not generate a material animation clip'
+        for group in effect.eiem_editor_groups:group.expanded=True
+        editor._row(effect,'eiem_float._UseBlend').boolean=True
+        editor._row(effect,'eiem_float._MainUVSet').choice='POLARUV'
+        assert effect['eiem_float._MainUVSet']=='2', 'PolarUV must use the native UV mode enum'
+        assert effect['eiem_value4._MainTexUVWeights']=='0,0,1,0', 'PolarUV must update the shader UV weights'
+        editor._row(effect,'eiem_float._BlendUVSet').choice='SCREENUV'
+        assert effect['eiem_float._BlendUVSet']=='3'
+        assert effect['eiem_value4._BlendTexUVWeights']=='0,0,0,1'
+        editor._row(effect,'eiem_value4._MainTexUVSpeed').uv_speed=(0,-0.05)
+        editor._row(effect,'eiem_value4._BlendTexUVSpeed').uv_speed=(0,0.12)
+        main_speed=tuple(float(v) for v in effect['eiem_value4._MainTexUVSpeed'].split(','))
+        blend_speed=tuple(float(v) for v in effect['eiem_value4._BlendTexUVSpeed'].split(','))
+        assert abs(main_speed[0])<1e-6 and abs(main_speed[1]+0.05)<1e-6
+        assert abs(blend_speed[0])<1e-6 and abs(blend_speed[1]-0.12)<1e-6
+        fields=[];editor.draw(Layout(fields),effect)
+        assert ('eiem_float._UsePolarUV','boolean') not in fields
+        assert ('eiem_float._MainUVSet','choice') in fields
+        assert ('eiem_value4._MainTexUVSpeed','uv_speed') in fields
+        assert ('eiem_value4._BlendTexUVSpeed','uv_speed') in fields
+        assert ('eiem_float._MainTexUVRotate','scalar') not in fields
+        assert ('','eiem_editor_vfx_surface') in fields, 'VFX surface mixing selector is missing'
+        assert editor.features.surface_mode(effect)==1, 'source Alpha blend should be recognized'
+        effect.eiem_editor_groups['main'].details_expanded=True
+        fields=[];editor.draw(Layout(fields),effect)
+        assert ('eiem_float._MainTexUVRotate','scalar') in fields, 'static angle must remain available in secondary parameters'
+        editor._row(effect,'eiem_float._UseBlend').boolean=False
+        texture_fields=[]
+        editor._draw_texture(Layout(texture_fields),effect,'_BlendTex')
+        assert ('eiem_texture._BlendTex','text') in texture_fields
+        assert not any(name in ('uv_expanded','uv_spin_enabled','vector2') for _,name in texture_fields), 'texture row must contain only its path and picker'
+        assert not effect.eiem_material_animations, 'editing native UV controls must not create a material animation'
+        # Structure cache must follow external key/profile changes and RNA repair.
+        keys,_=editor._schema(effect)
+        effect['eiem_float._NewRuntimeParameter']='2'
+        assert 'eiem_float._NewRuntimeParameter' in editor._schema(effect)[0]
+        del effect['eiem_float._NewRuntimeParameter']
+        assert tuple(keys)==tuple(editor._schema(effect)[0])
+        editor._row(effect,'eiem_float._MainUVSet').key='broken'
+        assert not editor._controls_ready(effect)
+        editor._prepare_material(effect)
+        assert editor._controls_ready(effect)
+        before={key:str(value) for key,value in effect.items() if not key.startswith('eiem_editor_')}
+        fields=[];editor.draw(Layout(fields),effect)
+        for slot in disabled_slots:
+            assert ('eiem_texture.'+slot,'text') not in fields, 'disabled feature exposed '+slot
+            assert ('eiem_texture_scale.'+slot,'vector2') not in fields, 'disabled feature exposed UV controls for '+slot
+        for slot in ('_MainTex','_UnknownSourceTex'):
+            assert ('eiem_texture.'+slot,'text') in fields, 'unconditional or unrecognised texture was hidden: '+slot
+        assert before=={key:str(value) for key,value in effect.items() if not key.startswith('eiem_editor_')}, 'visibility changed native material data'
+        effect.eiem_editor_advanced=True
+        for group in effect.eiem_editor_groups:group.expanded=True
+        fields=[];editor.draw(Layout(fields),effect)
+        for slot in disabled_slots:
+            assert ('eiem_texture.'+slot,'text') in fields, 'raw view lost disabled texture '+slot
+        effect.eiem_editor_advanced=False
         tint=editor._row(effect,'eiem_value4._TintColor')
         assert all(abs(actual-1.0)<1e-6 for actual in tint.color), 'normal TintColor widget should display old 10000-like data as white'
         assert effect['eiem_value4._TintColor']=='9999.28906,9794.01562,9999.75781,1', 'opening TintColor must not overwrite stored data'
@@ -217,11 +323,36 @@ try:
         assert effect['eiem_value4._TintColor']=='1,1,1,1', 'explicit normal TintColor edit must write normalized white'
         effect.eiem_editor_features['blend'].enabled=True
         effect.eiem_editor_features['mask'].enabled=True
+        effect.eiem_editor_features['disturb'].enabled=True
+        effect.eiem_editor_features['normal'].enabled=True
+        effect.eiem_editor_features['emission'].enabled=True
         effect.eiem_editor_groups['blend'].expanded=False
         fields=[];editor.draw(Layout(fields),effect)
-        for slot in ('_MainTex','_BlendTex','_MaskTex'):
+        for slot in ('_MainTex',*disabled_slots):
             assert ('eiem_texture.'+slot,'text') in fields
+            assert effect['eiem_texture.'+slot]==slot+'.png', 're-enabling changed the texture binding'
+            assert effect['eiem_texture_scale.'+slot]=='1,1' and effect['eiem_texture_offset.'+slot]=='0.25,0.5'
         effect.eiem_editor_groups['blend'].expanded=True
+        # Each texture layer exposes its native UV mode and independent speed.
+        _,_,items,ownership=editor._material_structure(effect)
+        for item in items:
+            slots=[slot for slot in item['slots'] if slot in editor.features.VFX_UV]
+            if not slots:
+                continue
+            effect.eiem_editor_groups[item['key']].expanded=True
+            effect.eiem_editor_groups[item['key']].details_expanded=True
+            fields=[]
+            editor._draw_feature(Layout(fields),effect,item,ownership,items,'vfx')
+            for slot in slots:
+                uv=editor.features.VFX_UV[slot]
+                assert ('eiem_float.'+uv[0],'choice') in fields, 'layer lost UV mode selector: '+slot
+                assert ('eiem_value4.'+uv[1],'uv_speed') in fields, 'layer lost independent UV speed: '+slot
+                assert ('eiem_float.'+uv[2],'scalar') in fields, 'layer lost static UV angle: '+slot
+                assert not any(key=='eiem_value4.'+uv[3] for key,_ in fields), 'derived GPU matrix crowded normal UI'
+                assert ('eiem_texture_scale.'+slot,'vector2') in fields, 'layer lost texture tiling: '+slot
+                assert ('eiem_texture_offset.'+slot,'vector2') in fields, 'layer lost texture offset: '+slot
+            if item['key']=='main':
+                assert ('eiem_float._UsePolarUV','boolean') not in fields, 'PolarUV must be selected per texture layer'
         labels=[];editor.draw(Layout([],labels),effect)
         for label in ('Shader 主色','Shader 中标记 HDR / Gamma','Mask 只影响 Alpha'):
             assert any(label in text for text,_ in labels), 'missing shader-backed guidance: '+label+' in '+repr(labels)
@@ -229,8 +360,18 @@ try:
         assert 'eiem_keyword._CHARACTER_VFX_SPECIAL' not in effect
     finally:
         bpy.data.materials.remove(effect)
+    # Live upgrade can move the RNA definition to the end without clearing
+    # saved IDProperties, row identities, UV folds, or native values.
+    rows_before=[(r.name,r.key) for r in mat.eiem_editor_values]
+    groups_before=[(g.name,g.expanded,g.details_expanded) for g in mat.eiem_editor_groups]
+    native_before=native()
+    del bpy.types.Material.eiem_editor_values
+    bpy.types.Material.eiem_editor_values=bpy.props.CollectionProperty(type=editor.EFF_PG_material_value)
+    assert rows_before==[(r.name,r.key) for r in mat.eiem_editor_values]
+    assert groups_before==[(g.name,g.expanded,g.details_expanded) for g in mat.eiem_editor_groups]
+    assert native_before==native(), 'RNA rebind changed native material values'
 finally:
     bpy.data.materials.remove(queue_mat)
     bpy.data.materials.remove(mat)
     package.unregister()
-print('PASS material editor: read-only draw, deferred schema initialisation, reopen all groups, left labels, typed values, HDR, portable payload')
+print('PASS material editor: read-only draw, native PolarUV controls, per-texture UV modes/speeds, texture-only rows, raw view, left labels, typed values, HDR, portable payload')

@@ -6,14 +6,17 @@ display conversion. Native snapshots stay authoritative and are not modified.
 import hashlib
 import base64
 import json
+import struct
 from pathlib import Path
 
 if __package__:
     from . import eiem_effect_document as document
     from .nativepack import type_tree
+    from .nativepack.hashing import sha256_bytes
 else:
     import eiem_effect_document as document
     from nativepack import type_tree
+    from nativepack.hashing import sha256_bytes
 
 
 def plain(value):
@@ -28,6 +31,35 @@ def plain(value):
     return value.data
 
 
+def _skip(reader, schema):
+    """Advance over a schema field without decoding shader programs/arrays."""
+    def advance(size):
+        document.require(0 <= size <= len(reader.data) - reader.pos, 'truncated native field')
+        reader.pos += size
+    primitive = type_tree.PRIMITIVES.get(schema.type)
+    if primitive:
+        advance(struct.calcsize(primitive))
+    elif schema.type in ('string', 'TypelessData'):
+        advance(reader.count())
+    elif schema.type == 'Array':
+        document.require(len(schema.children) == 2 and schema.children[0].name == 'size', 'array schema')
+        count = reader.count()
+        child = schema.children[1]
+        code = type_tree.PRIMITIVES.get(child.type)
+        if code and not child.align:
+            advance(count * struct.calcsize(code))
+        else:
+            document.require(count <= len(reader.data) - reader.pos or count == 0, 'array exceeds object')
+            for _ in range(count):
+                _skip(reader, child)
+    else:
+        document.require(schema.children, 'unknown native leaf: ' + schema.type)
+        for child in schema.children:
+            _skip(reader, child)
+    if schema.align or schema.type == 'string':
+        advance((-reader.pos) % 4)
+
+
 class Reader:
     def __init__(self, edit):
         self.edit = edit
@@ -40,14 +72,15 @@ class Reader:
     def snapshot(self, spec):
         path = document.safe_path(self.source, spec['file'])
         if spec['file'] not in self.verified:
-            with path.open('rb') as stream:
-                signature = hashlib.file_digest(stream, 'sha256').hexdigest().upper()
+            signature = sha256_bytes(path.read_bytes()).hex().upper()
             document.require(signature == spec['sha256'].upper(), '原生底稿摘要不匹配：' + spec['file'])
             self.verified.add(spec['file'])
         return path
 
     def tree(self, identity):
         spec = self.edit.objects[identity]
+        document.require(spec.get('state') != 'game-reference',
+                         '游戏资源保留逻辑引用，不包含原生程序：' + identity)
         authored = next((row for row in self.edit.state.get('author_assets', [])
                          if row.get('identity', '').casefold() == identity.casefold()), None)
         if authored:
@@ -57,8 +90,17 @@ class Reader:
             document.require(type_tree.encode(tree) == payload,
                              'Authored resource payload does not round-trip')
             return tree, payload
+        if spec.get('gameSource'):
+            donor = document.Editor(document.load_source(spec['gameSource']))
+            return Reader(donor).tree(identity)
         if spec.get('template'):
             spec = self.edit.objects[spec['template']]
+        schema, raw = self._payload(spec)
+        tree = type_tree.decode(schema, raw)
+        document.require(type_tree.encode(tree) == raw, '原生资源未修改往返失败')
+        return tree, raw
+
+    def _payload(self, spec):
         native = spec['native']
         row = next(r for r in self.manifest['serializedFiles'] if r['cab'].lower() == native['cab'].lower())
         path = self.snapshot(row['snapshot'])
@@ -71,9 +113,29 @@ class Reader:
             data = document.safe_path(self.source, spec['schema']).read_bytes()
             document.require(document.digest(data) == self.receipt[spec['schema']].upper(), '资源结构摘要不匹配')
             self.schemas[spec['schema']] = type_tree.Schema.compile(json.loads(data)['nodes'])
-        tree = type_tree.decode(self.schemas[spec['schema']], raw)
-        document.require(type_tree.encode(tree) == raw, '原生资源未修改往返失败')
-        return tree, raw
+        return self.schemas[spec['schema']], raw
+
+    def shader_name(self, identity):
+        """Read verified shader metadata without decoding the GPU programs."""
+        spec = self.edit.objects[identity]
+        document.require(spec['classId'] == 48, 'resource is not a Shader')
+        if spec.get('shaderName'):
+            return spec['shaderName']
+        if spec.get('gameSource'):
+            donor = document.Editor(document.load_source(spec['gameSource']))
+            return Reader(donor).shader_name(identity)
+        schema, raw = self._payload(spec)
+        cursor = type_tree.Reader(raw)
+        for name in ('m_ParsedForm', 'm_Name'):
+            child = next((c for c in schema.children if c.name == name), None)
+            document.require(child is not None, 'Shader name is absent from native schema')
+            for preceding in schema.children:
+                if preceding is child:
+                    break
+                _skip(cursor, preceding)
+            schema = child
+        document.require(schema.type == 'string', 'Shader name is not a native string')
+        return cursor.read(schema).data
 
     def stream(self, identity, info):
         member = info['path'].replace('\\', '/').rsplit('/', 1)[-1]

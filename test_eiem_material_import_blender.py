@@ -4,6 +4,7 @@ Run with Blender --background --factory-startup --python-exit-code 1 --python
 this_file.py. Optional arguments after -- are real Material files to read back
 into this disposable process, never into the user's open scene.
 """
+import configparser
 import importlib.util
 import json
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 import struct
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 import zlib
 
@@ -136,6 +138,140 @@ class MaterialImportTests(unittest.TestCase):
         payload, images = addon.material_override_payload(material, by_section, True)
         self.assertIn("float._Gloss=0.4", payload)
         self.assertEqual(len(images), 1)
+
+    def dds_only_package(self, label, linear="true"):
+        path = make_package(self.root / label, "format3")
+        ini = path.parents[1] / "mod.ini"
+        text = ini.read_text(encoding="utf-8")
+        text = text.replace("path=textures/body.effres\n", "")
+        text = text.replace("source=assets/test/body.png\nname=BodyTexture\n",
+            "source.path=assets/declared/flow.png\nsource.asset=DeclaredFlow\n"
+            "target.path=assets/legacy/unused.png\ntarget.asset=UnusedLegacyTarget\n")
+        text = text.replace("linear=true\n", "" if linear is None else "linear=" + linear + "\n")
+        ini.write_text(text, encoding="utf-8")
+        return path
+
+    def test_dds_only_source_and_sampling_survive_both_import_export_routes(self):
+        for route in ("material", "package"):
+            with self.subTest(route=route):
+                path = self.dds_only_package(route)
+                root = path.parents[1]
+                if route == "material":
+                    material = addon.import_material_file(path, self.obj)
+                else:
+                    self.assertEqual(addon.import_package(root), 0)
+                    material = next(row for row in bpy.data.materials
+                        if row.get("eiem_author_package") == str(root))
+                image = next(row for row in bpy.data.images
+                    if row.get("eiem_author_package") == str(root))
+                self.assertEqual(image["eiem_target_path"], "assets/declared/flow.png")
+                self.assertEqual(image["eiem_target_asset"], "DeclaredFlow")
+                self.assertEqual(image["eiem_linear"], "true")
+                native = dict(details=dict(textures=[dict(property=prop,
+                    pointer=dict(isNull=False, identity="original"))
+                    for prop in ("_BaseMap", "_DetailMap")]), native=dict(typeHash="12" * 16))
+                original = dict(logicalPath="assets/original.png", name="Original",
+                    details=dict(format="BC5", colorSpace=1))
+                declared = dict(logicalPath="assets/declared/flow.png", name="DeclaredFlow",
+                    details=dict(format="BC7", colorSpace=1))
+                source = SimpleNamespace(resolve=lambda kind, *args:
+                    native if kind == "Material" else declared,
+                    resolve_identity=lambda identity: original)
+                exporter = addon.native_export
+                images = {str(row.get("eiem_section")): row for row in bpy.data.images
+                          if row.get("eiem_section")}
+                textures = {}
+                record = exporter.collect_material(addon, source, material, images, textures,
+                    self.root, None, include_native_fields=False)
+                self.assertEqual(len(textures), 1, "two slots must share their authored Image")
+                texture = next(iter(textures.values()))
+                self.assertEqual((texture["sourcePath"], texture["sourceAsset"], texture["colorSpace"]),
+                    ("assets/declared/flow.png", "DeclaredFlow", 0))
+                output = self.root / (route + "-published")
+                output.mkdir()
+                exporter.pack_modules()[0]["author_format3"].write_format3_directory(
+                    output, "RoundTrip", [], {record["id"]: record}, list(textures.values()), [], [], [], [])
+                result = configparser.ConfigParser(interpolation=None)
+                result.read(output / "mod.ini", encoding="utf-8")
+                values = result[texture["id"]]
+                self.assertEqual(values["source.path"], "assets/declared/flow.png")
+                self.assertEqual(values["source.asset"], "DeclaredFlow")
+                self.assertEqual(values["linear"], "true")
+                self.assertNotIn("path", values)
+                self.assertEqual((output / values["dds"]).read_bytes(),
+                                 (root / "textures/body.dds").read_bytes())
+                self.assertFalse(list((output / "textures").glob("*.effres")))
+
+    def test_explicit_srgb_is_not_overwritten_by_normal_slot_heuristic(self):
+        material = addon.import_material_file(self.dds_only_package("normal", "false"), self.obj)
+        material["eiem_texture._BumpMap"] = material["eiem_texture._BaseMap"]
+        images = {str(row.get("eiem_section")): row for row in bpy.data.images
+                  if row.get("eiem_section")}
+        payload, _ = addon.material_override_payload(material, images, True)
+        binding = next(row.split("=", 1)[1] for row in payload
+                       if row.startswith("texture._BumpMap="))
+        image = images[binding]
+        self.assertEqual(image["eiem_author_package"], str(self.root / "normal"))
+        self.assertEqual(image["eiem_linear"], "false")
+
+    def test_omitted_linear_stays_inherited_after_both_import_routes(self):
+        for route in ("material", "package"):
+            with self.subTest(route=route):
+                path = self.dds_only_package("inherited-" + route, None)
+                if route == "material":
+                    material = addon.import_material_file(path, self.obj)
+                else:
+                    addon.import_package(path.parents[1])
+                    material = next(row for row in bpy.data.materials
+                        if row.get("eiem_author_package") == str(path.parents[1]))
+                image = next(row for row in bpy.data.images
+                    if row.get("eiem_author_package") == str(path.parents[1]))
+                material["eiem_texture._BumpMap"] = material["eiem_texture._BaseMap"]
+                images = {str(row.get("eiem_section")): row for row in bpy.data.images
+                          if row.get("eiem_section")}
+                addon.material_override_payload(material, images, True)
+                self.assertNotIn("eiem_linear", image)
+
+    def test_equal_dds_pixels_do_not_merge_distinct_logical_templates(self):
+        first_path = self.dds_only_package("first")
+        second_path = self.dds_only_package("second")
+        ini = second_path.parents[1] / "mod.ini"
+        ini.write_text(ini.read_text(encoding="utf-8").replace(
+            "assets/declared/flow.png", "assets/another/flow.png").replace(
+            "DeclaredFlow", "AnotherFlow"), encoding="utf-8")
+        first = addon.import_material_file(first_path, self.obj)
+        second = addon.import_material_file(second_path, self.obj)
+        images = {str(row.get("eiem_section")): row for row in bpy.data.images
+                  if row.get("eiem_section")}
+        bindings = []
+        for material in (first, second):
+            payload, _ = addon.material_override_payload(material, images, True)
+            section = next(row.split("=", 1)[1] for row in payload
+                           if row.startswith("texture._BaseMap="))
+            bindings.append(section)
+        self.assertNotEqual(bindings[0], bindings[1])
+        self.assertEqual(images[bindings[0]]["eiem_target_path"], "assets/declared/flow.png")
+        self.assertEqual(images[bindings[1]]["eiem_target_path"], "assets/another/flow.png")
+
+    def test_new_dds_without_sampling_override_uses_original_slot_defaults(self):
+        dds = self.root / "external.dds"
+        write_dds(dds)
+        material = bpy.data.materials.new("NewAuthorMaterial")
+        material["eiem_source"] = "assets/test/body.mat"
+        material["eiem_name"] = "Body"
+        material["eiem_texture._BaseMap"] = str(dds)
+        images, textures = {}, {}
+        native = dict(details=dict(textures=[dict(property="_BaseMap", pointer=dict(
+            isNull=False, identity="original"))]), native=dict(typeHash="12" * 16))
+        original = dict(logicalPath="assets/original.png", name="Original",
+            details=dict(format="BC5", colorSpace=0))
+        source = SimpleNamespace(resolve=lambda *args: native,
+                                 resolve_identity=lambda identity: original)
+        result = addon.native_export.collect_material(addon, source, material, images,
+            textures, self.root, None, include_native_fields=False)
+        texture = textures[result["textureEdits"][0]["texture"]]
+        self.assertEqual((texture["sourcePath"], texture["sourceAsset"], texture["colorSpace"]),
+                         ("assets/original.png", "Original", 0))
 
     def test_source_and_mod_materials_never_overwrite_each_other(self):
         first = addon.import_material_file(make_package(self.root / "source", "source"), self.obj)

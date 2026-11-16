@@ -2,6 +2,7 @@
 import base64
 import importlib
 import json
+import math
 from pathlib import Path
 import sys
 
@@ -35,6 +36,9 @@ class Layout:
     def row(self, **kwargs): return self
     def split(self, **kwargs): return self
     def box(self): return self
+    def panel(self, key, **kwargs):
+        self.calls.append(('panel', key, kwargs))
+        return self, None if kwargs.get('default_closed') else self
     def separator(self): pass
     def label(self, **kwargs): self.calls.append(('label', kwargs))
     def prop(self, owner, name, **kwargs):
@@ -61,7 +65,9 @@ assert before == dict(material.items())
 # Edit real RNA widgets used by the original EFF Material UI.
 material.eiem_editor_values['eiem_float._TintColorIntensity'].scalar = 2.75
 material.eiem_editor_values['eiem_value4._TintColor'].color = (3, .5, .25, .7)
-assert material['eiem_value4._TintColor'].startswith('1,0.5,0.25,0.7'), 'ordinary color widget must clamp to 0-1'
+assert all(math.isclose(float(actual), expected, abs_tol=1e-6)
+           for actual, expected in zip(material['eiem_value4._TintColor'].split(','), (1, .5, .25, .7))), \
+    'ordinary color widget must clamp to 0-1'
 material.eiem_editor_advanced = True
 material.eiem_editor_values['eiem_value4._TintColor'].vector4 = (3, .5, .25, .7)
 material.eiem_editor_values['eiem_value4._MainTexUVSpeed'].uv_speed = (.125, -.25)
@@ -72,6 +78,8 @@ material.eiem_editor_features['mask'].enabled = False
 material.eiem_editor_features['disturb'].enabled = True
 edit = editor.synchronize(root)
 data = edit.value(mid)
+for field in ('m_EnableInstancingVariants', 'm_DoubleSidedGI'):
+    if field in data:assert type(data[field]) is bool, field + ' lost its native boolean type'
 def saved(group, name):
     return next(r['second'] for r in data['m_SavedProperties'][group] if r['first'] == name)
 assert saved('m_Floats', '_TintColorIntensity') == 2.75

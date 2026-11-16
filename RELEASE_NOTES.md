@@ -1,4 +1,28 @@
-# EFF Blender v0.50.6
+# EFF Blender v0.50.36 (local)
+
+- Material animation contributions retain their own Action and slot. Switching or clearing the editor's active Action cannot change previously registered samples; deleted live channels remain omitted.
+- Imported mixed animation channels retain one shared playback group, compatible sample-rate settings and their original INI variable names on re-export.
+- Effect reimport follows current INI texture declarations. Newly added/shared DDS resources, Material rebindings and Photoshop edits survive re-export; unreachable removed declarations no longer block import.
+
+## EFF Blender v0.50.35 (local)
+
+- Animation export follows the exported Meshes and their used materials, rigs and selected effect mounts. Sharing an Action no longer requires exporting every owner in the project.
+- Unused or removed materials and unrelated stale Action slots cannot block selected Mesh export. Shared Action playback settings, merged channels and the export switch are retained.
+
+## EFF Blender v0.50.34 (local)
+
+- Action curves now determine the channel list and export. Adding or deleting Shape Key, Bone/Empty or Material curves needs no second EFF channel edit; the action export switch still controls the complete animation.
+- Deleted material curves are skipped and partially animated vectors retain their unkeyed component values. Existing action timing, playback and key settings remain available.
+- The native geometry writer follows the readable Part/Mesh/Material names published by INI, including names whose internal identity suffixes were removed.
+
+## EFF Blender v0.50.32 (local)
+
+- Replaced the separate animation editors with one action list, channel list and shared playback/key settings.
+- One Blender Action can include Shape Key, Bone/Empty and Material slots and export as one EFF Animation.
+- Removed the old material-animation panel, parameter picker and redundant type-specific controls. Existing source Actions and keyframes remain editable.
+- Added real Blender coverage for mixed-slot actions, atomic channel imports, channel removal/reimport and panel drawing.
+
+## EFF Blender v0.50.6
 
 This release adds author-controlled bone animation resources, multi-skeleton export, and effect block clipboard round trips. Effect preview output now preserves VAT lookup UVs, vertex colors, tangent handedness, and native submesh metadata. The package remains Python-only and uses the shared native tools from the coordinated EFF release.
 

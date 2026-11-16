@@ -67,7 +67,7 @@ for root in roots:
     stats['preview'] = measure(lambda: editor.preview.refresh(root, editor.editor(root)))
     key = editor.field_key(identity, ['InitialModule','startSpeed','scalar'])
     original = node[key]
-    update = type('Update', (), {'id': node})()
+    update = type('Update', (), {'id': node, 'is_updated_geometry': False})()
     depsgraph = type('Depsgraph', (), {'updates': [update]})()
     def drag():
         node[key] = float(node[key]) + .001

@@ -106,8 +106,10 @@ class Frame:
     def at(self, node, time):
         return Frame(self.root, self.edit, time).placement(node)
 
-    def visible(self, node):
+    def visible(self, node, viewport=True):
         while node:
+            if viewport and (node.hide_get() or node.hide_viewport):
+                return False
             identity = node.get('eff_effect_node')
             if identity in self.edit.state['values'] and not self.edit.value(identity).get('m_IsActive', True):
                 return False
@@ -181,7 +183,7 @@ def static_renderers(frame, resources, diagnostics):
             obj = preview._preview_object(root, node, renderer + '/static/' + str(slot))
             obj.name = '原网格 · ' + node.name + ' · 材质 ' + str(slot)
             obj['eff_preview_static'] = True
-            visible = root.eff_effect.preview and frame.visible(node) and current.value(renderer).get('m_Enabled', True)
+            visible = root.eff_effect.preview and frame.visible(node, viewport=False) and current.value(renderer).get('m_Enabled', True)
             obj.hide_viewport = obj.hide_render = not visible
             if not visible:
                 continue
@@ -202,7 +204,9 @@ def static_renderers(frame, resources, diagnostics):
                 del obj['eff_preview_vat']
             faces = source['submeshes'][min(slot, len(source['submeshes']) - 1)]
             mesh = obj.data
-            if len(mesh.vertices) != len(vertices) or len(mesh.polygons) != len(faces):
+            geometry_changed=(len(mesh.vertices) != len(vertices) or len(mesh.polygons) != len(faces)
+                              or obj.get('eff_preview_source_mesh') != mesh_id)
+            if geometry_changed:
                 mesh.clear_geometry()
                 mesh.from_pydata([BASIS @ Vector(v) for v in vertices], [], [tuple(reversed(f)) for f in faces])
                 for uv_slot, values in source['uvs'].items():
@@ -212,11 +216,14 @@ def static_renderers(frame, resources, diagnostics):
                 color = mesh.color_attributes.new(name='EFFColor', type='FLOAT_COLOR', domain='POINT')
                 values = source['colors']
                 color.data.foreach_set('color', values.ravel() if values is not None and values.shape[1] == 4 else [1.] * (len(vertices) * 4))
-            else:
+                obj['eff_preview_source_mesh'] = mesh_id
+            elif display is not None or obj.get('eff_preview_was_vat'):
                 mesh.vertices.foreach_set('co', [float(v) for point in vertices for v in BASIS @ Vector(point)])
-            mesh.update()
-            if normals is not None:
+            if display is not None or obj.get('eff_preview_was_vat') or geometry_changed:
+                mesh.update()
+            if normals is not None and (display is not None or obj.get('eff_preview_was_vat') or geometry_changed):
                 mesh.normals_split_custom_set_from_vertices([BASIS @ Vector(n) for n in normals])
+            obj['eff_preview_was_vat'] = display is not None
             if not mesh.materials:
                 mesh.materials.append(mat)
             elif mesh.materials[0] != mat:
@@ -250,12 +257,14 @@ def trails(frame, node, identity, renderer, data, resources, diagnostics):
     key = identity + '/trails'
     existing = next((o for o in root_collection(frame.root).objects if o.get('eff_preview_key') == frame.root['eff_effect_id'] + key), None)
     visible = (frame.root.eff_effect.preview and frame.root.eff_effect.preview_particles and
-               frame.root.eff_effect.trail_preview and frame.visible(node) and module.get('enabled') and
+               frame.root.eff_effect.trail_preview and frame.visible(node, viewport=False) and module.get('enabled') and
                frame.edit.value(renderer).get('m_Enabled', True))
     if not visible:
         if existing:existing.hide_viewport = existing.hide_render = True
         return
-    paths, warnings = sampler.paths(data, frame.time, int(frame.root['eff_effect_id'][:8], 16))
+    if __package__:from . import eiem_effect_document as document
+    else:import eiem_effect_document as document
+    paths, warnings = sampler.paths(data, frame.time, document.seed(frame.root['eff_effect_id']))
     diagnostics.update(warnings)
     obj = existing or preview._preview_object(frame.root, node, key)
     obj.name = '预览拖尾 · ' + node.name; obj['eff_preview_trail'] = True

@@ -44,6 +44,27 @@ def png_preview():
 
 
 class EffectTests(unittest.TestCase):
+    def test_continuous_particle_keeps_ancestor_game_lifetime_running(self):
+        state=fixture()
+        state['schemas']['schemas/schema.json']['nodes'].append(dict(type='bool',name='looping',level=1,metaFlag=0,byteSize=1,version=1))
+        state['values']['cab:1']['looping']=False
+        state['original']['cab:1']['looping']=False
+        for identity in ('root-setting','sibling-setting'):
+            state['catalog']['objects'].append(dict(identity=identity,classId=114,schema='setting',script={'class':'EffectSetting'}))
+            state['values'][identity]={'effectLogicCfg':{'isLoop':0,'duration':3.0}}
+        state['schemas']['setting']={'nodes':[
+            dict(type=t,name=n,level=l,metaFlag=0,byteSize=-1,version=1) for t,n,l in
+            [('EffectSetting','Base',0),('EffectLogicCfg','effectLogicCfg',1),('int','isLoop',2),('float','duration',2)]]}
+        state['catalog']['hierarchy']=[
+            dict(identity='root',transform='root-transform',parent=None,components=['root-setting']),
+            dict(identity='emitter',transform='emitter-transform',parent='root-transform',components=['cab:1']),
+            dict(identity='sibling',transform='sibling-transform',parent='root-transform',components=['sibling-setting'])]
+        edit=effects.Editor(state)
+        edit.keep_emitter_running('cab:1')
+        self.assertTrue(edit.value('cab:1',['looping']))
+        self.assertEqual(edit.value('root-setting',['effectLogicCfg']),{'isLoop':1,'duration':3.0})
+        self.assertEqual(edit.value('sibling-setting',['effectLogicCfg','isLoop']),0)
+
     @staticmethod
     def texture(identity, path, name, cab='cab', path_id=2):
         return dict(identity=identity, state='raw-backed', classId=28, type='Texture2D',

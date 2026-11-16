@@ -6,6 +6,7 @@ characteristic field/texture signature; an explicit different Shader wins.
 Opening the UI never applies a preset or changes an authored field.
 """
 import json
+import math
 
 
 def field(material, name, kind='float', default=''):
@@ -220,6 +221,72 @@ def set_feature(material, key, enabled):
     # an authored override just to make a folder button visible.
 
 
+# CharacterNPR_VFX exposes a UV mode and time-driven UV speed per texture layer.
+# PolarUV is one UV mode, not a material-wide switch; UVRotate is a static angle.
+VFX_UV = {
+    '_MainTex': ('_MainUVSet', '_MainTexUVSpeed', '_MainTexUVRotate', '_MainTexUVRotateMat'),
+    '_BlendTex': ('_BlendUVSet', '_BlendTexUVSpeed', '_BlendTexUVRotate', '_BlendTexUVRotateMat'),
+    '_MaskTex': ('_MaskUVSet', '_MaskTexUVSpeed', '_MaskTexUVRotate', '_MaskTexUVRotateMat'),
+    '_DisturbTex1': ('_DisturbUVSet1', '_DisturbUVSpeed1', '_DisturbUVRotate1', '_DisturbUVRotateMat1'),
+    '_NormalMap': ('_NormalMapUVSet', '_NormalMapUVSpeed', '_NormalMapUVRotate', '_NormalMapUVRotateMat'),
+}
+VFX_UV_WEIGHTS = dict(zip(VFX_UV, ('_MainTexUVWeights', '_BlendTexUVWeights',
+                                  '_MaskTexUVWeights', '_DisturbUVWeights1', '_NormalMapUVWeights')))
+UV_SET_ITEMS = (
+    ('UV0', 'UV0', 'Mesh UV channel 0', 0),
+    ('UV1', 'UV1', 'Mesh UV channel 1', 1),
+    ('POLARUV', 'PolarUV', 'Shader-generated polar coordinates', 2),
+    ('SCREENUV', 'ScreenUV', 'Screen-space coordinates', 3),
+)
+
+
+def uv_controls(material, slot):
+    """Only advertise controls actually declared by this verified Shader."""
+    if profile(material) != 'vfx':
+        return ()
+    kinds = ('float', 'value4', 'float', 'value4')
+    return tuple('eiem_' + kind + '.' + name
+                 for kind, name in zip(kinds, VFX_UV.get(slot, ()))
+                 if 'eiem_' + kind + '.' + name in material)
+
+
+def uv_rotation_matrix(degrees):
+    radians = math.radians(float(degrees))
+    if not math.isfinite(radians):
+        raise ValueError('UV 角度必须是有限数值')
+    cosine, sine = math.cos(radians), math.sin(radians)
+    return cosine, sine, -sine, cosine
+
+
+def set_uv_angle(material, name, value):
+    """Return False for unrelated fields/Shaders; never infer arbitrary names."""
+    if profile(material) != 'vfx':
+        return False
+    fields = next((row for row in VFX_UV.values() if row[2] == name), None)
+    if not fields or 'eiem_value4.' + fields[3] not in material:
+        return False
+    matrix = uv_rotation_matrix(value)
+    material['eiem_float.' + name] = format(float(value), '.9g')
+    material['eiem_value4.' + fields[3]] = ','.join(format(v, '.9g') for v in matrix)
+    return True
+
+
+def set_uv_source(material, name, value):
+    if profile(material) != 'vfx':
+        return False
+    slot = next((slot for slot, fields in VFX_UV.items() if fields[0] == name), None)
+    if not slot or 'eiem_value4.' + VFX_UV_WEIGHTS[slot] not in material:
+        return False
+    numeric = float(value)
+    if not numeric.is_integer() or numeric not in range(4):
+        raise ValueError('UV 模式必须是 UV0、UV1、PolarUV 或 ScreenUV')
+    selected = int(numeric)
+    material['eiem_float.' + name] = str(selected)
+    material['eiem_value4.' + VFX_UV_WEIGHTS[slot]] = ','.join(
+        '1' if index == selected else '0' for index in range(4))
+    return True
+
+
 def set_switch(material, name, enabled):
     """Synchronise known switches even when edited in the raw parameter view."""
     for item in features(material):
@@ -239,9 +306,25 @@ SURFACE_ITEMS = (
     ('TRANSPARENT', '半透明（预乘混合）', '参考原生 cloth07，保留当前深度写入和双面设置', 2),
     ('CUSTOM', '自定义组合', '原有字段组合保留，可在原始参数中查看', 3),
 )
+VFX_SURFACE_ITEMS = (
+    ('OPAQUE', '不透明', '关闭透明表面，保留来源深度状态', 0),
+    ('ALPHA', 'Alpha 混合', '透明表面，Shader Blend Type 设为 Alpha', 1),
+    ('ADDITIVE', '加法混合', '透明表面，Shader Blend Type 设为 Additive', 2),
+    ('CUSTOM', '自定义组合', '保留原有 Shader 状态', 3),
+)
 
 
 def surface_mode(material):
+    if profile(material) == 'vfx':
+        if 'eiem_float._SurfaceType' not in material or 'eiem_float._BlendMode' not in material:
+            return 3
+        if not truth(field(material, '_SurfaceType')):
+            return 0
+        try:
+            blend_mode = int(float(field(material, '_BlendMode')))
+        except (TypeError, ValueError, OverflowError):
+            return 3
+        return {0: 1, 1: 2}.get(blend_mode, 3)
     transparent = truth(field(material, '_SurfaceType', default='0'))
     clip = truth(field(material, '_EnableAlphaTest', default='0'))
     if transparent:
@@ -256,6 +339,23 @@ def surface_mode(material):
 
 
 def set_surface(material, mode):
+    if profile(material) == 'vfx':
+        if ('eiem_float._SurfaceType' not in material or
+                'eiem_float._BlendMode' not in material):
+            raise ValueError('来源 Shader 没有声明表面混合字段')
+        if mode not in (0, 1, 2):
+            return
+        transparent = mode != 0
+        material['eiem_float._SurfaceType'] = str(int(transparent))
+        material['eiem_float._BlendMode'] = '1' if mode == 2 else '0'
+        material['eiem_float._EnableAlphaTest'] = '0'
+        material['eiem_float._AlphaPremultiply'] = '0'
+        for name, value in (('_SrcBlend', '1'), ('_DstBlend', '10' if transparent else '0'),
+                            ('_AlphaSrcBlend', '1'), ('_AlphaDstBlend', '10' if transparent else '0')):
+            material['eiem_float.' + name] = value
+        material['eiem_render_queue'] = '3000' if transparent else '2000'
+        material['eiem_tag.RenderType'] = 'Transparent' if transparent else 'Opaque'
+        return
     if profile(material) != 'character':
         raise ValueError('此表面预设只适用于 CharacterNPR')
     if mode not in (0, 1, 2):
@@ -306,6 +406,20 @@ def visible_slots(material, item):
     return tuple(slot for slot in item['slots'] if slot in declared)
 
 
+def visible_texture_slots(material, items=None):
+    """Hide disabled features' paths without changing bindings or UV values."""
+    items = features(material) if items is None else items
+    declared = texture_slots(material)
+    inactive = {item['key'] for item in items if not active(material, item)}
+    visible = {slot for slot in declared
+               if str(material.get('eiem_texture.' + slot, '')).strip()
+               and owner(material, 'eiem_texture.' + slot, items) not in inactive}
+    visible.update(slot for item in items for slot in visible_slots(material, item))
+    if profile(material) == 'character' and '_BaseMap' in declared:
+        visible.add('_BaseMap')
+    return tuple(slot for slot in declared if slot in visible)
+
+
 LABELS = {
     '_BaseColor': '基础颜色与透明度', '_BaseMap': '基础颜色 D（A 为透明度）',
     '_BumpMap': '法线贴图 N', '_BumpScale': '法线强度', '_MetallicGlossMap': 'PBR 参数贴图 P',
@@ -335,9 +449,22 @@ LABELS = {
     '_TintColorIntensity': '主图亮度', '_TintColorAlpha': '主图不透明度', '_BlendTint': '混合图颜色（Shader 支持 HDR）',
     '_MainTexUVSpeed': '主图速度（U/V）', '_BlendTexUVSpeed': '混合图速度（U/V）',
     '_MaskTexUVSpeed': '遮罩速度（U/V）', '_UseMainTexAsAlpha': '主图参与 Alpha',
+    '_MainUVSet': '主图 UV 模式', '_BlendUVSet': '混合图 UV 模式', '_MaskUVSet': '遮罩 UV 模式',
+    '_MainTexUVRotate': '主图固定角度（度）', '_BlendTexUVRotate': '混合图固定角度（度）',
+    '_MaskTexUVRotate': '遮罩固定角度（度）', '_DisturbUVRotate1': '扰动图固定角度（度）',
+    '_NormalMapUVRotate': '法线图固定角度（度）', '_DisturbUVSpeed1': '扰动图速度（U/V）',
+    '_DisturbUVSet1': '扰动图 UV 模式', '_NormalMapUVSet': '法线图 UV 模式',
     '_UseMaskTexAsAlpha': '遮罩参与 Alpha', '_Cull': '绘制面', '_ZWrite': '深度写入',
     '_TransparentDepthWrite': '透明深度写入', '_ZTest': '深度比较',
 }
+
+
+LABELS.update({
+    '_UsePolarUV': '极坐标 UV 映射（材质级）',
+    '_MainUVSet': '主图 UV 模式', '_BlendUVSet': '混合图 UV 模式',
+    '_MaskUVSet': '遮罩 UV 模式', '_DisturbUVSet1': '扰动图 UV 模式',
+    '_NormalMapUVSet': '法线图 UV 模式',
+})
 
 
 def label(key):

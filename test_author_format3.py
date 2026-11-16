@@ -41,6 +41,29 @@ def _dds(width=4, height=4, mips=1, fmt=98, payload=b"P" * 16, alpha_mode=3):
 
 
 class Format3PublicationTests(unittest.TestCase):
+    def test_effect_source_cache_is_content_owned_and_recovers_corruption(self):
+        import eiem_format as fmt
+        relative = 'effects/author/Resource.effres'
+        identity = 'ResourceEffectAuthor_' + hashlib.sha256(relative.encode()).hexdigest()[:16].upper()
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            extracted = []
+            for generation in ('first', 'second'):
+                stream = io.BytesIO()
+                with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED) as archive:
+                    archive.writestr('effect.json', json.dumps(dict(marker=generation)))
+                    archive.writestr('source/manifest.json', json.dumps(dict(marker=generation)))
+                snapshot = fmt.encode_format3_effect_snapshot(stream.getvalue(), dict(marker=generation), {})
+                resource = folder / (generation + '.effres')
+                resource.write_bytes(author_format3.encode_effect_author_resource(identity, relative, snapshot))
+                _, _, source = fmt.materialize_format3_effect_author_resource(resource, identity, relative, folder/'cache')
+                self.assertEqual(json.loads((source/'effect.json').read_bytes())['marker'], generation)
+                extracted.append(source)
+            self.assertNotEqual(*extracted)
+            (extracted[-1]/'effect.json').write_text('damaged cache')
+            _, _, restored = fmt.materialize_format3_effect_author_resource(resource, identity, relative, folder/'cache')
+            self.assertEqual(json.loads((restored/'effect.json').read_bytes())['marker'], 'second')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -258,7 +281,8 @@ class Format3PublicationTests(unittest.TestCase):
                        sourcePath='assets/game/texture.png', sourceAsset='Texture')
         manifest = author_format3.write_format3_directory(
             output, 'Readable', [], {}, [texture], [], [], [], [])
-        row = manifest['_ini'][texture['id']]
+        row = manifest['_ini']['TextureMat']
+        self.assertNotIn(texture['id'], manifest['_ini'])
         self.assertEqual(row['dds'], 'textures/mat_25.001_01.dds')
         self.assertNotIn('path', row)
         self.assertFalse(list((output / 'textures').glob('*.effres')))

@@ -9,6 +9,36 @@ from test_eiem_effect_simulation import particle_data, constant
 
 
 class SourcePreviewTests(unittest.TestCase):
+    def test_animation_overlays_copy_only_changed_fields_without_mutating_source(self):
+        from types import SimpleNamespace
+        material=dict(m_SavedProperties=dict(
+            m_Floats=[dict(first='_Alpha',second=1)],
+            m_Colors=[dict(first='_Tint',second=dict(r=1,g=1,b=1,a=1))],
+            m_TexEnvs=[dict(first='_MainTex',second=dict(m_Scale=dict(x=1,y=1),m_Offset=dict(x=0,y=0)))]))
+        transform=dict(m_LocalScale=dict(x=1,y=1,z=1))
+        values={'mat':material,'transform':transform}
+        baseline=copy.deepcopy(values)
+        bindings=[dict(path=1,typeID=4,attribute=3,customType=0),
+                  dict(path=1,typeID=199,attribute=0x80000000|(timeline.crc('_Alpha')&0xfffffff),customType=22),
+                  dict(path=1,typeID=199,attribute=timeline.crc('_Tint')&0xfffffff,customType=22),
+                  dict(path=1,typeID=199,attribute=(1<<28)|(timeline.crc('_Tint')&0xfffffff),customType=22),
+                  dict(path=1,typeID=199,attribute=(2<<28)|(timeline.crc('_MainTex_ST')&0xfffffff),customType=22)]
+        clip=SimpleNamespace(safe_bindings=True,warnings=[],bindings=bindings,
+            dimension=timeline.Clip.dimension,sample=lambda *args:[2,3,4,.5,.2,.3,.4])
+        player=timeline.Timeline.__new__(timeline.Timeline)
+        player.clips={'clip':clip};player.warnings=[]
+        player.paths={1:[dict(transform='transform',components=['renderer'])]}
+        edit=SimpleNamespace(value=lambda identity:values[identity],objects={
+            'renderer':dict(classId=199,references=[dict(type='Material',identity='mat')])})
+        transforms,renderers,warnings=player.evaluate(edit,'clip',1)
+        self.assertFalse(warnings)
+        self.assertEqual(transforms['transform']['m_LocalScale'],dict(x=2,y=3,z=4))
+        props=renderers['renderer']['mat']['m_SavedProperties']
+        self.assertEqual(props['m_Floats'][0]['second'],.5)
+        self.assertEqual(props['m_Colors'][0]['second'],dict(r=.2,g=.3,b=1,a=1))
+        self.assertEqual(props['m_TexEnvs'][0]['second']['m_Offset'],dict(x=.4,y=0))
+        self.assertEqual(values,baseline)
+
     def test_sparse_stream_coefficients_and_stepped_segments(self):
         raw=b''.join(struct.pack('<fi',t,len(keys))+b''.join(struct.pack('<i4f',i,*c) for i,c in keys)
             for t,keys in [(-3.4e38,[(0,(0,0,0,7))]),(0,[(0,(2,3,4,5)),(1,(0,0,0,8))]),

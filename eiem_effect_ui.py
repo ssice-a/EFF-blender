@@ -4,13 +4,9 @@ Mappings verified against exported TypeTrees and UnityCsReference module editors
 No arbitrary module graph or synthetic lifetime/fade fields are serialized.
 """
 import json
+import math
 import textwrap
 
-GROUPS = (
-    ('运动', ('VelocityModule','InheritVelocityModule','LifetimeByEmitterSpeedModule','ForceModule','ExternalForcesModule','ClampVelocityModule','NoiseModule')),
-    ('外观随生命周期 / 速度变化', ('ColorModule','SizeModule','RotationModule','ColorBySpeedModule','SizeBySpeedModule','RotationBySpeedModule','UVModule')),
-    ('交互与扩展', ('CollisionModule','TriggerModule','SubModule','LightsModule','TrailModule','CustomDataModule')),
-)
 MODULES = {
     'InitialModule': ('发射器基础', '系统播放周期与每个粒子出生时的状态。'),
     'EmissionModule': ('发射数量', '按秒 / 按移动距离连续发射，或在指定时间爆发。'),
@@ -63,6 +59,9 @@ LABELS = {
     'gravityModifier':'重力倍率', 'maxNumParticles':'最大同时存活数', 'customEmitterVelocity':'自定义挂点速度',
     'rateOverTime':'每秒发射数', 'rateOverDistance':'每单位移动发射数', 'm_Bursts':'定时爆发',
     'scaleMode':'缩放来源', 'particleSystemScalingMode':'粒子缩放方式', 'axisBitMask':'参与计算的轴遮罩',
+    'uvChannelMask':'UV 通道遮罩', 'influenceMask':'力场图层遮罩', 'collidesWith':'碰撞图层遮罩',
+    'm_Bits':'位掩码', 'm_RenderingLayerMask':'渲染层遮罩', 'm_LightModeMask':'光照模式遮罩',
+    'influenceFilter':'力场过滤来源', 'm_MaskInteraction':'Sprite Mask 交互',
     'time':'时间 (s)', 'countCurve':'发射数量', 'cycleCount':'重复次数 (0=无限)', 'repeatInterval':'间隔 (s)', 'probability':'触发概率',
     'angle':'锥角 (°)', 'length':'长度', 'radius':'半径', 'arc':'圆弧 (°)', 'radiusThickness':'半径厚度比例',
     'boxThickness':'盒壳厚度', 'donutRadius':'圆环管半径', 'm_Position':'形状位置', 'm_Rotation':'形状旋转 (°)', 'm_Scale':'形状尺寸',
@@ -103,7 +102,7 @@ LABELS = {
     'm_SortingFudge':'排序偏移', 'm_SortingOrder':'排序顺序', 'm_AllowRoll':'允许 Billboard 翻滚',
     'm_UseCustomVertexStreams':'自定义顶点流', 'm_EnableGPUInstancing':'GPU 实例化',
     'm_MotionVectors':'运动矢量',
-    'effectLogicCfg':'游戏整体播放控制', 'isLoop':'整体循环', 'duration':'整体持续时间 (s)', 'randomDelay':'随机延迟',
+    'effectLogicCfg':'游戏整体播放控制', 'isLoop':'持续运行（忽略整体时长）', 'duration':'非持续时的整体时长 (s)', 'randomDelay':'随机延迟',
     'delay':'延迟 (s)', 'fadeoutTime':'整体淡出 (s)', 'autoFade':'自动淡入淡出', 'startFadeTime':'开始淡入 (s)', 'endFadeTime':'结束淡出 (s)',
     'timeScaleMode':'时间缩放模式', 'followMoveAnimPlaybackSpeed':'跟随移动动画速度',
 }
@@ -116,11 +115,13 @@ ENUMS = {
     'cullingMode': ('自动','暂停后追帧','暂停','始终模拟'),
     'ringBufferMode': ('关闭','暂停直到被替换','循环直到被替换'),
     'emitterVelocityMode': ('Transform','Rigidbody','自定义'),
+    'ExternalForcesModule.influenceFilter': ('图层遮罩','显式列表','图层遮罩与显式列表'),
     'minMaxState': ('常量','曲线','随机双曲线','随机范围'),
     'm_RenderMode': ('Billboard 面片','速度拉伸面片','水平面片','垂直面片','Mesh 网格','不渲染'),
     'm_RenderAlignment': ('视图','世界','局部','朝向相机','速度'),
     'm_SortMode': ('不排序','距相机距离','旧粒子在前','新粒子在前','相机深度','距离反序','深度反序'),
     'm_MotionVectors': ('仅相机运动','物体运动','强制无运动'),
+    'm_MaskInteraction': ('不与 Sprite Mask 交互','仅显示在 Mask 内','仅显示在 Mask 外'),
     'ShapeModule.type': ('球体','球壳','半球','半球壳','圆锥底面','盒体','Mesh','圆锥底边','圆锥体积','圆锥壳','圆盘','圆边','线段','MeshRenderer','SkinnedMeshRenderer','盒壳','盒边','圆环','矩形','Sprite','SpriteRenderer'),
     'UVModule.mode': ('网格图集','Sprite 列表'),
     'UVModule.timeMode': ('生命周期','速度','FPS'),
@@ -149,6 +150,104 @@ ENUMS = {
 }
 COLOR_MODES = ('颜色','渐变','随机双色','随机双渐变','渐变随机取色')
 
+_INTEGER_TYPES = frozenset(('SInt8','UInt8','char','short','SInt16','UInt16','unsigned short',
+                            'int','SInt32','UInt32','unsigned int','Type*','SInt64','long long',
+                            'UInt64','unsigned long long','FileSize'))
+_FLOAT_TYPES = frozenset(('float','double'))
+
+def bitmask_spec(path):
+    """Return only masks whose serialized field semantics are verified."""
+    path=tuple(part for part in path if not isinstance(part,int))
+    if path and path[-1]=='axisBitMask':
+        return {'label':'XYZ 轴','bits':((0,'X'),(1,'Y'),(2,'Z')),'compact':True}
+    if len(path)>=2 and path[-2:]==('UVModule','uvChannelMask'):
+        return {'label':'UV 通道','bits':tuple((bit,'UV'+str(bit)) for bit in range(4)),'compact':True}
+    if len(path)>=2 and path[-1]=='m_Bits' and path[-2] in ('influenceMask','collidesWith'):
+        title='力场图层' if path[-2]=='influenceMask' else '碰撞图层'
+        return {'label':title,'bits':tuple((bit,str(bit)) for bit in range(32)),
+                'prefix':'Layer ','compact':False}
+    if path and path[-1]=='m_RenderingLayerMask':
+        return {'label':'渲染层','bits':tuple((bit,str(bit)) for bit in range(32)),
+                'prefix':'Layer ','compact':False}
+    if path and path[-1]=='m_LightModeMask':
+        return {'label':'光照模式位','bits':tuple((bit,str(bit)) for bit in range(32)),
+                'prefix':'Bit ','compact':False}
+    if path and path[-1] in ('properties','m_Bits') and 'SubModule' in path and 'subEmitters' in path:
+        return {'label':'子发射器继承','bits':((0,'颜色'),(1,'大小'),(2,'旋转'),(3,'寿命'),(4,'系统持续时间')),
+                'compact':True}
+    return None
+
+def field_semantic(path,native_type,parent=None,class_id=None):
+    """Describe authoring meaning without changing the native storage type."""
+    if native_type in ('bool','Boolean'):return 'boolean'
+    normalized=tuple(part for part in path if not isinstance(part,int))
+    if class_id==114 and normalized==('m_Enabled',) and native_type=='UInt8':return 'boolean'
+    if bitmask_spec(path) and native_type in _INTEGER_TYPES | _FLOAT_TYPES:return 'bitmask'
+    if native_type in _INTEGER_TYPES and enum_items(path,parent):return 'enum'
+    if native_type in _FLOAT_TYPES:return 'float'
+    if native_type in _INTEGER_TYPES:return 'integer'
+    if str(native_type).startswith('PPtr<'):return 'reference'
+    return 'native'
+
+def toggle_bit(value,bit):
+    if type(value) is not int or type(bit) is not int or bit<0:
+        raise ValueError('位掩码和值必须是非负位索引的整数')
+    return value ^ (1<<bit)
+
+def toggle_native_bit(value,bit,native_type):
+    if type(value) is float and native_type in _FLOAT_TYPES:
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError('浮点存储的位掩码必须是有限整数')
+        result=toggle_bit(int(value),bit)
+        precision=24 if native_type=='float' else 53
+        if abs(result)>1<<precision or int(float(result))!=result:
+            raise ValueError('该位掩码超出此浮点类型的精确整数范围')
+        return float(result)
+    return toggle_bit(value,bit)
+
+def bitmask_display_value(value,native_type):
+    """Return a lossless 32-bit view, or None when a numeric display would lie."""
+    if native_type in _INTEGER_TYPES and type(value) is int:
+        return value & 0xFFFFFFFF
+    if native_type in _INTEGER_TYPES and type(value) is str:
+        digits=value[1:] if value.startswith('-') else value
+        if digits.isdigit():
+            parsed=int(value,10)
+            if str(parsed)==value:return parsed & 0xFFFFFFFF
+    if native_type in _FLOAT_TYPES and type(value) is float:
+        if not math.isfinite(value) or not value.is_integer():return None
+        precision=24 if native_type=='float' else 53
+        if abs(value)>1<<precision:return None
+        return int(value) & 0xFFFFFFFF
+    return None
+
+def draw_bitmask(layout,owner,identity,path,value,title,native_type):
+    spec=bitmask_spec(path)
+    if not spec:return False
+    display=bitmask_display_value(value,native_type)
+    if display is None:
+        layout.label(text=title+' · '+str(value)+'（无法无损显示位掩码，原生值保留）')
+        return True
+    def draw_row(target,bits):
+        row=target.row(align=True)
+        for bit,label in bits:
+            caption=(spec.get('prefix','')+label) if 'prefix' in spec else label
+            op=row.operator('eiem.effect_mask_toggle',text=caption,
+                            depress=bool(display & (1<<bit)))
+            op.object_name=owner.name;op.identity=identity;op.path=json.dumps(path,ensure_ascii=True);op.bit=bit
+    if spec.get('compact'):
+        row=layout.row(align=True);row.label(text=title)
+        draw_row(row,spec['bits'])
+        row.label(text='0x%08X'%display)
+    else:
+        header,body=layout.panel('effect_mask_'+owner.name+'_'+identity+'_'+json.dumps(path,ensure_ascii=True),
+                                 default_closed=True)
+        header.label(text=title+' · 0x%08X'%display)
+        if body:
+            bits=spec['bits']
+            for start in range(0,len(bits),8):draw_row(body,bits[start:start+8])
+    return True
+
 def enum_items(path, value=None):
     names = ENUMS.get('.'.join(str(p) for p in path if not isinstance(p, int))) or ENUMS.get(path[-1])
     if path[-1]=='m_Enabled' and isinstance(value,dict) and 'axisBitMask' in value and 'particleSystemScalingMode' in value:
@@ -161,9 +260,13 @@ def enum_items(path, value=None):
 
 def name(key):
     text = str(key)
-    if text.lower().startswith(('unk','unnamed')):
-        return 'unknown'
-    return LABELS.get(text, text)
+    translated = LABELS.get(text)
+    return translated+' · '+text if translated and translated!=text else text
+
+
+def module_name(key):
+    translated = MODULES.get(key, (key, ''))[0]
+    return translated+' · '+key if translated!=key else key
 
 
 def angle_unit(path):
@@ -185,15 +288,31 @@ def hint(layout, text, icon='NONE'):
         layout.label(text=line,icon=icon if i==0 else 'NONE')
 
 class Draw:
-    def __init__(self, api, obj, edit, identity):
+    def __init__(self, api, obj, edit, identity, *, ancestors=(), panel_prefix=''):
         self.api, self.obj, self.edit, self.identity = api, obj, edit, identity
+        self.ancestors, self.panel_prefix = ancestors, panel_prefix
     def key(self, path):
         return self.api.field_key(self.identity, path)
     def live(self, path):
         return self.obj.get(self.key(path), self.edit.value(self.identity, path))
     def prop(self, layout, path, text=None):
+        layout.use_property_split=False
         key = self.key(path)
         if key in self.obj:
+            schema=self.edit.schema(self.identity,path)
+            parent=self.edit.value(self.identity,path[:-1]) if path else None
+            semantic=field_semantic(path,schema['type'],parent,
+                                    self.edit.objects[self.identity].get('classId'))
+            title=name(path[-1]) if text is None else text
+            if semantic=='bitmask' and draw_bitmask(layout,self.obj,self.identity,path,
+                    self.live(path),title,schema['type']):return
+            if semantic=='boolean' and schema['type'] not in ('bool','Boolean'):
+                value=bool(self.live(path))
+                op=layout.operator('eiem.effect_bool_toggle',text=title,
+                                   icon='CHECKBOX_HLT' if value else 'CHECKBOX_DEHLT',depress=value)
+                op.object_name=self.obj.name;op.identity=self.identity
+                op.path=json.dumps(path,ensure_ascii=True)
+                return
             angle=self.obj.eff_effect_angles.get(key)
             choice=self.obj.eff_effect_choices.get(key)
             if angle:
@@ -203,8 +322,13 @@ class Draw:
                 layout.prop(angle,'degrees',text=title)
             elif choice:layout.prop(choice,'value',text=name(path[-1]) if text is None else text)
             else:layout.prop(self.obj, '["'+key+'"]', text=name(path[-1]) if text is None else text)
+        else:
+            # Parsed components outside the authoring allowlist remain visible.
+            # A read-only value must never look like an editable field.
+            title=name(path[-1]) if text is None else text
+            layout.label(text=title+'：'+str(self.edit.value(self.identity,path))+'（只读）')
     def block(self, layout, path, title, closed=False, enabled=False, return_header=False):
-        header, body = layout.panel(self.key(path), default_closed=closed)
+        header, body = layout.panel(self.panel_prefix+self.key(path), default_closed=closed)
         if enabled and self.key(path+['enabled']) in self.obj:
             self.prop(header, path+['enabled'], '')
         header.label(text=title)
@@ -259,7 +383,15 @@ class Draw:
                 else:self.color(row,path+['key'+str(i)],'')
         self.prop(layout,path+['m_Mode'],'插值')
     def value(self,layout,path,title=None):
-        value=self.edit.value(self.identity,path);title=name(path[-1]) if title is None else title
+        value=self.edit.value(self.identity,path)
+        if title is None:
+            title=name(path[-1])
+            if path[-1]=='second':
+                pair=self.edit.value(self.identity,path[:-1])
+                if isinstance(pair.get('first'),str):title=pair['first']+' · second'
+            if 'm_TexEnvs' in path:
+                title={'m_Texture':'贴图引用 · m_Texture','m_Scale':'UV 缩放 · m_Scale',
+                       'm_Offset':'UV 偏移 · m_Offset'}.get(path[-1],title)
         if isinstance(value,dict) and 'minMaxState' in value:
             mode=int(self.live(path+['minMaxState']))
             row=layout.row(align=True)
@@ -301,22 +433,33 @@ class Draw:
             row=layout.row(align=True);row.label(text=title)
             for k in value:self.prop(row,path+[k],k.upper())
             return
+        if isinstance(value,dict) and set(value)=={'m_Bits'}:
+            mask_path=path+['m_Bits'];mask_schema=self.edit.schema(self.identity,mask_path)
+            semantic=field_semantic(mask_path,mask_schema['type'],value,
+                                    self.edit.objects[self.identity].get('classId'))
+            if semantic=='bitmask':
+                draw_bitmask(layout,self.obj,self.identity,mask_path,value['m_Bits'],title,mask_schema['type'])
+                return
         if isinstance(value,dict) and set(value)>=set(('value','mode','spread','speed')):
             self.prop(layout,path+['value'],title)
             return
         schema=self.edit.schema(self.identity,path)
         if schema['type'].startswith('PPtr<'):
-            self.api.draw_pointer(layout,self.edit,self.identity,path,value,title=title)
+            self.api.draw_pointer(layout,self.edit,self.identity,path,value,title=title+' ['+schema['type']+']')
+            self.reference(layout,path)
             return
         if isinstance(value,list):
-            layout.label(text=title+' · '+str(len(value))+' 项')
+            layout=self.block(layout,path,title+' · '+str(len(value))+' 项',True)
+            if not layout:return
             for i,item in enumerate(value):
                 item_schema=self.edit.schema(self.identity,path+[i])
                 if item_schema['type'].startswith('PPtr<'):
                     self.value(layout,path+[i],title+' '+str(i+1))
                     continue
                 if isinstance(item,dict):
-                    row=layout.row(align=True);row.label(text=title+' '+str(i+1))
+                    row=layout.row(align=True)
+                    entry_name=item.get('first')
+                    row.label(text=title+' '+str(i+1)+(' · '+entry_name if isinstance(entry_name,str) else ''))
                     if self.edit.editable(self.identity,path):
                         self.array_op(row,path,'COPY',i,icon='DUPLICATE');self.array_op(row,path,'REMOVE',i,icon='X')
                     for k in item:self.value(layout,path+[i,k])
@@ -324,15 +467,41 @@ class Draw:
             if self.edit.editable(self.identity,path):self.array_op(layout,path,'ADD',text='添加'+title)
             return
         if isinstance(value,dict):
+            if value.get('encoding') in ('base64','author-payload'):
+                layout.label(text=title+'（原生字节，保留）');return
             body=self.block(layout,path,title,True)
             if body:
                 for k in value:self.value(body,path+[k])
             return
         self.prop(layout,path,title)
+    def reference(self,layout,path):
+        """Expand a material at its actual PPtr; never build/load assets in draw."""
+        target=self.api.preview._target(self.edit,self.identity,path)
+        spec=self.edit.objects.get(target,{})
+        if spec.get('classId')!=21 or target not in self.edit.state['values']:return
+        if target in self.ancestors or target==self.identity:
+            hint(layout,'此 Material 已在上层显示，保留引用，不重复展开。',icon='INFO');return
+        body=self.block(layout,path+['_referenced_material'],
+                        'Material · '+(spec.get('name') or '材质')+'（共享资源）',True)
+        if not body:return
+        root=self.api.root_of(self.obj)
+        author=self.api.assets.material_object(root,target) if root else None
+        if author is None or self.api.material_bridge.material_for(author) is None:
+            hint(body,'当前特效尚未建立此材质的编辑入口。',icon='INFO')
+            op=body.operator('eiem.effect_resource',text='展开材质编辑',icon='MATERIAL')
+            op.identity=target;op.select_object=False
+            hint(body,'从已保留的数据展开贴图和参数；修改前继续引用原游戏资源。')
+            return
+        hint(body,'此处修改被所有引用它的 Renderer 共用。贴图位于 m_SavedProperties → m_TexEnvs。')
+        draw=Draw(self.api,author,self.edit,target,ancestors=self.ancestors+(self.identity,),
+                  panel_prefix=self.panel_prefix+self.key(path)+'_')
+        draw.material(body)
+        raw=draw.block(body,path+['_native_material'],'原生 Material 序列化字段',True)
+        if raw:draw.native_component(raw)
     def fields(self,layout,path,fields):
         value=self.edit.value(self.identity,path)
-        for key in fields:
-            if key not in value:continue
+        for key in value:
+            if key not in fields:continue
             title=None
             if key=='curve':
                 if path and path[0] in ('RotationModule','RotationBySpeedModule'):title='角速度 Z (°/s)' if self.live(path+['separateAxes']) else '角速度 (°/s)'
@@ -345,13 +514,8 @@ class Draw:
         if not extra:return
         body=self.block(layout,path+['_advanced'],'高级 / 其余原生字段',True)
         if body:
-            for k in extra:self.api.draw_value(body,self.obj,self.edit,self.identity,path+[k],self.edit.value(self.identity,path+[k]))
+            for k in extra:self.value(body,path+[k])
     def main(self,layout):
-        system=['lengthInSec','looping','prewarm','startDelay','simulationSpeed','moveWithTransform','scalingMode','playOnAwake','autoRandomSeed']
-        self.fields(layout,[],system)
-        if not self.live(['autoRandomSeed']):self.value(layout,['randomSeed'])
-        if self.live(['moveWithTransform'])==2:self.value(layout,['moveWithCustomTransform'])
-        layout.separator();layout.label(text='粒子出生设置')
         initial=['startLifetime','startSpeed','startColor','size3D','startSize']
         if self.live(['InitialModule','size3D']):initial+=['startSizeY','startSizeZ']
         initial+=['rotation3D']
@@ -359,10 +523,10 @@ class Draw:
         initial+=['startRotation','gravityModifier','maxNumParticles']
         self.fields(layout,['InitialModule'],initial)
         self.advanced(layout,['InitialModule'],initial)
-        self.advanced(layout,[],system+['moveWithCustomTransform']+list(MODULES))
     def module(self,layout,module):
-        data=self.edit.value(self.identity,[module]);title,helptext=MODULES[module]
-        header,body=self.block(layout,[module],title,module not in ('InitialModule','EmissionModule','ShapeModule'),module!='InitialModule',return_header=True)
+        data=self.edit.value(self.identity,[module])
+        helptext=MODULES.get(module,(module,'来源 TypeTree 中的原生模块。'))[1]
+        header,body=self.block(layout,[module],module_name(module),True,'enabled' in data,return_header=True)
         row=header.row(align=True)
         copy_button=row.operator('eiem.effect_module_copy',text='',icon='COPYDOWN')
         copy_button.object_name=self.obj.name;copy_button.identity=self.identity;copy_button.module=module
@@ -370,7 +534,7 @@ class Draw:
         paste_button.object_name=self.obj.name;paste_button.identity=self.identity;paste_button.module=module
         if not body:return
         hint(body,helptext,icon='INFO')
-        body.enabled=bool(self.live([module,'enabled']))
+        if 'enabled' in data:body.enabled=bool(self.live([module,'enabled']))
         if module=='InitialModule':self.main(body);return
         if module=='EmissionModule':
             op=body.operator('eiem.effect_continuous',text='设为持续发射…',icon='TIME');op.object_name=self.obj.name;op.identity=self.identity
@@ -380,7 +544,8 @@ class Draw:
                 warning=body
                 hint(warning,'已启用高级自动数量规则，会覆盖这里的每秒发射数。',icon='INFO')
                 op=warning.operator('eiem.effect_use_particle_emission',text='使用下方的发射数量',icon='CHECKMARK');op.object_name=self.obj.name
-            self.fields(body,[module],['rateOverTime','rateOverDistance','m_Bursts']);return
+            fields=['rateOverTime','rateOverDistance','m_Bursts']
+            self.fields(body,[module],fields);self.advanced(body,[module],fields);return
         if module=='ShapeModule':
             kind=int(self.live([module,'type']));fields=['type']
             if kind not in (5,15,16,18,6,13,14,19,20):fields+=['radius']
@@ -421,38 +586,39 @@ class Draw:
                     if mode==2:fields+=['color'+str(stream)]
         self.fields(body,[module],fields);self.advanced(body,[module],fields)
     def particle(self,layout):
-        hint(layout,'取消勾选仅停用模块；在原位置重新勾选即可恢复。',icon='INFO')
-        for module in ('InitialModule','EmissionModule','ShapeModule'):self.module(layout,module)
-        for title,modules in GROUPS:
-            available=[m for m in modules if m in self.edit.value(self.identity)]
-            if not available:continue
-            layout.label(text=title)
-            for module in available:self.module(layout,module)
+        hint(layout,'模块按来源顺序显示。勾选控制启停，折叠只控制界面；关闭保留参数。',icon='INFO')
+        data=self.edit.value(self.identity)
+        modules=[key for key,value in data.items() if key.endswith('Module') and isinstance(value,dict)]
+        body=self.block(layout,['_system'],'ParticleSystem · 系统字段',True)
+        if body:
+            fields=[key for key in data if key not in modules and key not in self.api.document.LOCKED]
+            self.fields(body,[],fields)
+        for module in modules:self.module(layout,module)
     def renderer(self,layout):
-        body=self.block(layout,['_renderer'],'渲染：面片 / Mesh / 材质',True)
-        if not body:return
-        fields=['m_Enabled','m_RenderMode','m_Materials']
+        body=layout
+        hint(body,'Billboard / Mesh 是 m_RenderMode 的渲染方式；贴图由 m_Materials 中的 Material 引用。')
         mode=int(self.live(['m_RenderMode']))
-        if mode==4:fields+=['m_Mesh','m_Mesh1','m_Mesh2','m_Mesh3']
-        if mode==1:fields+=['m_CameraVelocityScale','m_VelocityScale','m_LengthScale']
-        fields+=['m_RenderAlignment','m_Pivot','m_Flip','m_SortMode','m_SortingFudge','m_SortingOrder','m_MinParticleSize','m_MaxParticleSize','m_AllowRoll','m_MotionVectors']
-        self.fields(body,[],fields);self.advanced(body,[],fields)
         if mode==4:
-            body.separator();body.prop(self.obj.eff_effect,'particle_mesh')
+            row=body.row(align=True)
+            row.prop(self.obj.eff_effect,'particle_mesh',text='调用 Mesh（场景物体）')
+            pick=row.row(align=True);pick.ui_units_x=1
+            pick.prop(self.obj.eff_effect,'particle_mesh_pick',text='',
+                      icon='BLANK1',icon_only=True,emboss=False)
             op=body.operator('eiem.effect_mesh_edit',text='编辑粒子 Mesh',icon='MESH_DATA')
             op.object_name=self.obj.name;op.renderer=self.identity
-            body.label(text='网格的 EFF 材质槽会导出到粒子渲染器；对象位置不影响发射区域。')
-            body.label(text='支持网格/UV/静态修改器；当前每个网格一个材质。')
-        for index in range(len(self.edit.value(self.identity).get('m_Materials',[]))):
-            mid=self.api.assets.renderer_material(self.api.root_of(self.obj),self.edit,self.identity,index)
-            if not mid or mid not in self.edit.state['values']:continue
-            textures=self.edit.value(mid).get('m_SavedProperties',{}).get('m_TexEnvs',[])
-            if not textures:continue
-            box=body.box();box.label(text='材质 '+str(index+1)+' · 贴图引用')
-            for texture_index,texture in enumerate(textures):
-                texture_path=['m_SavedProperties','m_TexEnvs',texture_index,'second','m_Texture']
-                self.api.draw_pointer(box,self.edit,mid,texture_path,
-                                      self.edit.value(mid,texture_path),texture.get('first','贴图'))
+            if self.obj.eff_effect.particle_mesh:
+                op=body.operator('eiem.effect_mesh_place',text='采用 Mesh 当前变换',icon='OBJECT_ORIGIN')
+                op.object_name=self.obj.name
+            hint(body,'用右侧吸管从视图或大纲选择 Mesh，也可点击下拉列表搜索；留空使用原生 Mesh 引用。')
+            body.label(text='旋转围绕物体原点；选取时采用当前位置与朝向，之后可独立调整发射器。')
+            body.label(text='支持场景 EFF 材质、多材质槽、无 UV 网格及静态修改器。')
+        fields=[key for key in self.edit.value(self.identity) if key not in self.api.document.LOCKED]
+        source_meshes=[key for key in fields if key in ('m_Mesh','m_Mesh1','m_Mesh2','m_Mesh3')] if mode==4 else []
+        self.fields(body,[],[key for key in fields if key not in source_meshes])
+        if source_meshes:
+            header,references=body.panel(self.key(['_source_meshes']),default_closed=True)
+            header.label(text='原生 Mesh 引用 / 游戏逻辑资源')
+            if references:self.fields(references,[],source_meshes)
 
     def material(self,layout):
         self.api.material_bridge.draw(layout,self.obj)
@@ -462,28 +628,22 @@ class Draw:
         elif spec['classId']==199:self.renderer(layout)
         elif spec['classId']==21:self.material(layout)
         elif kind=='EffectSetting':
-            body=self.block(layout,['_game'],'游戏整体控制（所有发射器）',True)
-            if body:
-                data=self.edit.value(self.identity)
-                if 'effectLogicCfg' in data:self.fields(body,['effectLogicCfg'],list(data['effectLogicCfg']))
-                body.label(text='游戏脚本控制；离线粒子预览暂不执行此组件。',icon='INFO')
-                self.advanced(body,[],['effectLogicCfg'])
+            hint(layout,'游戏整体播放 / LOD 控制。离线粒子预览暂不执行此脚本。',icon='INFO')
+            hint(layout,'持续运行不会清空粒子重播；关闭后游戏会在整体时长结束时回收。')
+            self.native_component(layout)
         elif kind=='VFXAutoEmissiveRate':
-            body=self.block(layout,['_automatic_emission'],'高级：按缩放自动计算数量',True)
-            if body:
-                hint(body,'默认关闭，直接使用“发射数量”。仅需按挂点缩放改数量时开启。',icon='INFO')
-                self.value(body,['m_Enabled'],title='启用自动数量')
-                settings=body
-                self.value(settings,['rateOverTime'],title='单位缩放发射数')
-                self.fields(settings,[],['scaleMode','particleSystemScalingMode','axisBitMask'])
-                hint(settings,'轴遮罩：X=1，Y=2，Z=4；相加选择，例如 XYZ=7。')
-                hint(settings,'对应原组件 VFXAutoEmissiveRate；开启后会修改随机范围的上界。')
+            hint(layout,'按挂点缩放覆盖发射数量；仅需要此游戏脚本行为时启用。',icon='INFO')
+            self.native_component(layout)
+            hint(layout,'轴遮罩：X=1，Y=2，Z=4；相加选择，例如 XYZ=7。')
         elif spec['classId']==4:
-            body=self.block(layout,['_transform'],'节点变换',True)
-            if body:
-                body.prop(self.obj,'location',text='位置');body.prop(self.obj,'rotation_euler',text='旋转');body.prop(self.obj,'scale',text='缩放')
+            layout.prop(self.obj,'location',text='位置 · m_LocalPosition')
+            layout.prop(self.obj,'rotation_euler',text='旋转 · m_LocalRotation')
+            layout.prop(self.obj,'scale',text='缩放 · m_LocalScale')
+            hint(layout,'以上控件使用 Blender 坐标；导出转换回原生 Transform。父子关系由来源层级保留。')
         else:
-            body=self.block(layout,['_component'],kind+' · 来源组件',True)
-            if body:
-                for k,v in self.edit.value(self.identity).items():
-                    if k not in ('m_GameObject','m_Script','references'):self.value(body,[k])
+            if spec['classId'] not in self.api.document.EDITABLE:
+                hint(layout,'此原生组件目前只读保留；显示实际字段和引用，不执行该组件。',icon='INFO')
+            self.native_component(layout)
+    def native_component(self,layout):
+        for key in self.edit.value(self.identity):
+            if key not in self.api.document.LOCKED:self.value(layout,[key])

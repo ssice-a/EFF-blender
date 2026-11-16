@@ -47,9 +47,7 @@ def blender_processes():
 
 
 def save_job(path, job):
-    temporary = path.with_suffix('.tmp')
-    temporary.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding='utf-8')
-    os.replace(temporary, path)
+    updates.save_install_job(path, job)
 
 
 def install(job_path):
@@ -89,7 +87,7 @@ def install(job_path):
     except Exception:
         backup.rename(target)
         raise
-    job.update(status='installed', backup=str(backup), revision=build['revision'])
+    job.update(status='installed', backup=str(backup), revision=build['revision'], waitingPids=[])
     save_job(job_path, job)
     return job
 
@@ -98,15 +96,22 @@ def run(job_path):
     path = Path(job_path).resolve()
     try:
         job = json.loads(path.read_text('utf-8-sig'))
-        job['status'] = 'waitingForBlenderExit'; save_job(path, job)
-        while blender_processes():
+        job.update(status='waitingForBlenderExit', waitingPids=[])
+        save_job(path, job)
+        while True:
+            pids = sorted(blender_processes())
+            if job['waitingPids'] != pids:
+                job['waitingPids'] = pids
+                save_job(path, job)
+            if not pids:
+                break
             time.sleep(1)
         # A new process can race the final check; locked files make the rename
         # fail with the old directory intact. Do not force-close anything.
         install(path)
     except Exception as error:
         job = json.loads(path.read_text('utf-8-sig'))
-        job.update(status='failed', error=str(error)); save_job(path, job)
+        job.update(status='failed', error=str(error), waitingPids=[]); save_job(path, job)
         raise
 
 

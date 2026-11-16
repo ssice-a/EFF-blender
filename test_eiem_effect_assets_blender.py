@@ -18,6 +18,13 @@ editor = addon.eiem_blender_addon.effect_editor
 assets = editor.assets
 root = editor.import_source(bpy.context, source)
 edit = editor.synchronize(root)
+cleared = editor.document.Editor(copy.deepcopy(edit.state))
+for identity, spec in cleared.objects.items():
+    if spec['classId'] != 198 or identity not in cleared.state['values']:continue
+    for module, array in (('UVModule', 'sprites'), ('SubModule', 'subEmitters')):
+        value = cleared.value(identity).get(module, {})
+        if array in value:value[array] = []
+assets.export_document(root, cleared)
 baseline = assets.export_document(root, edit)
 controller_edits = {identity: value for identity, value in edit.emission_controllers()}
 baseline_objects = {row['identity']: row for row in baseline['objects']}
@@ -46,12 +53,25 @@ custom.rotation_euler = (.2, -.1, .3)
 custom.scale = (1.2, .8, 1.1)
 custom.location = (5, 0, 0)  # Template placement must not move emitted particles.
 modifier = custom.modifiers.new('可编辑细分', 'SUBSURF'); modifier.levels = 1; modifier.render_levels = 1
+geometry = bpy.data.node_groups.new('作者网格 · 几何节点测试', 'GeometryNodeTree')
+geometry.interface.new_socket(name='Geometry', in_out='INPUT', socket_type='NodeSocketGeometry')
+geometry.interface.new_socket(name='Geometry', in_out='OUTPUT', socket_type='NodeSocketGeometry')
+nodes=geometry.nodes;links=geometry.links
+group_input=nodes.new('NodeGroupInput');group_output=nodes.new('NodeGroupOutput')
+transform=nodes.new('GeometryNodeTransform');transform.inputs['Translation'].default_value=(0,0,.23)
+links.new(group_input.outputs['Geometry'],transform.inputs['Geometry'])
+links.new(transform.outputs['Geometry'],group_output.inputs['Geometry'])
+modifier=custom.modifiers.new('作者网格节点修改器','NODES');modifier.node_group=geometry
 for uv in custom.data.uv_layers.active.data: uv.uv.x *= .8
 mesh_preview = assets.preview_mesh(custom)
 snapshot = assets.mesh_snapshot(custom)
 assert snapshot['vertex_count'] > 4 and snapshot['uvs'][0]
 points = [Vector(snapshot['vertices'][i:i+3]) for i in range(0, len(snapshot['vertices']), 3)]
 assert all(any((v-p).length < 1e-5 for p in points) for v in mesh_preview[0]), 'preview and native mesh coordinates differ'
+modifier.show_viewport=False
+without_nodes=assets.preview_mesh(custom)[0]
+modifier.show_viewport=True
+assert len(without_nodes)==len(mesh_preview[0]) and any((a-b).length>.1 for a,b in zip(without_nodes,mesh_preview[0])), 'author Geometry Nodes modifier was not evaluated for preview/export'
 
 # Asymmetric pixels and alpha expose orientation, color and mipmap mistakes.
 image = bpy.data.images.new('作者花瓣颜色', width=4, height=2, alpha=True)
@@ -77,7 +97,7 @@ class Layout:
 layout=Layout()
 editor.effect_ui.Draw(editor,node,edit,renderer).renderer(layout)
 material_path=editor.logical_asset_text(edit,mid)
-assert any('材质 1' in s and material_path in s for s in layout.labels), layout.labels
+assert any('m_Materials 1' in s and material_path in s for s in layout.labels), layout.labels
 assert any(args and args[0]=='eiem.effect_pointer' and
            kwargs.get('icon')=='EYEDROPPER'
            for args,kwargs in layout.operators), layout.operators
