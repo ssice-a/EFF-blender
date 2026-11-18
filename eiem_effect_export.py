@@ -111,12 +111,10 @@ def publish(destination, effects):
     read_native_build = modules['effect_native'].read_native_build
     destination.parent.mkdir(parents=True, exist_ok=True)
     mod_id = destination.name
-    if destination.exists() and any(destination.iterdir()):
-        if not (destination / 'mod.ini').is_file():
-            raise ValueError('不能覆盖缺少 mod.ini 的目录，请选择新的特效 Mod 目录')
-        previous = eiem_native_export.publication_inventory(destination)
+    previous = eiem_native_export.publication_inventory(destination)
+    if previous is not None:
         _require(previous.get('modType') == 'effect',
-                 '输出目录是角色 Mod；请通过角色的完整 Format 3 导出更新特效')
+                 '输出目录是角色 Mod：%s；请通过角色的完整 Format 3 导出更新特效' % destination)
         mod_id = previous['modId']
     mod_id = author_format3.identifier(mod_id)
     for manifest in destination.parent.rglob('mod.ini'):
@@ -145,5 +143,6 @@ def publish(destination, effects):
         def reader(path):
             return author_format3.read_format3_directory(path)
 
-        eiem_native_export.publish(staging, destination, reader, candidate=candidate)
+        eiem_native_export.publish(staging, destination, reader, previous=previous,
+                                   candidate=candidate)
     return False

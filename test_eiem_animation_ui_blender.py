@@ -1,5 +1,6 @@
 """A native Action with KEY, OBJECT and MATERIAL slots uses one EFF action."""
 import importlib
+import copy
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -36,16 +37,25 @@ try:
         rig.pose.bones['Root'].keyframe_insert('location',frame=frame)
         value.scalar=number;value.keyframe_insert('scalar',frame=frame)
     for other in bpy.context.selected_objects:other.select_set(False)
-    for member in (obj,rig):member.select_set(True)
+    obj.select_set(True)
     bpy.context.view_layer.objects.active=obj;bpy.context.scene.render.fps=30
     assert bpy.ops.eiem.animation(operation='CREATE')=={'FINISHED'}
     clip=model.active_clip(bpy.context);identity=clip.identity
+    assert model.create_action([rig]).identity==identity
+    assert len(model.all_groups())==1
     assert clip.label=='MixedAction' and (clip.start,clip.end)==(1,31)
     assert {row['kind'] for row in model.action_channels(identity)}=={'SHAPE','BONE','MATERIAL'}
     assert {row['action'] for row in model.action_channels(identity)}=={action}
+    extra=bpy.data.objects.new('ExtraOwner',mesh.copy());bpy.context.collection.objects.link(extra)
+    extra.data.eiem_shape_animations.clear()
+    extra_material=material.copy();extra_material.eiem_material_animations.clear()
+    extra.data.materials.clear();extra.data.materials.append(extra_material)
     with patch.object(addon.material_animation,'import_action',side_effect=ValueError('injected import failure')):
-        try:model.create_action([obj,rig]);raise AssertionError('Partial mixed action committed')
+        try:model.create_action([extra]);raise AssertionError('Partial mixed action committed')
         except ValueError as error:assert str(error)=='injected import failure'
+    assert not extra.data.eiem_shape_animations and not extra_material.eiem_material_animations
+    extra_mesh=extra.data;bpy.data.objects.remove(extra,do_unlink=True)
+    bpy.data.meshes.remove(extra_mesh);bpy.data.materials.remove(extra_material)
     assert len(model.all_groups())==1 and len(model.action_channels(identity))==3
     clip.hotkey='F6';clip.sample_rate=30;clip.autoplay=True
     for row in model.action_channels(identity):
@@ -71,6 +81,13 @@ try:
     runtime=state['animations'][identity]
     assert len(runtime['tracks'])==2 and len(runtime['boneTracks'])==1
     assert {len(samples) for samples in runtime['tracks'].values()}=={31}
+    duplicate=copy.deepcopy(part);duplicate['partId']='OtherImport'
+    duplicate['shapeAnimations'][0]['_groupIdentity']='another-import-group'
+    try:
+        author_format3._controls_resource('MixedActionMod',[part,duplicate],[],[],[],return_state=True)
+        raise AssertionError('Independent imported groups silently merged by runtime ID')
+    except ValueError as error:
+        assert 'independent Animation groups' in str(error)
 
     class Layout:
         def __init__(self):self.properties=[];self.operators=[];self.labels=[]

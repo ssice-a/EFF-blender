@@ -80,6 +80,41 @@ try:
     assert {'speed','sample_rate'}<=set(layout.properties)
     assert 'advanced' not in layout.properties
     assert not hasattr(bpy.types,'EFF_PT_material_animation')
+    # Legacy material tracks may have an Action but no persisted binding flag
+    # or slot handle. Drawing the unified panel must resolve that binding as a
+    # read-only operation; Blender forbids writing Material ID properties in
+    # a panel draw callback.
+    legacy=bpy.data.materials.new('Legacy unbound material Action')
+    legacy['eiem_source']='assets/vfx.mat';legacy['eiem_float._EmissionBrightness']='1'
+    legacy_row=legacy.eiem_editor_values.add()
+    legacy_row.name=legacy_row.key='eiem_float._EmissionBrightness'
+    legacy_action=bpy.data.actions.new('Legacy material Action')
+    legacy_animation=legacy.animation_data_create();legacy_animation.action=legacy_action
+    legacy_action.slots.new(id_type='MATERIAL',name='Unrelated material')
+    legacy_slot=legacy_action.slots.new(id_type='MATERIAL',name=legacy.name)
+    legacy_animation.action_slot=legacy_slot
+    for frame,value in ((1,0),(31,1)):
+        legacy_row.scalar=value;legacy_row.keyframe_insert(data_path='scalar',frame=frame)
+    legacy_clip=legacy.eiem_material_animations.add()
+    legacy_clip.identity=legacy_clip.runtime_id='LegacyBinding'
+    legacy_clip.label='Legacy binding';legacy_clip.property='_EmissionBrightness'
+    legacy_clip.source_key='eiem_float._EmissionBrightness'
+    legacy_clip.source_path=legacy_row.path_from_id('scalar')
+    legacy_clip.kind='FLOAT';legacy_clip.action=legacy_action
+    legacy_clip.source_bound=False;legacy_clip.slot_handle=0
+    bpy.context.scene.eiem_animation_group=legacy_clip.identity
+    legacy_layout=PanelLayout();panel.layout=legacy_layout
+    addon.shape_animation.EFF_PT_shape_animation.draw(panel,bpy.context)
+    legacy_channels=addon.shape_animation.action_channels(legacy_clip.identity)
+    assert len(legacy_channels)==1 and legacy_channels[0]['action']==legacy_action
+    assert legacy_channels[0]['owner']==legacy and legacy_channels[0]['name']=='_EmissionBrightness'
+    assert legacy_clip.source_bound is False and legacy_clip.slot_handle==0
+    assert addon.shape_animation.source_actions(legacy_clip.identity)=={legacy_action}
+    assert addon.material_animation.source_action(legacy,legacy_clip)==legacy_action
+    assert legacy_clip.source_bound is False and legacy_clip.slot_handle==0
+    legacy_clip.start=1;legacy_clip.end=31
+    assert len(addon.material_animation.export_clips(legacy,'LegacyMaterial',addon))==1
+    assert legacy_clip.source_bound is False and legacy_clip.slot_handle==0
     # Selecting an unrelated action in the UI must never change export grouping.
     separate=bpy.data.materials.new('Separate material Action');separate['eiem_source']='assets/vfx.mat'
     separate['eiem_float._EmissionBrightness']='1'

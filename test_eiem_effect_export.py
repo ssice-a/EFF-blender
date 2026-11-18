@@ -101,6 +101,23 @@ class StandaloneEffectExportTests(unittest.TestCase):
         self.assertNotIn('[Replace', ini)
         self.assertEqual(author_format3.read_format3_directory(self.staging)['modType'], 'effect')
 
+    def test_publishes_into_existing_directory_without_manifest(self):
+        from _eiem_effect_export_tests import eiem_native_export
+
+        destination = self.root / 'WeaponEffects'
+        destination.mkdir()
+        (destination / 'notes.txt').write_bytes(b'keep')
+        modules = dict(author_format3=author_format3,
+                       effect_native=types.SimpleNamespace(read_native_build=None))
+
+        with patch.object(eiem_native_export, 'pack_modules', return_value=(modules, None)):
+            eiem_effect_export.publish(destination, [self.effect()])
+
+        manifest = author_format3.read_format3_directory(destination)
+        self.assertEqual(manifest['modType'], 'effect')
+        self.assertEqual(manifest['modId'], destination.name)
+        self.assertEqual((destination / 'notes.txt').read_bytes(), b'keep')
+
     def test_rejects_duplicate_effect_identity_before_writing(self):
         with self.assertRaisesRegex(ValueError, '重复'):
             eiem_effect_export.write_effect_directory(

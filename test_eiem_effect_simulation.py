@@ -41,6 +41,22 @@ class SimulationTests(unittest.TestCase):
         for row in p:self.assertAlmostEqual(row['position'][2],2*row['age'])
         data['InitialModule']['maxNumParticles']=0;self.assertEqual(sim.particles(data,1),[])
 
+    def test_zero_duration_loop_does_not_scan_empty_cycles(self):
+        data=particle_data(16)
+        data['lengthInSec']=0.0
+        data['InitialModule']['startLifetime']=constant(2)
+        data['EmissionModule']['m_Bursts']=[]
+        self.assertEqual(sim._burst_cycles(2.4,1e-6,True,False),())
+        self.assertEqual(len(sim.particles(data,2.4)),32)
+
+    def test_zero_duration_loop_burst_uses_first_cycle(self):
+        data=particle_data(0)
+        data['lengthInSec']=0.0
+        data['EmissionModule']['m_Bursts']=[dict(time=0.0,cycleCount=1,repeatInterval=0.0,
+            probability=1.0,countCurve=constant(2))]
+        self.assertEqual(sim._burst_cycles(2.4,1e-6,True,True,False),(0,))
+        self.assertEqual(len(sim.particles(data,2.4)),2)
+
     def test_birth_capacity_cache_reuses_admissions_and_preserves_backward_seek(self):
         data=particle_data(1000)
         data['InitialModule'].update(maxNumParticles=1,startLifetime=constant(.37))

@@ -7,6 +7,7 @@ import importlib
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import bpy
 
@@ -48,7 +49,7 @@ def dispatch(operator, context):
 
 original = (addon.selected_export_resources, addon.ExportHelper.invoke, addon.export_package)
 try:
-    addon.selected_export_resources = lambda context=None: ([], [], [object()], [])
+    addon.selected_export_resources = lambda context=None: ([], [], [SimpleNamespace(emitters=None)], [])
     addon.ExportHelper.invoke = accept_dialog
     addon.export_package = record_export
     addon.EFF_OT_export.execute = dispatch
@@ -90,6 +91,25 @@ try:
     existing = output / 'chosen-existing-mod'
     existing.mkdir(exist_ok=True)
     (existing / 'mod.ini').write_text('[Mod]\nformat=3\nid=existing\n', encoding='utf-8')
+    # A filename remembered by ExportHelper is not a directory selection.
+    # Reproduce choosing the Mods parent while a character Mod's name remains
+    # in that field: it must not steal the explicitly named effect output.
+    bpy.context.scene.eiem_export_mod_name = 'new-particles'
+    assert bpy.ops.eiem.export_package('EXEC_DEFAULT', directory=str(output),
+        filepath=str(existing)) == {'FINISHED'}
+    assert destinations[-1] == output / 'new-particles', 'remembered filename hijacked the chosen parent'
+    assert addon.mod_export_directory(output, str(existing), 'new-particles') == output / 'new-particles'
+    # Blender supplies the absolute current directory when no child directory
+    # is selected; unlike `files`, this never falls back to the filename field.
+    assert bpy.ops.eiem.export_package('EXEC_DEFAULT', directory=str(output),
+        filepath=str(existing), dirs=[{'name': str(output)}]) == {'FINISHED'}
+    assert destinations[-1] == output / 'new-particles'
+    invoke_in_background = True
+    bpy.context.scene.eiem_export_mod_name = 'new-particles'
+    assert bpy.ops.eiem.export_package('INVOKE_DEFAULT', directory=str(output),
+        filepath=str(existing)) == {'FINISHED'}
+    assert destinations[-1] == output / 'new-particles', 'picker adopted a stale filename as a Mod selection'
+    invoke_in_background = False
     bpy.context.scene.eiem_export_mod_name = 'previous-name'
     assert bpy.ops.eiem.export_package('EXEC_DEFAULT', directory=str(existing),
         filepath=str(existing / 'previous-name')) == {'FINISHED'}
@@ -100,16 +120,25 @@ try:
     assert bpy.ops.eiem.export_package('INVOKE_DEFAULT', directory=str(existing),
         filepath=str(existing / 'another-old-name')) == {'FINISHED'}
     assert destinations[-1] == existing and bpy.context.scene.eiem_export_mod_name == existing.name
+    assert bpy.ops.eiem.export_package.get_rna_type().properties['dirs'].is_skip_save
     # Selecting the directory in its parent (without entering it) is the same
     # operation; Blender then reports the child as filepath.
     bpy.context.scene.eiem_export_mod_name = 'stale-name'
     assert bpy.ops.eiem.export_package('INVOKE_DEFAULT', directory=str(output),
-        filepath=str(existing)) == {'FINISHED'}
+        filepath=str(existing), dirs=[{'name': existing.name}]) == {'FINISHED'}
     assert destinations[-1] == existing and bpy.context.scene.eiem_export_mod_name == existing.name
+    unmarked = output / 'selected-without-manifest'
+    unmarked.mkdir(exist_ok=True)
+    (unmarked / 'notes.txt').write_text('keep', encoding='utf-8')
+    bpy.context.scene.eiem_export_mod_name = 'stale-name'
+    assert bpy.ops.eiem.export_package('INVOKE_DEFAULT', directory=str(output),
+        filepath=str(unmarked), dirs=[{'name': unmarked.name}]) == {'FINISHED'}
+    assert destinations[-1] == unmarked and bpy.context.scene.eiem_export_mod_name == unmarked.name
     report = dict(passed=True, normalDialogUsesVisibleDestination=True,
         legacyRememberedOverrideCleared=True, quickExactDestinationPreserved=True,
         overrideDoesNotPersist=True, blankNameGetsDefault=True,
-        selectedExistingModReplacesItself=True)
+        selectedExistingModReplacesItself=True, selectedDirectoryWithoutManifest=True,
+        staleExistingFilenameIgnored=True)
     (output / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     print('PASS EXPORT DESTINATION ' + json.dumps(report), flush=True)
 finally:

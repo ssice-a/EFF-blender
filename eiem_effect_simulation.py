@@ -242,7 +242,8 @@ class _CapacitySchedule:
             births.append((born,ordinal))
         # A burst may repeat past the end of its system cycle. Keep considering
         # those old cycles; filtering by birth time avoids admitting them twice.
-        cycles=range(int(time/duration)+1) if data['looping'] else (0,)
+        cycles=_burst_cycles(time,duration,data['looping'],bool(data['bursts']),
+                             data.get('burstLooping',data['looping']))
         for cycle in cycles:
             for bi,burst in enumerate(data['bursts']):
                 rng=random.Random(self.seed+cycle*3571+bi)
@@ -272,6 +273,23 @@ def _capacity_schedule(serialized, seed):
     return _CapacitySchedule(serialized,seed)
 
 
+def _burst_cycles(time,duration,looping,has_bursts,burst_looping=True):
+    """Return only cycles that can contribute burst events.
+
+    Rate-over-time admission is calculated analytically above. Iterating every
+    system cycle when there are no bursts is wasted work, and an invalid
+    zero-duration looping system must not turn into millions of empty cycles.
+    With a zero source duration there is no meaningful repeat interval, so its
+    burst preview uses the first cycle only while rate-over-time remains
+    continuous over the requested timeline.
+    """
+    if not has_bursts:
+        return ()
+    if not looping or not burst_looping:
+        return (0,)
+    return range(int(time/duration)+1)
+
+
 def particles(data, time, seed=1):
     if time < 0:
         return []
@@ -286,10 +304,12 @@ def particles(data, time, seed=1):
     limit=max(0,int(initial.get('maxNumParticles',1000)))
     if limit==0:return []
     if limit>20000:raise ValueError('离线预览上限为 20000 粒子；原生数据未修改')
-    duration=max(1e-6,data.get('lengthInSec',5))
+    source_duration=data.get('lengthInSec',5)
+    duration=max(1e-6,source_duration)
     prewarm=duration if data.get('prewarm') and data.get('looping') else 0
     time+=prewarm
-    admission=dict(duration=duration,looping=bool(data.get('looping')),limit=limit,
+    admission=dict(duration=duration,looping=bool(data.get('looping')),
+                   burstLooping=bool(data.get('looping')) and source_duration>0,limit=limit,
                    lifetime=initial.get('startLifetime',{}),rate=emission.get('rateOverTime',{}),
                    bursts=emission.get('m_Bursts',[]))
     serialized=json.dumps(admission,sort_keys=True,separators=(',',':'))

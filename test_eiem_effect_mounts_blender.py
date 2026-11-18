@@ -40,7 +40,14 @@ assert restored[0].eff_effect.mount==restored[1].eff_effect.mount
 assert len(cache)==1
 graph2=mounts.graphs(restored,animation,Matrix.Identity(4))
 out=graph2[restored[0].eff_effect.mount][0]
-assert out['animations'][0]['tracks']==tracks,(out['animations'][0]['tracks'],tracks)
+assert out['animations'][0]['id']==clip.identity
+assert animation.bone_group_members(clip.identity)==[(pivot,clip)], 'restoring a separate import merged the source Action group'
+original_by_kind={track['kind']:track for track in tracks}
+assert {track['kind'] for track in out['animations'][0]['tracks']}==set(original_by_kind)
+node_paths={node['path'] for node in out['nodes']}
+for track in out['animations'][0]['tracks']:
+    assert track['samples']==original_by_kind[track['kind']]['samples']
+    assert track['path'] in node_paths, 'restored animation points at a missing author node'
 bad=empty('Source emitter');bad['eff_effect_node']='source:1';assert not mounts.eligible(bad)
 Path(report).write_text(json.dumps(dict(status='PASS',shared=True,nodes=2,samples=len(position),
     nativeBytes=len(rows[0]['_mount_native'][0]['data']),editableRoundtrip=True)),encoding='utf-8')

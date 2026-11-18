@@ -1131,9 +1131,12 @@ def publication_inventory(root):
     edited DDS in the old output must not prevent publishing a complete repair.
     """
     root = Path(root).resolve()
+    marker = root / 'mod.ini'
+    if not marker.is_file():
+        return None
     ini = configparser.ConfigParser(interpolation=None, delimiters=('=',), strict=True)
     ini.optionxform = str
-    with (root / 'mod.ini').open(encoding='utf-8-sig') as stream:
+    with marker.open(encoding='utf-8-sig') as stream:
         ini.read_file(stream)
     if ini.get('Mod', 'format', fallback='') != '3':
         raise ValueError('Format 3 发布目标包含其他格式 Mod')
@@ -1165,12 +1168,12 @@ def publication_inventory(root):
 def publish(staging, destination, reader, previous=None, candidate=None):
     staging = Path(staging).resolve()
     destination = Path(destination).resolve()
-    marker = destination/'mod.ini'
-    if destination.exists() and any(destination.iterdir()):
-        if not marker.is_file():
-            raise ValueError('不能覆盖缺少 mod.ini 的目录，请选择新的 Mod 输出目录')
-        if previous is None:previous = publication_inventory(destination)
+    if previous is None:
+        previous = publication_inventory(destination)
     if candidate is None:candidate = reader(staging)
+    for name in candidate['_files']:
+        if destination not in (destination / name).resolve().parents:
+            raise ValueError('导出资源路径超出输出目录：' + name)
     changed, removed = package_changes(staging, destination, previous, candidate)
     if not changed and not removed:
         return previous if previous is not None else candidate

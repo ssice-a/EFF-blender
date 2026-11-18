@@ -73,7 +73,7 @@ def _write_curve(curves, data_path, index, values, start, end):
 def _settings(clip, sample_count, fps):
     duration = float(clip["duration"])
     rate = int(clip.get("sampleRate") or round((sample_count - 1) / duration))
-    return dict(identity=clip["id"], label=clip["label"], enabled=True,
+    return dict(identity=clip["id"], runtime_id=clip.get('_runtimeId',clip['id']), label=clip["label"], enabled=True,
                 speed_variable=clip["speedVariable"],
                 start=1.0, end=1.0 + duration * fps, loop=clip["loop"],
                 autoplay=clip["autoplay"], speed=clip["speed"],
@@ -217,7 +217,7 @@ def _restore_material_animations(state, materials, fps):
                 item.autoplay = clip["autoplay"]
                 item.speed = clip["speed"]
                 item.sample_rate = settings["sample_rate"]
-                item.runtime_id = identity
+                item.runtime_id = settings['runtime_id']
                 item.speed_variable = clip["speedVariable"]
                 item.runtime_variables = json.dumps(variables[(property_name, kind)])
                 item.property = property_name
@@ -262,7 +262,7 @@ def _editable_binding(binding, state):
                         for rows in endpoints.values())
                     and len({item["speed"] for rows in endpoints.values()
                              for item in rows}) <= 1)
-    return any(binding["id"] == "KeyAnimation" + clip["id"]
+    return any(binding["id"] == "KeyAnimation" + clip.get('_runtimeId',clip["id"])
                and binding["variable"] == clip["speedVariable"]
                and binding["type"] == "press" and binding["key"] == clip["key"]
                and binding["values"] == [1.0]
@@ -273,6 +273,13 @@ def restore_format3_controls(state, meshes, skeletons, skeleton_payloads,
                              materials, package_collection, scene, basis,
                              condition_parser):
     """Rebuild editable controls while keeping their INI variable identities."""
+    from . import eiem_shape_animation as animation
+    identities=animation.import_group_ids(package_collection,
+        [clip['id'] for clip in state['animations'].values()])
+    state=dict(state)
+    state['animations']={name:dict(clip) for name,clip in state['animations'].items()}
+    for clip in state['animations'].values():
+        clip['_runtimeId']=clip['id'];clip['id']=identities[clip['id']]
     visibility = {}
     part_sections = {}
     for section, part in state["parts"].items():

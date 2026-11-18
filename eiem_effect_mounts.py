@@ -119,7 +119,7 @@ def graphs(roots, animation, basis):
                 for kind,values in zip(('Position','Rotation','Scale'),samples):
                     tracks.append(dict(path=paths[obj],kind=kind,samples=values))
             if tracks:
-                graph['animations'].append(dict(id=group,label=c.label,key=c.hotkey,
+                graph['animations'].append(dict(id=animation.runtime_identity(c),_groupIdentity=group,label=c.label,key=c.hotkey,
                     duration=duration,speed=c.speed,speedVariable=c.speed_variable or None,
                     loop=c.loop,autoplay=c.autoplay,sample_rate=c.sample_rate,sample_count=count,
                     tracks=tracks))
@@ -170,7 +170,7 @@ def compile_clips(roots, rows, include_hotkeys=True):
         row['_mount_native'] = output
 
 
-def restore(root, row, cache, collection, basis):
+def restore(root, row, cache, collection, basis, group_ids=None):
     graph=row.get('authorHierarchy')
     if not graph: return
     key=(graph['id'],root.eff_effect.owner.as_pointer() if root.eff_effect.owner else 0,root.eff_effect.bone)
@@ -184,6 +184,8 @@ def restore(root, row, cache, collection, basis):
             q=node['rotation'];obj.matrix_basis=basis@Matrix.LocRotScale(Vector(node['position']),Quaternion((q[3],*q[:3])),Vector(node['scale']))@basis.inverted()
             nodes[node['path']]=obj
         from . import eiem_shape_animation as animation
+        if group_ids is None:
+            group_ids=animation.import_group_ids(collection,[c['id'] for c in graph.get('animations',())])
         for clip in graph.get('animations',()):
             targets=sorted({t['path'] for t in clip['tracks']})
             for path in targets:
@@ -200,7 +202,8 @@ def restore(root, row, cache, collection, basis):
                 descriptor=animation.current_bone_descriptor(obj)
                 settings=dict(label=clip['label'],enabled=True,start=1,end=1+clip['duration']*fps,
                     loop=clip['loop'],autoplay=clip['autoplay'],speed=clip['speed'],sample_rate=clip['sample_rate'],hotkey=clip['key'])
-                member=animation.append_bone_member(obj,clip['id'],descriptor,settings)
+                settings['runtime_id']=clip['id']
+                member=animation.append_bone_member(obj,group_ids[clip['id']],descriptor,settings)
                 member.speed_variable=clip.get('speedVariable') or ''
                 bpy.context.scene.frame_set(bpy.context.scene.frame_current)
         cache[key]=nodes

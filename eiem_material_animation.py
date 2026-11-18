@@ -30,16 +30,22 @@ def action_curves(material,action=None,slot_handle=None):
     return curves
 
 
-def source_action(material,clip,strict=False):
-    """Resolve old metadata once; never reinterpret a bound group on UI selection."""
+def resolve_source_action(material,clip,strict=False):
+    """Resolve a material clip without changing any Blender RNA data.
+
+    Blender calls panel ``draw`` methods from a read-only context. Older
+    projects can have an Action but lack its persisted binding flag or slot
+    handle, so resolution must work there without lazily writing the repair.
+    Return ``(Action or None, slot_handle)``.
+    """
     if clip.action:
+        handle=getattr(clip,'slot_handle',0)
         if not clip.source_bound and not hasattr(clip.action,'fcurves'):
             slots=[slot for slot in clip.action.slots if slot.target_id_type=='MATERIAL']
             named=[slot for slot in slots if slot.name_display==material.name]
-            if len(named)==1:clip.slot_handle=named[0].handle
-            elif len(slots)==1:clip.slot_handle=slots[0].handle
-        clip.source_bound=True
-        return clip.action
+            if len(named)==1:handle=named[0].handle
+            elif len(slots)==1:handle=slots[0].handle
+        return clip.action,handle
     if clip.source_bound:return None
     index=next((i for i,c in enumerate(material.eiem_material_animations) if c==clip),-1)
     path=clip.source_path or 'eiem_material_animations[%d].%s'%(index,'value' if clip.kind=='FLOAT' else 'vector')
@@ -52,13 +58,17 @@ def source_action(material,clip,strict=False):
     named=[pair for pair in candidates if pair[0].name in {clip.label,clip.identity,clip.runtime_id}]
     if len(named)==1:candidates=named
     if len(candidates)==1:
-        clip.action,clip.slot_handle=candidates[0]
-        clip.source_bound=True
-        return clip.action
+        return candidates[0]
     if not candidates:return None  # Deleted curves contribute no exported tracks.
     if strict:
         raise ValueError(material.name+' 的旧动画来源不唯一：'+clip.label+'；请在 EFF 动画中选择源 Action')
     return None
+
+
+def source_action(material,clip,strict=False):
+    """Read-only compatibility wrapper for callers that need only an Action."""
+    resolved=resolve_source_action(material,clip,strict=strict)
+    return resolved[0] if resolved else None
 
 
 def discover_action_tracks(material,action=None,slot_handle=None):
@@ -128,7 +138,8 @@ def pending_action_tracks(material):
     if not animation or not animation.action:return []
     handle=getattr(getattr(animation,'action_slot',None),'handle',0)
     existing={(clip.source_path,clip.property) for clip in material.eiem_material_animations
-              if source_action(material,clip)==animation.action and clip.slot_handle==handle}
+              if (binding:=resolve_source_action(material,clip)) is not None
+              and binding==(animation.action,handle)}
     return [item for item in discover_action_tracks(material)
             if (next(iter(item['curves'].values())).data_path,item['property']) not in existing]
 
@@ -148,11 +159,12 @@ def register_action_tracks(materials):
     added=0
     for action,entries in by_action.items():
         groups=shape.all_groups()
-        target=next((clip for clip in groups
-                     if action in shape.source_actions(clip.identity)),None)
+        matches=[clip for clip in groups if action in shape.source_actions(clip.identity)]
+        if len(matches)>1:raise ValueError('材质 Action 已属于多个动画组，请先选择要添加到的动画组')
+        target=matches[0] if matches else None
         if target:
             identity=target.identity
-            settings={field:getattr(target,field) for field in shape.SHARED_FIELDS}
+            settings=shape.group_settings(target)
         else:
             identity=animation_identity(entries[0][1])
             frames=[point.co.x for _material,tracks in entries for item in tracks
@@ -211,9 +223,9 @@ def import_action(material,identity='',settings=None,scene=None,tracks=None):
         shared['label']=settings.get('label',action.name)
     added=0
     for item in discovered:
-        if any(clip.identity==identity and source_action(material,clip)==action and clip.slot_handle==handle and clip.source_path==next(iter(item['curves'].values())).data_path
+        if any(clip.identity==identity and resolve_source_action(material,clip)==(action,handle) and clip.source_path==next(iter(item['curves'].values())).data_path
                and clip.property==item['property'] for clip in material.eiem_material_animations):continue
-        clip=material.eiem_material_animations.add();clip.action=action;clip.source_bound=True;clip.identity=identity;clip.runtime_id=identity
+        clip=material.eiem_material_animations.add();clip.action=action;clip.source_bound=True;clip.identity=identity;clip.runtime_id=shared.get('runtime_id') or identity
         clip.label=shared['label'];clip.enabled=shared['enabled'];clip.start=shared['start'];clip.end=shared['end']
         clip.loop=shared['loop'];clip.autoplay=shared['autoplay'];clip.speed=shared['speed']
         clip.speed_variable=shared.get('speed_variable','');clip.sample_rate=shared['sample_rate'];clip.hotkey=shared['hotkey']
@@ -233,7 +245,8 @@ def import_action(material,identity='',settings=None,scene=None,tracks=None):
 def remove_track(material,identity,property_name=None):
     """Retire binding metadata while keeping source editor keyframes intact."""
     collections=[]
-    bindings={(source_action(material,clip),clip.slot_handle) for clip in material.eiem_material_animations}
+    bindings={binding for clip in material.eiem_material_animations
+              if (binding:=resolve_source_action(material,clip)) is not None}
     animation=material.animation_data
     if animation and animation.action:bindings.add((animation.action,getattr(animation.action_slot,'handle',0)))
     for action,handle in bindings:
@@ -273,8 +286,10 @@ def action_tracks(material,strict=True):
     result=[];bindings={}
     for clip in clips:
         if strict and not clip.enabled:continue
-        action=source_action(material,clip,strict=strict)
-        if action:bindings.setdefault((action,clip.slot_handle),[]).append(clip)
+        resolved=resolve_source_action(material,clip,strict=strict)
+        if resolved:
+            action,handle=resolved
+            bindings.setdefault((action,handle),[]).append(clip)
     for (action,handle),members in bindings.items():
         for track in discover_action_tracks(material,action,handle):
             path=next(iter(track['curves'].values())).data_path
@@ -329,9 +344,11 @@ def export_clips(material,mid,addon,include_hotkeys=True):
             tracks.append(dict(variable=variable,material=mid,property=property_name,kind=kind,component=component,samples=samples))
         row=grouped.get(cid)
         if row is None:
-            row=dict(id=cid,label=c.label,key=c.hotkey if include_hotkeys else '',duration=(c.end-c.start)/fps,
+            row=dict(id=cid,_groupIdentity=c.identity,label=c.label,key=c.hotkey if include_hotkeys else '',duration=(c.end-c.start)/fps,
                 speed=c.speed,speedVariable=c.speed_variable or None,loop=c.loop,autoplay=c.autoplay,
                 sample_rate=int(c.sample_rate),targets=[]);grouped[cid]=row
+        elif row['_groupIdentity']!=c.identity:
+            raise ValueError('独立动画组使用了相同导出 ID：'+cid)
         elif any(row[key]!=value for key,value in (('duration',(c.end-c.start)/fps),('speed',c.speed),
                 ('loop',c.loop),('autoplay',c.autoplay),('sample_rate',int(c.sample_rate)))):
             raise ValueError('同一 EFF 动画组内的材质轨道播放参数不一致：'+c.label)

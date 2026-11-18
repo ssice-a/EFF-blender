@@ -95,7 +95,9 @@ class ControlsImportTests(unittest.TestCase):
         for rig in self.rigs:
             bpy.data.objects.remove(rig, do_unlink=True)
         for obj in self.meshes.values():
+            mesh=obj.data
             bpy.data.objects.remove(obj, do_unlink=True)
+            bpy.data.meshes.remove(mesh)
         bpy.data.materials.remove(self.material, do_unlink=True)
         for child in list(self.package_collection.children):
             bpy.data.collections.remove(child)
@@ -285,6 +287,35 @@ variable=$value
             self.assertEqual(restored['parts']['PartA']['shapes']['Smile'], '$value')
             self.assertEqual(restored['bindings'][0]['key'], 'F9')
             self.assertEqual(set(bpy.data.texts), texts_before)
+
+    def test_same_named_actions_from_separate_mods_are_isolated(self):
+        addon=package.eiem_blender_addon;animation=addon.shape_animation
+        others={name:bpy.data.objects.new(name+'_other',obj.data.copy()) for name,obj in self.meshes.items()}
+        other_material=bpy.data.materials.new('OtherMaterial')
+        other_collection=bpy.data.collections.new('OtherMod')
+        other_collection['eiem_import_id']='other-mod'
+        try:
+            for meshes,material,collection in ((self.meshes,self.material,self.package_collection),
+                                              (others,other_material,other_collection)):
+                package.eiem_controls_import.restore_format3_controls(self.state,meshes,{}, {},
+                    {'MaterialGlow':material},collection,bpy.context.scene,
+                    addon.unity_transform_matrix_to_blender_basis(),Condition)
+            first=next(iter(self.meshes.values())).data.eiem_shape_animations[0]
+            second=next(iter(others.values())).data.eiem_shape_animations[0]
+            self.assertNotEqual(first.identity,second.identity)
+            self.assertEqual(animation.runtime_identity(first),'walk')
+            self.assertEqual(animation.runtime_identity(second),'walk')
+            second.speed=3
+            self.assertEqual(first.speed,1)
+            self.assertEqual(other_material.eiem_material_animations[0].speed,3)
+            self.assertEqual(self.material.eiem_material_animations[0].speed,1)
+            self.assertEqual(animation.export_clips(next(iter(others.values())),addon)[0]['id'],'walk')
+            self.assertEqual(package.eiem_material_animation.export_clips(other_material,'MaterialGlow',addon)[0]['id'],'walk')
+            self.assertEqual(self.state['animations']['walk']['id'],'walk')
+        finally:
+            for obj in others.values():
+                mesh=obj.data;bpy.data.objects.remove(obj,do_unlink=True);bpy.data.meshes.remove(mesh)
+            bpy.data.materials.remove(other_material);bpy.data.collections.remove(other_collection)
 
     def test_controls_restore_shared_shape_material_tracks_and_visibility(self):
         importer = package.eiem_controls_import

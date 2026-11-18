@@ -89,6 +89,17 @@ class Format3PublicationTests(unittest.TestCase):
         self.assertEqual((self.destination / 'textures/new.dds').read_bytes(), b'new dds')
         self.assertFalse((self.destination / 'textures/body.dds').exists())
 
+    def test_overwrites_files_in_directory_without_manifest(self):
+        (self.destination / 'mod.ini').unlink()
+        (self.destination / 'meshes/body.effres').write_bytes(b'previous mesh')
+        (self.destination / 'notes.txt').write_bytes(b'keep')
+
+        exporter.publish(self.staging, self.destination, read_format3)
+
+        self.assertEqual(read_format3(self.destination), read_format3(self.staging))
+        self.assertEqual((self.destination / 'meshes/body.effres').read_bytes(), b'old mesh')
+        self.assertEqual((self.destination / 'notes.txt').read_bytes(), b'keep')
+
     def test_failed_manifest_commit_restores_resources_and_removals(self):
         before = {path.relative_to(self.destination): path.read_bytes()
                   for path in self.destination.rglob('*') if path.is_file()}

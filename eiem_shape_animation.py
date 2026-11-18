@@ -1,5 +1,6 @@
 """Shared animation clips and channel adapters for EFF actions."""
 import math
+import json
 import re
 import uuid
 import sys
@@ -14,6 +15,34 @@ else:
 
 SHARED_FIELDS=('label','enabled','start','end','loop','autoplay','speed','speed_variable','sample_rate','hotkey')
 _syncing=False
+
+def runtime_identity(clip):
+    return getattr(clip,'runtime_id','') or clip.identity
+
+
+def group_settings(clip):
+    return dict(((field,getattr(clip,field)) for field in SHARED_FIELDS),
+                runtime_id=runtime_identity(clip))
+
+
+def import_group_ids(collection, identities):
+    """One import scope shares groups across adapters, isolated from other Mods."""
+    mapping=json.loads(collection.get('eiem_animation_groups_json','{}'))
+    scope=collection.get('eiem_import_id','') or collection.get('eiem_animation_scope','')
+    if not scope:
+        scope=uuid.uuid4().hex;collection['eiem_animation_scope']=scope
+    used={clip.identity for clip in all_groups()} | set(mapping.values())
+    for original in identities:
+        if original in mapping:continue
+        identity=original;suffix=2
+        if identity in used:identity=original+'__'+scope[:8]
+        stem=identity
+        while identity in used:
+            identity=stem+'_'+str(suffix);suffix+=1
+        mapping[original]=identity;used.add(identity)
+    collection['eiem_animation_groups_json']=json.dumps(mapping)
+    return mapping
+
 
 def sync_settings(clip, context):
     """Keep a shared group editable from any member without sharing its Action."""
@@ -81,7 +110,8 @@ def source_actions(identity):
     actions={clip.action for _owner,clip in group_members(identity)+bone_group_members(identity)
              if clip.action}
     actions.update(action for material,clip in material_group_members(identity)
-                   if (action:=_addon.material_animation.source_action(material,clip)))
+                   if (binding:=_addon.material_animation.resolve_source_action(material,clip))
+                   and (action:=binding[0]))
     return actions
 
 def action_channels(identity):
@@ -98,8 +128,9 @@ def action_channels(identity):
         for clip,track in _addon.material_animation.action_tracks(material,strict=False):
             if clip.identity!=identity:continue
             name=track['source_key'].split('.',1)[-1] or track['property']
+            binding=_addon.material_animation.resolve_source_action(material,clip)
             rows.append(dict(kind='MATERIAL',owner=material,clip=clip,name=name,
-                             action=_addon.material_animation.source_action(material,clip)))
+                             action=binding[0] if binding else None))
     return rows
 
 def selected_channel_plan(objects,identity='',source_action=None):
@@ -138,8 +169,10 @@ def selected_channel_plan(objects,identity='',source_action=None):
         if source_action is not None and material.animation_data.action!=source_action:continue
         tracks=_addon.material_animation.discover_action_tracks(material)
         existing={(clip.source_path,clip.property) for clip in material.eiem_material_animations
-                  if clip.identity==identity and _addon.material_animation.source_action(material,clip)==material.animation_data.action
-                  and clip.slot_handle==getattr(material.animation_data.action_slot,'handle',0)}
+                  if clip.identity==identity
+                  and _addon.material_animation.resolve_source_action(material,clip)==(
+                      material.animation_data.action,
+                      getattr(material.animation_data.action_slot,'handle',0))}
         tracks=[track for track in tracks if
                 (next(iter(track['curves'].values())).data_path,track['property']) not in existing]
         frames=[point.co.x for track in tracks for curve in track['curves'].values()
@@ -186,6 +219,14 @@ def apply_channel_plan(plan,identity,settings):
 def create_action(objects,source_action=None):
     plan=selected_channel_plan(objects,source_action=source_action)
     if not plan:raise ValueError('所选对象没有可加入的 Action 关键帧')
+    actions={row['action'] for row in plan}
+    existing=[clip for clip in all_groups() if actions & source_actions(clip.identity)]
+    if len(existing)>1:raise ValueError('所选 Action 已属于多个动画组，请先选择要添加到的动画组')
+    if existing:
+        clip=existing[0]
+        plan=selected_channel_plan(objects,clip.identity,source_action=source_action)
+        if plan:apply_channel_plan(plan,clip.identity,group_settings(clip))
+        return clip
     name=plan[0]['action'].name
     stem=re.sub(r'[^A-Za-z0-9_]','_',name).strip('_') or 'Action'
     if stem[0].isdigit():stem='Action_'+stem
@@ -200,7 +241,7 @@ def create_action(objects,source_action=None):
 def add_action_channels(clip,objects):
     plan=selected_channel_plan(objects,clip.identity)
     if not plan:return 0
-    return apply_channel_plan(plan,clip.identity,{field:getattr(clip,field) for field in SHARED_FIELDS})
+    return apply_channel_plan(plan,clip.identity,group_settings(clip))
 
 def action_source_objects(action):
     """Find real users of an Action; resolving bindings is an explicit UI action."""
@@ -337,7 +378,7 @@ def add_members(clip,objects):
     current={o.data.as_pointer() for o,c in group_members(clip.identity)}
     members=[o for o in unique_meshes(objects) if o.data.as_pointer() not in current]
     descriptors=[current_descriptor(o) for o in members]
-    settings={field:getattr(clip,field) for field in SHARED_FIELDS};added=[];_syncing=True
+    settings=group_settings(clip);added=[];_syncing=True
     try:
         for obj,descriptor in zip(members,descriptors):
             added.append(obj);append_member(obj,clip.identity,descriptor,settings)
@@ -355,7 +396,7 @@ def add_bone_members(clip,objects):
         if obj.type in {'ARMATURE','EMPTY'} and obj.as_pointer() not in current and obj.as_pointer() not in seen:
             seen.add(obj.as_pointer());members.append(obj)
     descriptors=[current_bone_descriptor(o) for o in members]
-    settings={field:getattr(clip,field) for field in SHARED_FIELDS};added=[];_syncing=True
+    settings=group_settings(clip);added=[];_syncing=True
     try:
         for obj,descriptor in zip(members,descriptors):
             added.append(obj);append_bone_member(obj,clip.identity,descriptor,settings)
@@ -447,7 +488,7 @@ def export_clips(obj, addon, include_hotkeys=True):
             if not all(math.isfinite(v) and control.minimum-1e-6<=v<=control.maximum+1e-6 for v in values): raise ValueError('动画权重超出形态键范围：'+name)
             channels[addon.shape_channel_name(obj,key)]=values
         if not channels:continue
-        result.append(dict(id=clip.identity,label=clip.label,key=clip.hotkey if include_hotkeys else '',duration=duration,speed=clip.speed,speedVariable=clip.speed_variable or None,loop=clip.loop,autoplay=clip.autoplay,sample_rate=clip.sample_rate,channels=channels))
+        result.append(dict(id=runtime_identity(clip),_groupIdentity=clip.identity,label=clip.label,key=clip.hotkey if include_hotkeys else '',duration=duration,speed=clip.speed,speedVariable=clip.speed_variable or None,loop=clip.loop,autoplay=clip.autoplay,sample_rate=clip.sample_rate,channels=channels))
     return result
 
 def export_bone_clips(obj,addon,skeleton_id,include_hotkeys=True):
@@ -509,11 +550,11 @@ def export_bone_clips(obj,addon,skeleton_id,include_hotkeys=True):
             if original_action and original_slot is not None:animation.action_slot=original_slot
             scene.frame_set(original_frame,subframe=original_subframe)
         payload=addon.bone_animation.encode_animation(dict(
-            id=clip.identity,skeleton=skeleton_id,duration=duration,
+            id=runtime_identity(clip),skeleton=skeleton_id,duration=duration,
             sample_rate=int(clip.sample_rate),loop=clip.loop,
             tracks=[dict(path=path_by_name[name],samples=values)
                     for name,values in tracks.items()]))
-        result.append(dict(id=clip.identity,skeleton=skeleton_id,data=payload,
+        result.append(dict(id=runtime_identity(clip),_groupIdentity=clip.identity,skeleton=skeleton_id,data=payload,
             label=clip.label,key=clip.hotkey if include_hotkeys else '',
             duration=duration,speed=clip.speed,speedVariable=clip.speed_variable or None,loop=clip.loop,autoplay=clip.autoplay,
             sample_rate=int(clip.sample_rate)))
@@ -523,6 +564,7 @@ class EFF_PG_animation_channel(bpy.types.PropertyGroup):
     enabled: BoolProperty(name='参与播放',default=True)
 class EFF_PG_shape_animation(bpy.types.PropertyGroup):
     identity: StringProperty()
+    runtime_id: StringProperty(options={'HIDDEN'})
     speed_variable: StringProperty(options={'HIDDEN'})
     label: StringProperty(name='名称',default='动画片段',update=sync_settings)
     enabled: BoolProperty(name='导出',default=True,update=sync_settings)
@@ -541,6 +583,7 @@ class EFF_PG_shape_animation(bpy.types.PropertyGroup):
 
 class EFF_PG_bone_animation(bpy.types.PropertyGroup):
     identity: StringProperty()
+    runtime_id: StringProperty(options={'HIDDEN'})
     speed_variable: StringProperty(options={'HIDDEN'})
     label: StringProperty(name='名称',default='动画片段',update=sync_settings)
     enabled: BoolProperty(name='导出',default=True,update=sync_settings)
@@ -579,9 +622,10 @@ class EFF_OT_shape_animation(bpy.types.Operator):
                               for curve in curves_for_bone for p in curve.keyframe_points)
                 for material,track in material_group_members(clip.identity):
                     if not track.source_path:continue
-                    source=_addon.material_animation.source_action(material,track)
-                    if source is None:continue
-                    curves=[curve for curve in _addon.material_animation.action_curves(material,source,track.slot_handle)
+                    binding=_addon.material_animation.resolve_source_action(material,track)
+                    if binding is None:continue
+                    source,slot_handle=binding
+                    curves=[curve for curve in _addon.material_animation.action_curves(material,source,slot_handle)
                             if curve.data_path==track.source_path]
                     frames.extend(point.co.x for curve in curves for point in curve.keyframe_points)
                 if not frames:raise ValueError('所选动作没有动画关键帧')

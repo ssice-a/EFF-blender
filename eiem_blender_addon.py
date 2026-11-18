@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 50, 36),
+    "version": (0, 50, 37),
     "blender": (5, 2, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
@@ -1652,7 +1652,9 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
                     if bone:
                         effect_root.eff_effect.bone = bone.name
             from . import eiem_effect_mounts
-            eiem_effect_mounts.restore(effect_root,attachment,mount_cache,skeleton_collection,effect_editor.BASIS)
+            group_ids=shape_animation.import_group_ids(package_collection,
+                [clip['id'] for clip in attachment.get('authorHierarchy',{}).get('animations',())])
+            eiem_effect_mounts.restore(effect_root,attachment,mount_cache,skeleton_collection,effect_editor.BASIS,group_ids)
             effect_root.eff_effect.toggle_keys.clear()
             for key in attachment.get("keys", []):
                 effect_root.eff_effect.toggle_keys.add().key = str(key)
@@ -2998,22 +3000,24 @@ def default_export_mod_name(context=None):
     return name or 'EFF_Mod'
 
 
-def selected_export_mod_directory(directory, filepath=None):
-    """Accept both entering a Mod folder and selecting it from its parent."""
+def selected_export_mod_directory(directory, *, selected_names=()):
+    """Use an explicitly selected folder or the current Mod root."""
     selected = Path(directory).expanduser().resolve()
+    # ExportHelper remembers its filename independently of the chosen folder.
+    # Only a real file-browser selection can identify a child folder here.
+    if len(selected_names) == 1:
+        chosen = (selected / selected_names[0]).resolve()
+        if chosen.parent == selected and chosen.is_dir():
+            return chosen
     if (selected / 'mod.ini').is_file():
         return selected
-    if filepath:
-        chosen = Path(bpy.path.abspath(os.path.expandvars(str(filepath)))).expanduser().resolve()
-        if chosen.parent == selected and (chosen / 'mod.ini').is_file():
-            return chosen
     return None
 
 
-def mod_export_directory(directory, filepath=None, mod_name=None):
+def mod_export_directory(directory, filepath=None, mod_name=None, *, selected_names=()):
     """Resolve the package root from the export dialog.
 
-    An existing selected Mod is the destination itself. Otherwise an explicit
+    An explicitly selected folder or current Mod is the destination itself. Otherwise an explicit
     or generated name creates a child of the selected parent directory.
     The legacy filename fallback remains for callers omitting ``mod_name``.
     """
@@ -3022,7 +3026,7 @@ def mod_export_directory(directory, filepath=None, mod_name=None):
         directory or (os.path.dirname(raw_filepath) if raw_filepath else "")
         or os.getcwd()).expanduser().resolve()
     if mod_name is not None:
-        existing = selected_export_mod_directory(selected, raw_filepath)
+        existing = selected_export_mod_directory(selected, selected_names=selected_names)
         if existing:
             return existing
         return (selected / _validated_mod_folder_name(
@@ -4565,6 +4569,7 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
     bl_label = "Export EFF package"
     filename_ext = ""
     directory: StringProperty(subtype="DIR_PATH")
+    dirs: CollectionProperty(type=bpy.types.OperatorFileListElement, options={'HIDDEN', 'SKIP_SAVE'})
     scope_message: StringProperty(options={"HIDDEN"})
     package_directory: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
     include_switches: BoolProperty(
@@ -4579,6 +4584,12 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
 
     def _lod_levels(self, meshes):
         return operator_lod_levels(self, meshes)
+
+    def _selected_names(self):
+        # Blender's `files` includes the filename field even without a
+        # selection. `dirs` contains selected directories, or the current
+        # absolute directory (which cannot resolve as its own child).
+        return tuple(item.name for item in self.dirs)
 
     def invoke(self, context, event):
         # Only quick update (EXEC_DEFAULT) supplies an exact package root.
@@ -4607,7 +4618,8 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
         """Keep the name in step with a Mod entered in the file picker."""
         directory = self.directory or os.path.dirname(self.filepath)
         if directory:
-            existing = selected_export_mod_directory(bpy.path.abspath(directory), self.filepath)
+            existing = selected_export_mod_directory(bpy.path.abspath(directory),
+                selected_names=self._selected_names())
             if existing and context.scene.eiem_export_mod_name != existing.name:
                 context.scene.eiem_export_mod_name = existing.name
                 return True
@@ -4616,11 +4628,12 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
     def draw(self, context):
         self.layout.label(text=self.scope_message)
         directory = self.directory or os.path.dirname(self.filepath)
-        existing = directory and selected_export_mod_directory(bpy.path.abspath(directory), self.filepath)
+        existing = directory and selected_export_mod_directory(bpy.path.abspath(directory),
+            selected_names=self._selected_names())
         name_row = self.layout.row()
         name_row.enabled = not existing
         name_row.prop(context.scene, "eiem_export_mod_name", text='Mod 文件夹名')
-        self.layout.label(text='更新所选 Mod 目录' if existing else '名称留空时自动生成')
+        self.layout.label(text='导出到所选目录' if existing else '名称留空时自动生成')
         self.layout.prop(context.scene, "eiem_source_baseline", text='原生来源目录')
         self.layout.prop(self, "include_switches")
         draw_lod_options(self.layout, self)
@@ -4630,7 +4643,8 @@ class EFF_OT_export(ExportHelper, bpy.types.Operator):
             meshes, rigs, effects, physics = selected_export_resources(context)
             destination=(Path(self.package_directory).resolve() if self.package_directory else
                 mod_export_directory(self.directory or os.path.dirname(self.filepath),
-                    self.filepath,context.scene.eiem_export_mod_name))
+                    self.filepath,context.scene.eiem_export_mod_name,
+                    selected_names=self._selected_names()))
             self._destination=str(destination)
             levels = self._lod_levels(meshes)
             stats = export_package(
