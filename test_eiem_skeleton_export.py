@@ -62,16 +62,58 @@ rig.data['eiem_source_bone_candidates_json']=json.dumps({
 records=addon.skeleton_author_nodes(rig)
 assert [source for b,r,source in records]==[True,True,True,False,False]
 assert [r[0] for b,r,s in records][-2:]==['Rig/Extra','Rig/Extra/Tip']
+assert addon.retarget_armature(bpy.context) == rig.data
+bpy.context.view_layer.objects.active = first
+assert addon.retarget_armature(bpy.context) == rig.data
+assert 'retarget_rigs' not in bpy.ops.eiem.export_package.get_rna_type().properties
+assert bpy.ops.eiem.bone_retarget(rig=rig.data.name) == {'FINISHED'}
+assert bpy.ops.eiem.bone_retarget(rig=rig.data.name, index=0) == {'FINISHED'}
+assert not rig.data.eiem_bone_retargets
+assert bpy.ops.eiem.bone_retarget(rig=rig.data.name) == {'FINISHED'}
+mapping = rig.data.eiem_bone_retargets[0]
+assert addon._retarget_bone_choices(mapping, 'unused', True) == ['Unused']
+assert addon._retarget_bone_choices(mapping, '', False) == ['Extra', 'Tip']
+mapping.source, mapping.target = 'Unused', 'Tip'
+retargets = {'Rig/Extra/Tip': 'Rig/Unused'}
+assert addon.skeleton_retargets(rig, records) == retargets
+runtime_skeleton=addon.bone_animation.decode_skeleton(addon.bone_animation.encode_skeleton(
+    [record for _,record,_ in records],source_nodes=[source for _,_,source in records]))
+assert runtime_skeleton['source_nodes']==[True,True,True,False,False]
+modules,_=addon.native_export.pack_modules()
+author_format3=modules['author_format3']
+relative='test-animation.effres'
+runtime_bytes=addon.bone_animation.encode_skeleton(
+    runtime_skeleton['nodes'],source_nodes=runtime_skeleton['source_nodes'])
+(output/relative).write_bytes(author_format3.encode_skeleton_resource('Character',relative,runtime_bytes))
+assert author_format3._validate_skeleton_resource(output,relative,'SkeletonCharacter',len(runtime_bytes)) == {
+    record[0] for _,record,_ in records}
+assert author_format3.read_skeleton_resource(output,relative,'SkeletonCharacter')==runtime_bytes
+scene=bpy.context.scene
+scene.render.fps=30
+pose=rig.pose.bones['Extra']
+for frame,offset in ((1,0.0),(31,.4)):
+    pose.location.y=offset
+    pose.keyframe_insert('location',index=1,frame=frame)
+addon.shape_animation.create_action([rig])
+clip=addon.shape_animation.export_bone_clips(rig,addon,'CharacterRig')[0]
+track=addon.bone_animation.decode_animation(clip['data'])['tracks'][0]
+assert track['path']=='Rig/Extra'
+rest=records[-2][1]
+start,end=track['samples'][0],track['samples'][-1]
+assert close(matrix(rest),matrix(('',0,start[:3],start[3:7],start[7:]))),start
+assert (Vector(end[:3])-Vector(start[:3])).length>.1
 
 # A weapon can own a complete skeleton with an authored root; it does not need
 # a source-game root bone to satisfy the Mesh/Skeleton contract.
 weapon_data=bpy.data.armatures.new('WeaponAuthorRigData')
 weapon=bpy.data.objects.new('WeaponAuthorRig',weapon_data);bpy.context.scene.collection.objects.link(weapon)
+rig.select_set(False)
 bpy.context.view_layer.objects.active=weapon;weapon.select_set(True);bpy.ops.object.mode_set(mode='EDIT')
 weapon_root=weapon_data.edit_bones.new('WeaponRoot');weapon_root.head=(0,0,0);weapon_root.tail=(0,0,1)
 anchor=weapon_data.edit_bones.new('FxAnchor');anchor.head=(0,0,1);anchor.tail=(0,0,1.2);anchor.parent=weapon_root
 bpy.ops.object.mode_set(mode='OBJECT')
 weapon_records=addon.skeleton_author_nodes(weapon)
+assert addon.retarget_armature(bpy.context) is None
 assert [source for bone,record,source in weapon_records]==[False,False]
 weapon_nodes=[(record[0],record[1],record[2],record[3],record[4])
               for bone,record,source in weapon_records]
@@ -113,6 +155,11 @@ rig_name,first_name=rig.name,first.name
 bpy.ops.wm.open_mainfile(filepath=str(blend))
 rig=bpy.data.objects[rig_name]
 first=bpy.data.objects[first_name]
+assert addon.skeleton_retargets(rig, addon.skeleton_author_nodes(rig)) == retargets
+runtime_skeleton['preserve_author_rest'] = True
+restored_rig = addon.make_armature('SkeletonReimport', runtime_skeleton, bpy.context.scene.collection)
+addon.restore_skeleton_retargets(restored_rig, retargets)
+assert addon.skeleton_retargets(restored_rig, addon.skeleton_author_nodes(restored_rig)) == retargets
 addon.write_skeleton(skel_file,rig)
 assert skel_file.read_bytes()==original_skeleton
 reloaded=output/'reloaded.mesh'

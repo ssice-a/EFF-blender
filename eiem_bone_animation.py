@@ -2,7 +2,7 @@
 
 The encoded Bone payload is an export-internal contribution merged into a
 shared Controls Animation Clip; Format 3 does not publish a separate
-BoneAnimation resource. The game DLL still needs runtime Transform playback.
+BoneAnimation resource.
 """
 
 import math
@@ -52,7 +52,7 @@ def validate_skeleton(nodes):
         raise ValueError("invalid author skeleton node count")
     paths = set()
     for index, (path, parent, position, rotation, scale) in enumerate(nodes):
-        path = _path(path)
+        path = _path(path) if path or index else ""
         if path in paths:
             raise ValueError("duplicate author skeleton path: " + path)
         paths.add(path)
@@ -73,18 +73,18 @@ def validate_skeleton(nodes):
     return nodes
 
 
-def _put_string(out, value, label):
-    encoded = _string(value, label)
+def _put_string(out, value, label, allow_empty=False):
+    encoded = b"" if allow_empty and value == "" else _string(value, label)
     out.extend(struct.pack("<H", len(encoded)))
     out.extend(encoded)
 
 
-def _read_string(data, offset, label):
+def _read_string(data, offset, label, allow_empty=False):
     if offset + 2 > len(data):
         raise ValueError("truncated " + label)
     size = struct.unpack_from("<H", data, offset)[0]
     offset += 2
-    if not size or offset + size > len(data):
+    if (not size and not allow_empty) or offset + size > len(data):
         raise ValueError("invalid " + label)
     try:
         value = data[offset:offset + size].decode("utf-8", "strict")
@@ -93,17 +93,25 @@ def _read_string(data, offset, label):
     return value, offset + size
 
 
-def encode_skeleton(nodes, coordinate=COORDINATE):
+def encode_skeleton(nodes, coordinate=COORDINATE, source_nodes=None):
     nodes = validate_skeleton(nodes)
     if coordinate != COORDINATE:
         raise ValueError("unsupported author skeleton coordinate space")
     out = bytearray(MAGIC_SKELETON)
-    out.extend(struct.pack("<II", VERSION, len(nodes)))
+    version = VERSION if source_nodes is None else 2
+    if source_nodes is not None and (
+        len(source_nodes) != len(nodes) or any(type(source) is not bool for source in source_nodes)
+        or (not nodes[0][0] and not source_nodes[0])
+    ):
+        raise ValueError("invalid author skeleton source flags")
+    out.extend(struct.pack("<II", version, len(nodes)))
     _put_string(out, coordinate, "skeleton coordinate space")
-    for path, parent, position, rotation, scale in nodes:
-        _put_string(out, path, "skeleton path")
+    for index, (path, parent, position, rotation, scale) in enumerate(nodes):
+        _put_string(out, path, "skeleton path", allow_empty=index == 0)
         out.extend(struct.pack("<i", parent))
         out.extend(struct.pack("<3f4f3f", *(float(v) for v in (*position, *rotation, *scale))))
+        if source_nodes is not None:
+            out.append(int(source_nodes[index]))
     return bytes(out)
 
 
@@ -112,25 +120,35 @@ def decode_skeleton(data):
     if len(data) < 16 or data[:8] != MAGIC_SKELETON:
         raise ValueError("not an author skeleton")
     version, count = struct.unpack_from("<II", data, 8)
-    if version != VERSION or not count or count > 16384:
+    if version not in (1, 2) or not count or count > 16384:
         raise ValueError("invalid author skeleton header")
     offset = 16
     coordinate, offset = _read_string(data, offset, "skeleton coordinate space")
     if coordinate != COORDINATE:
         raise ValueError("unsupported author skeleton coordinate space")
     nodes = []
-    for _ in range(count):
-        path, offset = _read_string(data, offset, "skeleton path")
-        if offset + 4 + 40 > len(data):
+    source_nodes = []
+    for index in range(count):
+        path, offset = _read_string(data, offset, "skeleton path", allow_empty=index == 0)
+        if offset + 44 + (version == 2) > len(data):
             raise ValueError("truncated author skeleton node")
         parent = struct.unpack_from("<i", data, offset)[0]
         offset += 4
         values = struct.unpack_from("<3f4f3f", data, offset)
         offset += 40
         nodes.append((path, parent, values[:3], values[3:7], values[7:]))
+        if version == 2:
+            source = data[offset]
+            if source > 1:
+                raise ValueError("invalid author skeleton source flag")
+            source_nodes.append(bool(source))
+            offset += 1
     if offset != len(data):
         raise ValueError("author skeleton has trailing bytes")
-    return {"version": version, "coordinate": coordinate, "nodes": validate_skeleton(nodes)}
+    if source_nodes and not nodes[0][0] and not source_nodes[0]:
+        raise ValueError("an authored skeleton root requires a name")
+    return {"version": version, "coordinate": coordinate, "nodes": validate_skeleton(nodes),
+            "source_nodes": source_nodes}
 
 
 def _sample(sample):

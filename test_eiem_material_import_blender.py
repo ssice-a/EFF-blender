@@ -139,6 +139,58 @@ class MaterialImportTests(unittest.TestCase):
         self.assertIn("float._Gloss=0.4", payload)
         self.assertEqual(len(images), 1)
 
+    def test_mod_import_exposes_embedded_defaults_without_exporting_them(self):
+        path = make_package(self.root / "mod", "format3")
+        source = "assets/test/body.mat"
+        record = dict(format="EFF_MATERIAL_IMPORT/1", source=source,
+            value=dict(m_Name="Body", m_CustomRenderQueue=3000,
+                m_ValidKeywords=["_MASK", "_NOISE"], m_InvalidKeywords=["_CLIP"],
+                m_SavedProperties=dict(
+                    m_Floats=[dict(first="_Gloss", second=0.2), dict(first="_UseMask", second=1.0)],
+                    m_Colors=[dict(first="_Tint", second=dict(r=1.0, g=0.5, b=0.0, a=1.0)),
+                              dict(first="_Accent", second=dict(r=1.0, g=0.0, b=0.0, a=1.0))],
+                    m_TexEnvs=[dict(first="_Noise", second=dict(
+                        m_Scale=dict(x=2.0, y=1.0), m_Offset=dict(x=0.0, y=0.0)))])),
+            bindings=[dict(field="$.m_SavedProperties.m_TexEnvs[0].second.m_Texture",
+                           type="Texture", path="packages/test/noise.png")])
+        author = (f"format=EFFMAT\nversion=1\noverrides=true\nsource={source}\nname=Body\n"
+                  "float._Gloss=0.4\nkeyword._MASK=1\n"
+                  "color._Accent=0,1,0,1\n;EFF_MATERIAL_IMPORT=" + json.dumps(record) + "\n")
+        path.write_bytes(encode_material_resource(
+            "MaterialBody", "materials/body.effres", source, "Body", author.encode()))
+
+        for route in ("material", "package"):
+            with self.subTest(route=route):
+                if route == "material":
+                    material = addon.import_material_file(path, self.obj)
+                else:
+                    addon.import_package(path.parents[1])
+                    material = next(m for m in bpy.data.materials if
+                                    m.get("eiem_section") == "MaterialBody" and
+                                    m.get("eiem_author_package") == str(path.parents[1]))
+                self.assertEqual(material["eiem_float._Gloss"], "0.4")
+                self.assertEqual(material["eiem_float._UseMask"], "1.0")
+                self.assertEqual(material["eiem_value4._Tint"], "1.0,0.5,0.0,1.0")
+                self.assertEqual(material["eiem_color._Accent"], "0,1,0,1")
+                self.assertEqual(material["eiem_texture._Noise"], "packages/test/noise.png")
+                self.assertEqual(material["eiem_texture_scale._Noise"], "2.0,1.0")
+                self.assertEqual(material["eiem_keyword._MASK"], "1")
+                self.assertEqual(material["eiem_keyword._CLIP"], "0")
+                self.assertTrue(material["eiem_texture._BaseMap"].endswith("body.dds"))
+                by_section = {i["eiem_section"]: i for i in bpy.data.images if i.get("eiem_section")}
+                payload, _ = addon.material_override_payload(material, by_section, True)
+                self.assertIn("float._Gloss=0.4", payload)
+                self.assertNotIn("float._UseMask=1.0", payload)
+                self.assertIn("keyword._MASK=1", payload)
+                self.assertIn("color._Accent=0,1,0,1", payload)
+                self.assertNotIn("keyword._NOISE=1", payload)
+                self.assertNotIn("keyword._CLIP=0", payload)
+                self.assertNotIn("texture._Noise", {line.partition("=")[0] for line in payload})
+                self.assertNotIn("texture_scale._Noise=2.0,1.0", payload)
+                material["eiem_float._UseMask"] = "0"
+                payload, _ = addon.material_override_payload(material, by_section, True)
+                self.assertIn("float._UseMask=0", payload)
+
     def dds_only_package(self, label, linear="true"):
         path = make_package(self.root / label, "format3")
         ini = path.parents[1] / "mod.ini"
@@ -193,7 +245,9 @@ class MaterialImportTests(unittest.TestCase):
                     output, "RoundTrip", [], {record["id"]: record}, list(textures.values()), [], [], [], [])
                 result = configparser.ConfigParser(interpolation=None)
                 result.read(output / "mod.ini", encoding="utf-8")
-                values = result[texture["id"]]
+                texture_section = next(result[s]["texture._BaseMap"] for s in result.sections()
+                                       if result[s].get("texture._BaseMap"))
+                values = result[texture_section]
                 self.assertEqual(values["source.path"], "assets/declared/flow.png")
                 self.assertEqual(values["source.asset"], "DeclaredFlow")
                 self.assertEqual(values["linear"], "true")
@@ -361,9 +415,16 @@ try:
                         record["sourceAsset"], record["authorData"]))
                     decoded = addon.format_io.read_format3_material_resource(
                         output, record["id"], relative)
+                    ini = addon.parse_ini(root)
+                    section = next(s for s in ini.sections() if ini[s].get("path") ==
+                                   material["eiem_material_file"])
+                    original = addon.format_io.read_package_material(root, section, ini[section], "format3")
+                    defaults = json.loads(material["eiem_baseline_json"])
                     for key, value in material.items():
                         if key.startswith(("eiem_float.", "eiem_value4.", "eiem_keyword.", "eiem_int.")):
-                            assert decoded[key[5:]] == str(value), key
+                            field = key[5:]
+                            assert value == original.get(field, defaults.get(field)), key
+                            assert decoded.get(field, defaults.get(field)) == value, key
                     assert textures and all(row.get("ddsSourcePath") for row in textures.values())
                     print("REAL_MOD_MATERIAL_ROUNDTRIP_OK", record["sourcePath"], len(textures))
     print("EFF_MATERIAL_IMPORT_OK")

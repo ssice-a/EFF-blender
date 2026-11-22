@@ -6,7 +6,7 @@ import uuid
 import sys
 from types import SimpleNamespace
 import bpy
-from mathutils import Matrix
+from mathutils import Matrix, Quaternion, Vector
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 if __package__:
     from . import eiem_animation_ui as animation_ui
@@ -494,8 +494,17 @@ def export_clips(obj, addon, include_hotkeys=True):
 def export_bone_clips(obj,addon,skeleton_id,include_hotkeys=True):
     result=[];scene=bpy.context.scene;fps=scene.render.fps/scene.render.fps_base
     basis=addon.unity_transform_matrix_to_blender_basis()
+    inverse_basis=basis.inverted()
     records=addon.skeleton_author_nodes(obj)
     path_by_name={bone.name:record[0] for bone,record,source in records}
+    # Blender's display bones can omit native rest scale. Express the sampled
+    # motion relative to that display rest, then compose it with native rest.
+    rest_conversion={}
+    for bone,record,_ in records:
+        _,_,p,q,s=record
+        native_rest=Matrix.LocRotScale(Vector(p),Quaternion((q[3],q[0],q[1],q[2])),Vector(s))
+        display_rest=bone.parent.matrix_local.inverted()@bone.matrix_local if bone.parent else bone.matrix_local
+        rest_conversion[bone.name]=native_rest @ (inverse_basis@display_rest@basis).inverted()
     for clip in obj.eiem_bone_animations:
         if not clip.enabled: continue
         if not clip.action: raise ValueError('骨骼/挂点动画缺少 Action：'+clip.label)
@@ -534,7 +543,7 @@ def export_bone_clips(obj,addon,skeleton_id,include_hotkeys=True):
                     if pose is None: raise ValueError('求值后的骨架缺少骨骼：'+name)
                     local=pose.matrix.copy()
                     if pose.parent: local=pose.parent.matrix.inverted()@local
-                    local=basis.inverted()@local@basis
+                    local=rest_conversion[name]@inverse_basis@local@basis
                     position,rotation,scale=local.decompose()
                     rebuilt=Matrix.LocRotScale(position,rotation,scale)
                     if (max(abs(local[r][c]-rebuilt[r][c])
@@ -805,6 +814,7 @@ class EFF_PT_shape_animation(bpy.types.Panel):
     @classmethod
     def poll(cls,context):return context.scene is not None
     def draw(self,context):
+        _addon.draw_bone_retargets(self.layout,context)
         animation_ui.draw(self.layout,context,sys.modules[__name__])
 
 

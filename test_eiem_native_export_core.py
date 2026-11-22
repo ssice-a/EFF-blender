@@ -1226,6 +1226,39 @@ class NativeExportCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'complete Prefab EFFSOURCE'):
             exporter.validate_export_material_sources(Source(), [invalid], {})
 
+    def test_imported_mod_material_resolves_against_its_recorded_source(self):
+        source_type = exporter.pack_modules()[0]['author_source'].AuthorSource
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            primary_path, donor_path, mod_path = (root / name for name in ('mesh', 'donor', 'mod'))
+            material_path, asset = 'assets/donor/cloth.mat', 'DonorCloth'
+            for package, resources in (
+                (primary_path, [dict(type='Material', logicalPath=material_path, name='OtherCloth')]),
+                (donor_path, [dict(type='Material', logicalPath=material_path, name=asset)]),
+            ):
+                (package / 'source').mkdir(parents=True)
+                (package / 'source/manifest.json').write_text(json.dumps(dict(
+                    format='EFFSOURCE', version=1, serializedFiles=[], resources=resources)))
+            mod_path.mkdir()
+            (mod_path / 'mod.ini').write_text('[Mod]\nformat=3\n')
+            record = dict(format='EFF_MATERIAL_IMPORT/1', source=material_path,
+                          value=dict(m_Name=asset), bindings=[
+                              dict(type='Texture', previewSource=str(primary_path)),
+                              dict(type='Texture', previewSource=str(donor_path)),
+                          ])
+            material = Material('ImportedCloth', dict(eiem_author_package=str(mod_path),
+                eiem_source=material_path, eiem_name=asset, eff_material_import=json.dumps(record)))
+            primary = source_type(primary_path, None)
+            cache = {}
+            exporter.validate_export_material_sources(primary, [material], cache)
+            self.assertIs(exporter.material_source(primary, material, cache), cache[donor_path])
+
+            # Rebinding the material must not reuse provenance for a different asset.
+            material['eiem_target_asset'] = 'MissingCloth'
+            self.assertIs(exporter.material_source(primary, material, cache), primary)
+            with self.assertRaisesRegex(ValueError, 'MissingCloth'):
+                exporter.validate_export_material_sources(primary, [material], cache)
+
     def test_shared_texture_conversion_reuses_pixels_and_preserves_conflicts(self):
         from PIL import Image
         with tempfile.TemporaryDirectory() as folder:

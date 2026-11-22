@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EFF Resource Package",
     "author": "EFF",
-    "version": (0, 50, 37),
+    "version": (0, 50, 38),
     "blender": (5, 2, 0),
     "location": "File > Import/Export > EFF package",
     "category": "Import-Export",
@@ -416,6 +416,32 @@ read_mesh = format_io.read_mesh
 read_skeleton = format_io.read_skeleton
 validate_skeleton_nodes = format_io.validate_skeleton_nodes
 
+def expand_material_defaults(material):
+    """Expose inherited fields on an imported Mod Material, preserving its edits."""
+    source = str(material.get("eiem_source", ""))
+    if parse_json_property(material, "eiem_baseline_json", {}) != {"source": source}:
+        return False
+    asset = str(material.get("eiem_target_asset") or material.get("eiem_name", ""))
+    baseline = format_io.material_import_defaults(source, asset, material.get("eff_material_import"))
+    if not baseline:
+        return False
+    for name, value in list(baseline.items()):
+        key = "eiem_" + name
+        color_key = "eiem_color." + name[7:] if name.startswith("value4.") else ""
+        if color_key and color_key in material:
+            baseline["color." + name[7:]] = value
+            del baseline[name]
+            continue
+        if key in material:
+            # Preserve explicit overrides even if they match this snapshot's defaults.
+            del baseline[name]
+            continue
+        material[key] = value
+    baseline["source"] = source
+    material["eiem_baseline_json"] = json.dumps(baseline, sort_keys=True, separators=(",", ":"))
+    return True
+
+
 def load_material(root, section, values, textures=None, material_import=None):
     # Material names and INI sections are local to their source package. Two
     # imported Mods can legitimately contain ``MaterialBody``; reusing the
@@ -473,6 +499,8 @@ def load_material(root, section, values, textures=None, material_import=None):
         baseline, sort_keys=True, separators=(",", ":"))
     if values.get('_native_bindings'):
         material['eff_material_import'] = values['_native_bindings']
+        if str(values.get("overrides", "false")).lower() == "true":
+            expand_material_defaults(material)
     elif (Path(root) / 'source/manifest.json').is_file():
         from .eiem_effect_scene_material import Import
         material_import = material_import or Import()
@@ -957,12 +985,13 @@ def make_mesh(section, payload):
     return mesh
 
 
-def skeleton_hierarchy_key(payload):
-    return tuple(
+def skeleton_hierarchy_key(payload, retargets=None):
+    nodes = tuple(
         (path, parent, tuple(position), tuple(rotation), tuple(scale), bool(source))
         for (path, parent, position, rotation, scale), source in zip(
             payload["nodes"], payload.get("source_nodes", [True] * len(payload["nodes"])))
     )
+    return nodes, tuple(sorted((retargets or {}).items()))
 
 
 def armature_bone_hash_lookup(armature):
@@ -1118,6 +1147,8 @@ def make_armature(section, payload, collection):
             bone.tail = bone.head + Vector((0.0, 0.05, 0.0))
         bone["eiem_path"] = path
         bone["eiem_skeleton_source"] = bool(payload.get("source_nodes", [True] * len(payload["nodes"]))[index])
+        if payload.get("version") == 2 and not bone["eiem_skeleton_source"] and payload.get("preserve_author_rest"):
+            bone["eiem_preserve_author_rest"] = True
         bone["eiem_source_parent"] = payload["nodes"][parent][0] if parent >= 0 else ""
         # Edit bones expose head/tail/roll, which cannot reconstruct the
         # serialized local quaternion and scale. Preserve source TRS so an
@@ -1332,11 +1363,24 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
     armatures_by_hierarchy = {}
     for section, values in resources.items():
         if section.lower().startswith("skeleton") and values.get("path"):
-            payload = read_skeleton(safe_path(root, values["path"]))
-            hierarchy = skeleton_hierarchy_key(payload)
+            if is_source_package:
+                payload = read_skeleton(safe_path(root, values["path"]))
+            else:
+                safe_path(root, values["path"])
+                payload = bone_animation.decode_skeleton(modules["author_format3"].read_skeleton_resource(
+                    root, values["path"], section))
+                if not payload["source_nodes"]:
+                    payload["source_nodes"] = [True] * len(payload["nodes"])
+                payload["preserve_author_rest"] = True
+            retargets = ({} if is_source_package else
+                modules["author_format3"].read_skeleton_retargets(
+                    values, {node[0]: source for node, source in
+                             zip(payload["nodes"], payload["source_nodes"])}))
+            hierarchy = skeleton_hierarchy_key(payload, retargets)
             armature = armatures_by_hierarchy.get(hierarchy)
             if armature is None:
                 armature = make_armature(section, payload, skeleton_collection)
+                restore_skeleton_retargets(armature, retargets)
                 armature["eiem_source"] = values.get("source", "")
                 armature["eiem_target_path"] = values.get("target.path", "")
                 armature["eiem_target_asset"] = values.get("target.asset", "")
@@ -1438,7 +1482,17 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
         obj["eiem_original_material_sections_json"] = json.dumps(
             original_materials, sort_keys=True, separators=(",", ":"))
     for section, obj in meshes.items():
-        if section not in meshes_with_armature_binding:
+        skeleton_id = resources[section].get("skeleton", "") if not is_source_package else ""
+        if skeleton_id:
+            skeleton = skeletons["Skeleton" + skeleton_id]
+            payload = mesh_payloads[section]
+            palette = resolve_mesh_bone_palette(payload, skeleton)
+            obj["eiem_skeleton"] = skeleton["eiem_section"]
+            obj["eiem_bone_palette_json"] = json.dumps(palette, separators=(",", ":"))
+            modifier = obj.modifiers.new("EFF Armature", "ARMATURE")
+            modifier.object = skeleton
+            bind_mesh_weights(obj, payload, skeleton, palette)
+        elif section not in meshes_with_armature_binding:
             bind_mesh_weights_from_paths(obj, mesh_payloads.get(section, {}))
     for section, values in resources.items():
         if not section.lower().startswith("part") or not values.get("mesh"):
@@ -1446,16 +1500,18 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
         obj = meshes.get(values["mesh"])
         material_section = values.get("material", "")
         material = materials.get(material_section)
-        if obj is None or material is None:
+        if obj is None or (material_section and material is None):
             raise ValueError("Format 3 Part references a missing Mesh or Material: " + section)
-        if len(obj.data.materials) == 0:
-            obj.data.materials.append(material)
-        else:
-            obj.data.materials[0] = material
+        if material is not None:
+            if len(obj.data.materials) == 0:
+                obj.data.materials.append(material)
+            else:
+                obj.data.materials[0] = material
         obj["eiem_part_section"] = section
         obj["eiem_render_section"] = section
         obj["eiem_original_material_sections_json"] = json.dumps({"0": material_section})
         obj["eiem_format3_import"] = True
+        obj.eiem_afterimage = parser.getboolean(section, "afterimage", fallback=True)
     if control_state is not None:
         controls_import.restore_format3_controls(
             control_state, meshes, skeletons, skeleton_payloads, materials,
@@ -1523,7 +1579,17 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
                     skeleton_file.write_bytes(snapshot["skeleton"])
                     skeleton_payload = read_skeleton(skeleton_file)
                 hierarchy = skeleton_hierarchy_key(skeleton_payload)
-                rig = armatures_by_hierarchy.get(hierarchy)
+                target_rigs = set()
+                for rule_id in rule_ids:
+                    for part in resources[rule_id].get("parts", "").split(","):
+                        mesh_id = resources.get(part.strip(), {}).get("mesh", "")
+                        skeleton_id = "Skeleton" + resources.get(mesh_id, {}).get("skeleton", "")
+                        if (skeleton_id in skeleton_payloads and
+                                skeleton_hierarchy_key(skeleton_payloads[skeleton_id]) == hierarchy):
+                            target_rigs.add(skeletons[skeleton_id])
+                if len(target_rigs) > 1:
+                    raise ValueError("Physics %s 引用了多个骨架，无法确定绑定目标" % section)
+                rig = next(iter(target_rigs), None) or armatures_by_hierarchy.get(hierarchy)
                 if rig is None:
                     rig = make_armature("Skeleton_" + section, skeleton_payload, skeleton_collection)
                     rig["eiem_author_package"] = str(Path(root).resolve())
@@ -1624,7 +1690,7 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
                     hierarchy = skeleton_hierarchy_key(skeleton_payload)
                     current_hierarchy = next(
                         (key for key, candidate in armatures_by_hierarchy.items() if candidate is rig), None)
-                    if current_hierarchy != hierarchy:
+                    if current_hierarchy is None or current_hierarchy[0] != hierarchy[0]:
                         rig = armatures_by_hierarchy.get(hierarchy)
                         if rig is None:
                             rig = make_armature("Skeleton_Effect_" + section, skeleton_payload, skeleton_collection)
@@ -2704,6 +2770,35 @@ def write_mesh(path, obj, return_snapshot=False, skin_cache=None):
     path.write_bytes(format_io.encode_mesh(payload))
 
 
+def is_source_bone(bone):
+    return bool(bone.get("eiem_skeleton_source", "eiem_path" in bone))
+
+
+def skeleton_retargets(rig, records):
+    paths = {bone.name: (record[0], native) for bone, record, native in records}
+    pairs = {}
+    for index, row in enumerate(rig.data.eiem_bone_retargets, 1):
+        if not row.source and not row.target:
+            continue
+        source_path, native = paths.get(row.source, ("", False))
+        target_path, target_native = paths.get(row.target, ("", True))
+        if not source_path or not native or not target_path or target_native:
+            raise ValueError(f"{rig.name} 的骨骼重定向第 {index} 项需要选择游戏源骨与新增目标骨。")
+        if target_path in pairs:
+            raise ValueError(f"{rig.name} 的目标骨 {row.target} 已有重定向来源。")
+        pairs[target_path] = source_path
+    return pairs
+
+
+def restore_skeleton_retargets(rig, retargets):
+    if retargets:
+        names = {bone["eiem_path"]: bone.name for bone in rig.data.bones if "eiem_path" in bone}
+        for target, source in sorted(retargets.items()):
+            row = rig.data.eiem_bone_retargets.add()
+            row.source = names[source]
+            row.target = names[target]
+
+
 def skeleton_author_nodes(obj):
     """Source nodes are references, new nodes carry actual parent-local TRS.
 
@@ -2713,6 +2808,7 @@ def skeleton_author_nodes(obj):
     records, paths, indices, source_world = [], {}, {}, {}
     seen_paths = set()
     visiting = set()
+    unchanged_rest = set()
     def visit(bone):
         if bone.name in indices:
             return
@@ -2721,7 +2817,7 @@ def skeleton_author_nodes(obj):
         visiting.add(bone.name)
         if bone.parent:
             visit(bone.parent)
-        source = bool(bone.get("eiem_skeleton_source", "eiem_path" in bone))
+        source = is_source_bone(bone)
         parent_path = paths[bone.parent.name] if bone.parent else ""
         path = str(bone.get("eiem_path", bone.name)) if source else (
             parent_path + "/" + bone.name if parent_path else bone.name)
@@ -2746,6 +2842,15 @@ def skeleton_author_nodes(obj):
                 expected = Matrix.LocRotScale(expected.translation, expected.to_quaternion(), Vector((1,1,1)))
             if max(abs(expected[r][c]-bone.matrix_local[r][c]) for r in range(4) for c in range(4)) > 1e-4:
                 raise ValueError("源骨骼绑定姿态已改变，当前仅支持增加骨骼：" + bone.name)
+            unchanged_rest.add(bone.name)
+        elif (bone.get("eiem_preserve_author_rest") and bone.get("eiem_path") == path
+              and (not bone.parent or bone.parent.name in unchanged_rest)
+              and max(abs(value - bone.matrix_local[i // 4][i % 4])
+                      for i, value in enumerate(bone["eiem_rest_display"])) <= 1e-4):
+            p, q, s = (bone["eiem_local_" + key] for key in ("position", "rotation", "scale"))
+            local = Matrix.LocRotScale(Vector(p), Quaternion((q[3],q[0],q[1],q[2])), Vector(s))
+            source_world[bone.name] = source_world[bone.parent.name] @ local if bone.parent else local
+            unchanged_rest.add(bone.name)
         else:
             if "/" in bone.name or "\\" in bone.name:
                 raise ValueError("骨骼名称不能包含路径分隔符：" + bone.name)
@@ -3133,7 +3238,8 @@ def material_override_payload(material, images_by_section, force=False):
         if property_name.startswith("texture."):
             if not value.strip():
                 continue  # An empty authored slot inherits the source value.
-            if value == str(baseline.get(property_name, "")) and value.replace("\\", "/").lower().startswith("assets/"):
+            if (value == str(baseline.get(property_name, "")) and
+                    native_export._is_logical_resource_path(value.replace("\\", "/"))):
                 continue  # unchanged game logical texture: inherited from the cloned source
             original = str(baseline.get(property_name, "") if has_baseline else
                            texture_bindings.get(property_name, ""))
@@ -3656,6 +3762,7 @@ class EFF_PT_mesh_properties(bpy.types.Panel):
         obj = context.object
         mesh = obj.data
         layout.operator('eiem.remove_empty_vertex_groups', icon='BRUSH_DATA')
+        layout.prop(obj, "eiem_afterimage")
         if not mesh.get("eiem_section"):
             layout.label(text="Mesh 数据块缺少来源绑定", icon="ERROR")
             layout.operator("eiem.mesh_restore_source", icon="FILE_REFRESH")
@@ -4504,6 +4611,75 @@ def draw_lod_options(layout, operator):
         row.prop(operator, prop)
 
 
+def _retarget_bone_choices(mapping, query, native):
+    query = query.casefold()
+    return [bone.name for bone in mapping.id_data.bones
+            if query in bone.name.casefold() and is_source_bone(bone) == native
+            and (not native or bone.get("eiem_path"))]
+
+
+class EFF_PG_bone_retarget(bpy.types.PropertyGroup):
+    source: StringProperty(name="游戏源骨", options=set(),
+        search=lambda self, context, query: _retarget_bone_choices(self, query, True))
+    target: StringProperty(name="新增目标骨", options=set(),
+        search=lambda self, context, query: _retarget_bone_choices(self, query, False))
+
+
+class EFF_OT_bone_retarget(bpy.types.Operator):
+    bl_idname = "eiem.bone_retarget"
+    bl_label = "编辑骨骼重定向"
+    bl_options = {'INTERNAL', 'UNDO'}
+
+    rig: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    index: IntProperty(default=-1, options={'HIDDEN', 'SKIP_SAVE'})
+
+    def execute(self, context):
+        rig = bpy.data.armatures.get(self.rig)
+        if rig is None or not rig.is_editable:
+            return {'CANCELLED'}
+        rows = rig.eiem_bone_retargets
+        if self.index == -1:
+            rows.add()
+        elif 0 <= self.index < len(rows):
+            rows.remove(self.index)
+        else:
+            return {'CANCELLED'}
+        if context.area:
+            context.area.tag_redraw()
+        return {'FINISHED'}
+
+
+def retarget_armature(context):
+    try:
+        rig = animation_io.target_armature(context).data
+    except ValueError:
+        return None
+    if rig.eiem_bone_retargets or any(is_source_bone(bone) and bone.get('eiem_path')
+                                     for bone in rig.bones):
+        return rig
+    return None
+
+
+def draw_bone_retargets(layout, context):
+    rig = retarget_armature(context)
+    if rig is None:
+        return
+    header, body = layout.panel('eiem_bone_retargets', default_closed=True)
+    header.label(text="骨骼重定向", icon='ARMATURE_DATA')
+    if body is None:
+        return
+    body.enabled = rig.is_editable
+    body.label(text=rig.name)
+    for index, mapping in enumerate(rig.eiem_bone_retargets):
+        row = body.row()
+        fields = row.column(align=True)
+        fields.prop(mapping, "source")
+        fields.prop(mapping, "target")
+        remove = row.operator("eiem.bone_retarget", text="", icon='REMOVE')
+        remove.rig, remove.index = rig.name, index
+    body.operator("eiem.bone_retarget", text="添加配对", icon='ADD').rig = rig.name
+
+
 class EFF_OT_import_animation(ImportHelper, bpy.types.Operator):
     bl_idname = 'eiem.import_animation'
     bl_label = '导入 EFF 动画到选中骨架'
@@ -4998,6 +5174,8 @@ classes = (
     EFF_PT_shared_tools,
     EFF_OT_import,
     EFF_OT_import_animation,
+    EFF_PG_bone_retarget,
+    EFF_OT_bone_retarget,
     EFF_OT_export,
     EFF_OT_export_update,
     EFF_PT_material_properties,
@@ -5022,7 +5200,11 @@ def register():
     effect_editor.register()
     material_editor.register()
     bpy.types.Mesh.eiem_shape_controls = CollectionProperty(type=EFF_PG_shape_control)
+    bpy.types.Object.eiem_afterimage = BoolProperty(
+        name="参与残影", default=True,
+        description="允许游戏在技能残影中捕获此网格")
     bpy.types.Object.eiem_material_switches = CollectionProperty(type=EFF_PG_material_switch)
+    bpy.types.Armature.eiem_bone_retargets = CollectionProperty(type=EFF_PG_bone_retarget)
     bpy.types.Collection.eiem_switch_state_index = IntProperty(
         name='当前款式', default=0, min=0)
     bpy.types.Scene.eiem_switch_active = PointerProperty(
@@ -5060,6 +5242,8 @@ def unregister():
     bpy.types.TOPBAR_MT_file_export.remove(menu_export)
     del bpy.types.Scene.eiem_switch_active
     del bpy.types.Object.eiem_material_switches
+    del bpy.types.Object.eiem_afterimage
+    del bpy.types.Armature.eiem_bone_retargets
     del bpy.types.Scene.eiem_export_mod_name
     del bpy.types.Scene.eiem_export_last_directory
     del bpy.types.Scene.eiem_source_baseline

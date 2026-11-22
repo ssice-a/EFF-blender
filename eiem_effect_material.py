@@ -19,6 +19,7 @@ def _module(name):
 document = _module("eiem_effect_document")
 material_editor = _module("eiem_material_editor")
 native_export = _module("eiem_native_export")
+format_io = _module("eiem_format")
 type_tree = _module("nativepack.type_tree")
 
 _SCHEMAS = {}
@@ -53,10 +54,6 @@ def ensure_material(root, edit, identity):
     return material
 
 
-def _text(value):
-    return str(value) if isinstance(value, (int, str)) else repr(value)
-
-
 def _source(edit, identity):
     spec = edit.objects.get(identity, {})
     return next((r['path'] for r in spec.get('logicalPaths') or [] if r.get('path')), '')
@@ -66,19 +63,9 @@ def properties(edit, identity):
     """Same portable property names used by load_material and .mat export."""
     preview = _module("eiem_effect_preview")
     data = edit.value(identity)
-    result = {}
-    for group, kind in (('m_Floats', 'float'), ('m_Ints', 'int'), ('m_Colors', 'value4')):
-        for row in data.get('m_SavedProperties', {}).get(group, []):
-            value = row['second']
-            result['eiem_' + kind + '.' + row['first']] = ','.join(_text(value[k]) for k in 'rgba') if kind == 'value4' else _text(value)
-    if 'm_CustomRenderQueue' in data:result['eiem_render_queue'] = str(data['m_CustomRenderQueue'])
-    for row in data.get('stringTagMap', []):result['eiem_tag.' + row['first']] = row['second']
-    keywords = data.get('m_ValidKeywords', data.get('m_ShaderKeywords', '').split())
-    for name in keywords:result['eiem_keyword.' + name] = '1'
+    result = {'eiem_' + key: value for key, value in format_io.material_snapshot_properties(data).items()}
     for index, row in enumerate(data.get('m_SavedProperties', {}).get('m_TexEnvs', [])):
-        name, slot = row['first'], row['second']
-        for kind, field in (('texture_scale', 'm_Scale'), ('texture_offset', 'm_Offset')):
-            result['eiem_' + kind + '.' + name] = ','.join(_text(slot[field][k]) for k in 'xy')
+        name = row['first']
         target = preview._target(edit, identity, ['m_SavedProperties', 'm_TexEnvs', index, 'second', 'm_Texture'])
         field = '$.m_SavedProperties.m_TexEnvs[' + str(index) + '].second.m_Texture'
         binding = next((r.get('gameLogical') for r in edit.objects[identity].get('references', [])

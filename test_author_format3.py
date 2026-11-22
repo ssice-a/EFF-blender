@@ -291,8 +291,9 @@ class Format3PublicationTests(unittest.TestCase):
     def test_meshes_share_and_select_distinct_author_skeletons(self):
         output = self.root / "multi-skeleton"
         output.mkdir()
+        legacy_id = "weapon_a_1234567890abcdef"
         skeletons = [
-            dict(id="weapon_a", label="Weapon A", data=bone_codec.encode_skeleton([
+            dict(id=legacy_id, label="Weapon A", data=bone_codec.encode_skeleton([
                 ("WeaponA", -1, (0, 0, 0), (0, 0, 0, 1), (1, 1, 1)),
                 ("WeaponA/FxAnchor", 0, (0, 0, 0), (0, 0, 0, 1), (1, 1, 1)),
             ])),
@@ -301,8 +302,8 @@ class Format3PublicationTests(unittest.TestCase):
             ])),
         ]
         clips = [
-            dict(id="weapon_a_spin", skeleton="weapon_a", data=bone_codec.encode_animation({
-                "id": "weapon_a_spin", "skeleton": "weapon_a", "duration": 1.0,
+            dict(id="weapon_a_spin", skeleton=legacy_id, data=bone_codec.encode_animation({
+                "id": "weapon_a_spin", "skeleton": legacy_id, "duration": 1.0,
                 "sample_rate": 30, "loop": True,
                 "tracks": [{"path": "WeaponA/FxAnchor", "samples": [
                     (0, 0, 0, 0, 0, 0, 1, 1, 1, 1),
@@ -321,8 +322,8 @@ class Format3PublicationTests(unittest.TestCase):
         parts = [
             dict(partId=name, object=name, skeleton=skeleton_id,
                  visibilityExpression=("number", 1.0, "", None, None))
-            for name, skeleton_id in (("Blade", "weapon_a"),
-                                      ("Guard", "weapon_a"),
+            for name, skeleton_id in (("Blade", legacy_id),
+                                      ("Guard", legacy_id),
                                       ("Staff", "weapon_b"))
         ]
         author_format3.write_format3_directory(
@@ -334,7 +335,8 @@ class Format3PublicationTests(unittest.TestCase):
                 author_format3.encode_resource_file(1, b"mesh metadata", b"mesh"))
 
         manifest = (output / "mod.ini").read_text("utf-8")
-        self.assertIn("skeleton=weapon_a", manifest)
+        self.assertIn("skeleton=" + legacy_id, manifest)
+        self.assertIn("[Skeleton" + legacy_id + "]", manifest)
         self.assertIn("skeleton=weapon_b", manifest)
         self.assertIn("[Animationweapon_a_spin]", manifest)
         self.assertIn("[Animationweapon_b_pulse]", manifest)
@@ -364,6 +366,32 @@ class Format3PublicationTests(unittest.TestCase):
         self.assertIn("skeleton=weapon_rig", manifest)
         self.assertNotIn("[ShapeAnimation", manifest)
         self.assertEqual(read_format3_directory(output)["format"], 3)
+
+    def test_live_bone_retarget_is_exported_on_its_skeleton(self):
+        def node(path, parent):
+            return path, parent, (0, 0, 0), (0, 0, 0, 1), (1, 1, 1)
+
+        output = self.root / "retarget"
+        output.mkdir()
+        skeleton = dict(id="skirt", data=bone_codec.encode_skeleton([
+            node("Root", -1), node("Root/Short", 0), node("Root/Long", 0),
+        ], source_nodes=[True, True, False]), retargets={"Root/Long": "Root/Short"})
+        part = dict(partId="Skirt", object="Skirt", skeleton="skirt",
+                    visibilityExpression=("number", 1.0, "", None, None))
+        author_format3.write_format3_directory(
+            output, "Skirt", [part], {}, [], [], [], [], [], skeletons=[skeleton])
+        mesh = output / "meshes" / "Skirt.effres"
+        mesh.parent.mkdir()
+        mesh.write_bytes(author_format3.encode_resource_file(1, b"mesh metadata", b"mesh"))
+        manifest = output / "mod.ini"
+        original = manifest.read_text("utf-8")
+        self.assertIn("retarget.1.source=Root/Short", original)
+        self.assertIn("retarget.1.target=Root/Long", original)
+        self.assertEqual(read_format3_directory(output)["format"], 3)
+        manifest.write_text(original.replace("retarget.1.source=Root/Short",
+                                             "retarget.1.source=Root/Long"), "utf-8")
+        with self.assertRaisesRegex(ValueError, "Root/Long"):
+            read_format3_directory(output)
 
     def test_shape_and_bone_tracks_share_one_animation_clip_and_timeline(self):
         output = self.root / "mixed-animation"
@@ -427,6 +455,31 @@ class Format3PublicationTests(unittest.TestCase):
             bone_animations=[bone_clip, second_clip])
         self.assertTrue(merged)
 
+    def test_generated_animation_ids_keep_a_nonempty_suffix(self):
+        output = self.root / 'generated-animation-ids'
+        output.mkdir()
+        part = dict(partId='Body', object='Body', visibilityExpression=(
+            'number', 1.0, '', None, None),
+            shapeControls=[dict(enabled=True, identity='smile', shape='Smile',
+                variable='$smile', label='Smile', default=0.0, minimum=0.0,
+                maximum=1.0, hotkey_increase='', hotkey_decrease='', hotkey_speed=1.0)],
+            shapeAnimations=[dict(id=identity, label=label, key='', duration=1.0,
+                speed=1.0, loop=True, autoplay=True, sample_rate=2,
+                channels={'Smile': [0.0, 1.0, 0.0]}) for identity, label in (
+                    ('AnimationFallback', 'Named action'),
+                    ('0123456789abcdef0123456789abcdef', '\u9f7f\u8f6e'),
+                    ('abcdef0123456789abcdef0123456789', 'Second action'))])
+        ini = author_format3.write_format3_directory(
+            output, 'AnimationIds', [part], {}, [], [], [], [], [])['_ini']
+        self.assertNotIn('Animation', ini)
+        clips = author_format3.read_controls_ini(output, ini)['animations']
+        self.assertEqual({clip['label'] for clip in clips.values()},
+                         {'Named action', '\u9f7f\u8f6e', 'Second action'})
+        self.assertIn('AnimationFallback', clips)
+        self.assertEqual(len({clip['speedVariable'] for clip in clips.values()}), 3)
+        sample_ids = {ini['Animation' + identity]['samples'] for identity in clips}
+        self.assertEqual(len(sample_ids), 3)
+
     def test_part_can_inherit_a_runtime_renderer_material_slot(self):
         output = self.root / "inherited-material"
         output.mkdir()
@@ -455,6 +508,17 @@ class Format3PublicationTests(unittest.TestCase):
         self.assertTrue(all(written["_ini"][name]["parts"] == "PartBody"
                             for name in replace_sections))
         read_format3_directory(output)
+        self.assertNotIn("afterimage=", manifest)
+        part["afterimage"] = False
+        author_format3.write_format3_directory(
+            output, "InheritedMaterial", [part], {}, [], rules, [], [], [])
+        manifest = (output / "mod.ini").read_text("utf-8")
+        self.assertIn("afterimage=false", manifest)
+        read_format3_directory(output)
+        (output / "mod.ini").write_text(manifest.replace("afterimage=false", "afterimage=maybe"),
+                                        encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "Part afterimage setting"):
+            read_format3_directory(output)
 
     def test_effect_attachment_uses_declared_format3_part_id(self):
         source_part = "PartS_actor_wulfa_cloth_01_lod0_1.___8c6702d24e8fe635"
@@ -734,16 +798,19 @@ class Format3PublicationTests(unittest.TestCase):
         native = b'native-physics'
         written = author_format3.write_format3_directory(
             output, 'PhysicsRetarget', [part], {}, [], rules, [], [], [],
-            physics=[dict(id='ResourcePhysicsRibbon', author=author,
+            physics=[dict(id='ResourcePhysics15c0d8a7e9af4114bb50932f3c817ff3',
+                          label='Ribbon', author=author,
                           native=native, targets=targets)])
         ini = written['_ini']
-        resource = ini['ResourcePhysicsRibbon']
+        resource = ini['ResourcePhysics']
         mapping = {(resource[f'bind.{i}.source.path'], resource[f'bind.{i}.source.asset']):
                    (resource[f'bind.{i}.rule'], resource[f'bind.{i}.lod']) for i in range(3)}
         self.assertEqual(mapping, {targets[0]: ('ReplaceA', '0'),
                                   targets[1]: ('ReplaceA', '1'), targets[2]: ('ReplaceB', '0')})
         path = output / resource['path']
         before = path.read_bytes()
+        author_format3._validate_physics_resource(output, resource['path'],
+            'ResourcePhysics', ini, len(native + author))
         ini['ReplaceA']['target.path'] = 'assets/game/new_a.mesh'
         ini['ReplaceA']['target.asset'] = 'NewA'
         ini['ReplaceA']['lod.1.path'] = 'assets/game/new_a_lod1.mesh'
@@ -751,7 +818,7 @@ class Format3PublicationTests(unittest.TestCase):
         ini['ReplaceB']['target.path'] = 'assets/game/new_b.mesh'
         ini['ReplaceB']['target.asset'] = 'NewB'
         author_format3._validate_physics_resource(output, resource['path'],
-            'ResourcePhysicsRibbon', ini, len(native + author))
+            'ResourcePhysics', ini, len(native + author))
         self.assertEqual(path.read_bytes(), before)
 
     def test_effect_author_resource_is_linked_to_attachment(self):

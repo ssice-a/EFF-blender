@@ -349,6 +349,55 @@ def read_effmat_snapshot(data):
     return values
 
 
+def material_snapshot_properties(data):
+    """Read editable EFFMAT properties from a serialized Material snapshot."""
+    saved = data.get("m_SavedProperties", {})
+    values = {}
+    for group, kind in (("m_Floats", "float"), ("m_Ints", "int"), ("m_Colors", "value4")):
+        for row in saved.get(group, []):
+            value = row["second"]
+            values[kind + "." + row["first"]] = (
+                ",".join(str(value[k]) for k in "rgba") if kind == "value4" else str(value))
+    if "m_CustomRenderQueue" in data:
+        values["render_queue"] = str(data["m_CustomRenderQueue"])
+    for row in data.get("stringTagMap", []):
+        values["tag." + row["first"]] = row["second"]
+    valid = data.get("m_ValidKeywords", data.get("m_ShaderKeywords", "").split())
+    invalid = data.get("m_InvalidKeywords", [])
+    for name in valid:
+        values["keyword." + name] = "1"
+    for name in invalid:
+        values["keyword." + name] = "0"
+    for row in saved.get("m_TexEnvs", []):
+        for kind, field in (("texture_scale", "m_Scale"), ("texture_offset", "m_Offset")):
+            values[kind + "." + row["first"]] = ",".join(str(row["second"][field][k]) for k in "xy")
+    return values
+
+
+def material_import_defaults(source, asset, snapshot):
+    """Read the embedded baseline without consulting the game or its index."""
+    if not snapshot:
+        return {}
+    try:
+        record = json.loads(snapshot)
+        data = record["value"]
+        if (record.get("format") != "EFF_MATERIAL_IMPORT/1" or record.get("source") != source or
+                data.get("m_Name", asset) != asset or "m_SavedProperties" not in data):
+            return {}
+        values = material_snapshot_properties(data)
+        paths = {row["field"]: row["path"] for row in record.get("bindings", [])
+                 if row.get("type") == "Texture"}
+        for index, row in enumerate(data["m_SavedProperties"].get("m_TexEnvs", [])):
+            path = paths.get(f"$.m_SavedProperties.m_TexEnvs[{index}].second.m_Texture", "")
+            if path.startswith(("assets/", "packages/")) and all(
+                    part not in ("", ".", "..") for part in path.split("/")) and not any(
+                    ch in path for ch in ("\\", ":", "\0")):
+                values["texture." + row["first"]] = path
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return {}  # Legacy or incomplete optional snapshots can still import their edits.
+    return values
+
+
 def bind_effmat_texture_ids(data, texture_edits):
     """Store the same stable Texture IDs in EFFMAT and mod.ini."""
     bindings = {}

@@ -417,11 +417,6 @@ def preserved_controls_for_objects(objects):
     return result
 
 
-def author_skeleton_id(rig):
-    identity='\0'.join((str(rig.name_full),str(rig.data.name_full)))
-    return 'skel_'+hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16]
-
-
 def baseline_for(objects, configured, physics_objects=()):
     if configured:
         path = Path(configured).resolve()
@@ -439,18 +434,49 @@ def baseline_for(objects, configured, physics_objects=()):
     return next(iter(sources))
 
 
+def material_source_identity(material):
+    path = material.get('eiem_target_path', '') or material.get('eiem_source', '')
+    asset = material.get('eiem_target_asset', '') or material.get('eiem_name', material.name)
+    return str(path).strip(), str(asset).strip()
+
+
 def material_source(primary, material, cache):
-    """Source materials retain their schema; Mod edits use the chosen baseline."""
+    """Resolve the local EFFSOURCE for an imported material's native templates."""
     owner = str(material.get('eiem_author_package', '')).strip()
     if not owner:
         return primary
     package = Path(owner).resolve()
     if package == primary.package:
         return primary
-    # Runtime Mods carry sparse edits and DDS, not native source templates.
-    # Keep their author-package identity for bindings, but resolve the original
-    # Material/Texture schemas against the export's EFFSOURCE baseline.
     if (package / 'mod.ini').is_file() and format_io.package_kind(package) == 'format3':
+        path, asset = material_source_identity(material)
+        if primary.find_all('Material', path, asset):
+            return primary
+        # The mesh and a borrowed Mod material can come from different Prefabs.
+        # The material snapshot retains explicit local hints for its dependencies.
+        try:
+            record = json.loads(material.get('eff_material_import', ''))
+        except (TypeError, ValueError):
+            return primary
+        if not (isinstance(record, dict) and record.get('format') == 'EFF_MATERIAL_IMPORT/1'
+                and record.get('source') == path and isinstance(record.get('value'), dict)
+                and (record.get('asset') or record['value'].get('m_Name')) == asset):
+            return primary
+        bindings = record.get('bindings', [])
+        if not isinstance(bindings, list):
+            return primary
+        for hint in dict.fromkeys(row.get('previewSource') for row in bindings
+                                 if isinstance(row, dict) and isinstance(row.get('previewSource'), str)):
+            donor = Path(hint)
+            if not donor.is_absolute() or not (donor / 'source/manifest.json').is_file():
+                continue
+            donor = donor.resolve()
+            if donor == primary.package:
+                continue
+            if donor not in cache:
+                cache[donor] = type(primary)(donor, primary.core)
+            if cache[donor].find_all('Material', path, asset):
+                return cache[donor]
         return primary
     if package not in cache:
         cache[package] = type(primary)(package, primary.core)
@@ -466,10 +492,7 @@ def validate_export_material_sources(primary, materials, cache):
     Prefab preparation had to fall back to the untouched native resource.
     """
     for material in materials:
-        path = str(material.get('eiem_target_path', '') or
-                   material.get('eiem_source', '')).strip()
-        asset = str(material.get('eiem_target_asset', '') or
-                    material.get('eiem_name', material.name)).strip()
+        path, asset = material_source_identity(material)
         if not path or not asset:
             raise ValueError(
                 'Material export is missing its source logical path or asset; '
@@ -478,7 +501,7 @@ def validate_export_material_sources(primary, materials, cache):
             material_source(primary, material, cache).resolve('Material', path, asset)
         except Exception as error:
             raise ValueError(
-                'Material source is not present in the selected EFFSOURCE: '
+                'Material source could not be resolved in its local EFFSOURCE: '
                 + path + '#' + asset +
                 '; re-import from the complete Prefab EFFSOURCE') from error
 
@@ -935,8 +958,7 @@ def collect_material(addon, source, mat, images, textures, temporary, encode,
                      texture_inputs=None, force=True):
     texture_cache = texture_cache if texture_cache is not None else {}
     mid = mid or material_id(mat)
-    matpath = str(mat.get('eiem_target_path', '') or mat.get('eiem_source', ''))
-    matasset = str(mat.get('eiem_target_asset', '') or mat.get('eiem_name', mat.name))
+    matpath, matasset = material_source_identity(mat)
     values, _ = addon.material_override_payload(mat, images, force=force)
     if values is None:
         return None
@@ -1419,21 +1441,25 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
     clips_by_object = {original.as_pointer(): addon.shape_animation.export_clips(
         original, addon, include_switches) for original in originals}
     skeleton_records_by_rig={}
-    skeleton_id_by_rig={}
-    for rig in armatures:
+    for rig in sorted(armatures, key=lambda obj: obj.name_full):
         has_animation=any(clip.enabled for clip in getattr(rig,'eiem_bone_animations',()))
         records=addon.skeleton_author_nodes(rig)
-        skeleton_records_by_rig[rig]=records
         has_author_bones=any(not source_node for _bone,_record,source_node in records)
         if has_animation or has_author_bones:
-            skeleton_id_by_rig[rig]=author_skeleton_id(rig)
-    skeletons=[];bone_animations=[]
-    for rig,skeleton_id in sorted(skeleton_id_by_rig.items(),key=lambda row:row[0].name_full):
-        records=skeleton_records_by_rig[rig]
-        nodes=[(record[0],record[1],record[2],record[3],record[4])
-               for bone,record,source_node in records]
+            skeleton_records_by_rig[rig]=records
+    skeleton_ids=modules['author_format3'].named_resource_ids(
+        [(rig.name_full,rig.name_full) for rig in skeleton_records_by_rig], 'Rig')
+    skeleton_id_by_rig={rig:skeleton_ids[rig.name_full] for rig in skeleton_records_by_rig}
+    skeletons=[];bone_animations=[];retargets_by_rig={}
+    for rig,records in skeleton_records_by_rig.items():
+        skeleton_id=skeleton_id_by_rig[rig]
+        nodes=[record for _,record,_ in records]
+        source_nodes=[source for _,_,source in records]
+        retargets = addon.skeleton_retargets(rig, records)
+        retargets_by_rig[rig] = retargets
         skeletons.append(dict(id=skeleton_id,label=rig.name_full,
-                              data=addon.bone_animation.encode_skeleton(nodes)))
+                              retargets=retargets,
+                              data=addon.bone_animation.encode_skeleton(nodes,source_nodes=source_nodes)))
         if any(clip.enabled for clip in getattr(rig,'eiem_bone_animations',())):
             bone_animations.extend(addon.shape_animation.export_bone_clips(
                 rig,addon,skeleton_id,include_switches))
@@ -1499,6 +1525,7 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
                                       shapeNames=[c[0] for c in author['blend_channels']],shapeControls=controls,
                                       shapeOwner=str(original.data.get('eiem_control_id', '')),
                                       shapeAnimations=clips_by_object.get(identity, []),
+                                      afterimage=original.eiem_afterimage,
                                       nativeTypeHash=target['native']['typeHash'],fieldData=fields)
                         rig=snapshot_rigs[identity]
                         if rig in skeleton_id_by_rig:common['skeleton']=skeleton_id_by_rig[rig]
@@ -1602,6 +1629,10 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
             for rig in rigs:
                 groups = [obj for obj in physics_objects if obj.eiem_physics.rig == rig]
                 document = author.author_document(groups, 'shared.skeleton')
+                for group in document['groups']:
+                    for node in group['nodes']:
+                        if node['role'] == 'MOVE' and node['bone'] in retargets_by_rig.get(rig, {}):
+                            raise ValueError('同一骨骼不能同时由重定向和物理组驱动：' + node['bone'])
                 exported_physics += len(groups); exported_skeletons += 1
                 skeleton = addon.skeleton_author_nodes(rig)
                 mesh_bones = {identity: {snapshot['bone_paths'][slot]

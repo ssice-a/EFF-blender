@@ -366,20 +366,28 @@ def _write_bone_track(curves, rig, payload, track, samples, start, end, basis):
     nodes = payload["nodes"]
     local_values = []
     inverse = basis.inverted()
+    display_rest = pose_bone.bone.matrix_local
+    display_parent = pose_bone.parent.bone.matrix_local if pose_bone.parent else Matrix.Identity(4)
+    native_rest = trs(tuple(position) + tuple(rotation) + tuple(scale))
+    rest_conversion = display_rest @ basis @ native_rest.inverted()
     for sample_index in range(len(samples)):
-        worlds = []
-        for node in nodes:
-            local = trs(samples[sample_index]) if node[0] == path else trs(
-                tuple(node[2]) + tuple(node[3]) + tuple(node[4]))
-            parent = node[1]
-            worlds.append(worlds[parent] @ local if parent >= 0 else local)
-        world = worlds[node_index]
-        pose_matrix = basis @ world @ inverse
+        sample = trs(samples[sample_index])
+        if payload.get("version") == 2:
+            # Invert the export's native-rest correction in Blender space.
+            pose_matrix = rest_conversion @ sample @ inverse
+            parent_matrix = display_parent
+        else:
+            worlds = []
+            for node in nodes[:node_index + 1]:
+                local = sample if node[0] == path else trs(
+                    tuple(node[2]) + tuple(node[3]) + tuple(node[4]))
+                parent = node[1]
+                worlds.append(worlds[parent] @ local if parent >= 0 else local)
+            pose_matrix = basis @ worlds[node_index] @ inverse
+            parent_matrix = basis @ worlds[parent_index] @ inverse if pose_bone.parent else display_parent
         kwargs = {"invert": True}
         if pose_bone.parent:
-            parent_world = worlds[parent_index]
-            kwargs.update(parent_matrix=basis @ parent_world @ inverse,
-                          parent_matrix_local=pose_bone.parent.bone.matrix_local)
+            kwargs.update(parent_matrix=parent_matrix, parent_matrix_local=display_parent)
         matrix = pose_bone.bone.convert_local_to_pose(
             pose_matrix, pose_bone.bone.matrix_local, **kwargs)
         location, quaternion, scale = matrix.decompose()

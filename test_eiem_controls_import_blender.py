@@ -414,8 +414,9 @@ variable=$value
 
     def test_bone_tracks_roundtrip_parent_and_child_transforms(self):
         addon = package.eiem_blender_addon
-        payload = {"coordinate": "Unity", "nodes": [
-            ("Root", -1, (0.0, 0.5, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0)),
+        payload = {"version": 2, "coordinate": "unity-y-up-left-handed",
+                   "source_nodes": [True, False], "preserve_author_rest": True, "nodes": [
+            ("Root", -1, (0.0, 0.5, 0.0), (0.0, 0.0, 0.0, 1.0), (2.0, 2.0, 2.0)),
             ("Root/Tip", 0, (0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0)),
         ]}
         rig = addon.make_armature("SkeletonTest", payload, self.package_collection)
