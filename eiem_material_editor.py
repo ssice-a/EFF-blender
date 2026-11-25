@@ -40,7 +40,6 @@ BOOLEAN_NAMES = {
     '_OutlineTransparent', '_ResponsiveTransparency', '_SkinRimOff',
     '_DissolveUseViewUV', '_DisableRainEffectOnMaterial', '_AvatarCustomizeEnable',
     '_ClearCoat', '_SpecRampIridescentMode', '_ParallaxUseNormal',
-    '_SilkStockings', '_SilkStockingsAdvance',
 }
 RENDER_NAMES = {'_Cull', '_ZTest', '_ZWrite', '_SrcBlend', '_DstBlend', '_AlphaSrcBlend',
                 '_AlphaDstBlend', '_MVSrcBlend', '_MVDstBlend', '_QueueOffset',

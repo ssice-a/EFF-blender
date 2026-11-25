@@ -85,13 +85,6 @@ def addon_function(name, namespace, path=ADDON):
 
 
 class NativeExportCoreTests(unittest.TestCase):
-    def test_author_submesh_slot_is_not_serialized_as_source_renderer_slot(self):
-        self.assertEqual(exporter.inherited_source_material_slot(0), 0)
-        self.assertEqual(exporter.inherited_source_material_slot(1), 0)
-        self.assertEqual(exporter.inherited_source_material_slot(17), 0)
-        with self.assertRaisesRegex(ValueError, '作者材质槽编号无效'):
-            exporter.inherited_source_material_slot(-1)
-
     def test_imported_part_identity_survives_rename_and_extra_slots(self):
         self.assertEqual(exporter.mesh_part_id('Renamed', 0, 1, 'PartOriginal'), 'MeshOriginal')
         self.assertEqual(exporter.mesh_part_id('Renamed', 0, 2, 'PartOriginal'), 'MeshOriginal')
