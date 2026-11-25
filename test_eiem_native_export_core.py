@@ -85,6 +85,58 @@ def addon_function(name, namespace, path=ADDON):
 
 
 class NativeExportCoreTests(unittest.TestCase):
+    def test_material_split_compacts_vertex_streams_and_preserves_shape_channels(self):
+        count = 7
+        def stream(width):
+            return [float(10 * vertex + component) for vertex in range(count)
+                    for component in range(width)]
+        delta = (1.0, 2.0, 3.0)
+        author = dict(
+            coordinate='unity-y-up-left-handed', vertex_count=count,
+            vertices=stream(3), normals=stream(3), tangents=stream(4), colors=stream(4),
+            uvs=[stream(2), [], stream(4), [], [], [], [], []],
+            indices=[5, 1, 3, 0, 1, 3], index_count=6,
+            submeshes=[(0, 0, 3, 0, 1, 5), (0, 3, 0, 0, 0, 0), (0, 3, 3, 2, 2, 4)],
+            skin=[((1.0, 0, 0, 0), (vertex, 0, 0, 0)) for vertex in range(count)],
+            bindposes=[[1.0] * 16 for _ in range(count)], bone_hashes=list(range(count)),
+            bone_source_candidates=[[] for _ in range(count)],
+            blend_vertices=[(v, delta, delta, delta) for v in (1, 2, 5, 6)],
+            blend_frames=[('Move', 0, 3, True, True, False), ('Move', 3, 1, False, False, False)],
+            blend_channels=[('Move', 123, 0, 2)], blend_weights=[50.0, 100.0], additional=[])
+
+        parts = dict(exporter.split_material(author))
+        self.assertEqual(list(parts), [0, 2])
+        for slot, used, expected_indices, expected_shapes in (
+                (0, [1, 3, 5], [2, 0, 1], [0, 2]),
+                (2, [2, 3, 5], [0, 1, 2], [0, 2])):
+            with self.subTest(slot=slot):
+                part = parts[slot]
+                self.assertEqual(part['vertex_count'], 3)
+                self.assertEqual(part['indices'], expected_indices)
+                self.assertEqual(part['submeshes'], [(0, 0, 3, 0, 0, 3)])
+                self.assertEqual(part['skin'], [author['skin'][i] for i in used])
+                self.assertIs(part['bindposes'], author['bindposes'])
+                for name, width in (('vertices', 3), ('normals', 3), ('tangents', 4), ('colors', 4)):
+                    self.assertEqual(part[name], [x for i in used for x in author[name][i*width:(i+1)*width]])
+                self.assertEqual(part['uvs'][2], [x for i in used for x in author['uvs'][2][i*4:(i+1)*4]])
+                self.assertEqual(part['uvs'][1], [])
+                self.assertEqual(part['blend_vertices'], [(v, delta, delta, delta) for v in expected_shapes])
+                self.assertEqual(part['blend_frames'], [('Move', 0, 2, True, True, False),
+                                                       ('Move', 2, 0, False, False, False)])
+                self.assertEqual(part['blend_channels'], author['blend_channels'])
+                self.assertEqual(part['blend_weights'], author['blend_weights'])
+                decoded = exporter.format_io.decode_mesh(exporter.format_io.encode_mesh(part))
+                self.assertEqual(decoded['indices'], expected_indices)
+        self.assertEqual(author['vertex_count'], count)
+        self.assertEqual(author['indices'], [5, 1, 3, 0, 1, 3])
+
+    def test_author_submesh_slot_is_not_serialized_as_source_renderer_slot(self):
+        self.assertEqual(exporter.inherited_source_material_slot(0), 0)
+        self.assertEqual(exporter.inherited_source_material_slot(1), 0)
+        self.assertEqual(exporter.inherited_source_material_slot(17), 0)
+        with self.assertRaisesRegex(ValueError, '作者材质槽编号无效'):
+            exporter.inherited_source_material_slot(-1)
+
     def test_imported_part_identity_survives_rename_and_extra_slots(self):
         self.assertEqual(exporter.mesh_part_id('Renamed', 0, 1, 'PartOriginal'), 'MeshOriginal')
         self.assertEqual(exporter.mesh_part_id('Renamed', 0, 2, 'PartOriginal'), 'MeshOriginal')

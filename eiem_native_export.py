@@ -507,15 +507,70 @@ def validate_export_material_sources(primary, materials, cache):
 
 
 def split_material(author):
-    # The snapshot already has one consistent corner/skin/shape vertex map.
-    # Keeping unused vertices avoids inventing a second remapping algorithm.
-    for slot, (_, start, count, _, _, _) in enumerate(author['submeshes']):
-        if not count: continue
+    vertex_count = author['vertex_count']
+
+    def select_stream(values, vertices):
+        if not values:
+            return values
+        width, remainder = divmod(len(values), vertex_count)
+        if remainder:
+            raise ValueError('材质拆分遇到与顶点数不匹配的数据流')
+        return [value for vertex in vertices
+                for value in values[vertex * width:(vertex + 1) * width]]
+
+    for slot, (topology, start, count, base, _, _) in enumerate(author['submeshes']):
+        if not count:
+            continue
+        indices = author['indices'][start:start + count]
+        if base:
+            indices = [base + index for index in indices]
+        vertices = sorted(set(indices))
+        if len(indices) != count or vertices[0] < 0 or vertices[-1] >= vertex_count:
+            raise ValueError('材质拆分遇到无效的网格索引')
+
         part = dict(author)
-        part['indices'] = author['indices'][start:start+count]
+        part['indices'] = indices
         part['index_count'] = count
-        part['submeshes'] = [(0, 0, count, 0, 0, author['vertex_count'])]
+        part['vertex_count'] = len(vertices)
+        part['submeshes'] = [(topology, 0, count, 0, 0, len(vertices))]
+        if len(vertices) != vertex_count:
+            remap = {vertex: index for index, vertex in enumerate(vertices)}
+            part['indices'] = [remap[index] for index in indices]
+            for name in ('vertices', 'normals', 'tangents', 'colors'):
+                part[name] = select_stream(author[name], vertices)
+            part['uvs'] = [select_stream(values, vertices) for values in author['uvs']]
+            if author['skin']:
+                part['skin'] = [author['skin'][vertex] for vertex in vertices]
+
+            # Preserve every frame and channel, including a frame whose deltas
+            # are all on another Part. Actions still address the same channels.
+            shape_vertices = []
+            shape_frames = []
+            for name, first, length, *flags in author['blend_frames']:
+                offset = len(shape_vertices)
+                for vertex, *delta in author['blend_vertices'][first:first + length]:
+                    if vertex in remap:
+                        shape_vertices.append((remap[vertex], *delta))
+                shape_frames.append((name, offset, len(shape_vertices) - offset, *flags))
+            part['blend_vertices'] = shape_vertices
+            part['blend_frames'] = shape_frames
         yield slot, part
+
+
+def inherited_source_material_slot(author_slot):
+    """Return the source Renderer slot for an inherited split Part.
+
+    ``author_slot`` belongs to the Blender Mesh and is only used to select
+    geometry and the author's material while splitting SubMeshes.  It is not
+    a slot number in the game's Renderer.  Format 3 currently has no Blender
+    mapping for a source Renderer with several materials, so inherited Parts
+    target the source Renderer default slot.  A hand-authored ``material`` or
+    ``material_slot`` in mod.ini remains the explicit escape hatch for that
+    advanced case.
+    """
+    if not isinstance(author_slot, int) or isinstance(author_slot, bool) or author_slot < 0:
+        raise ValueError('作者材质槽编号无效')
+    return 0
 
 def material_fields(tree, overrides, encode):
     def defaults(schema):
@@ -1537,7 +1592,7 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
                                 part = dict(common,partId=variant_id,
                                     authorData=addon.format_io.encode_mesh(author),
                                     visibilityBindings=bindings+[dict(variable=switch['variable'],visible=[option_index])],
-                                    materialSlot=slot)
+                                    materialSlot=inherited_source_material_slot(slot))
                                 if preserved_controls:
                                     control_mesh_id = str(original.get('eiem_controls_mesh_id', original.name))
                                     expressions = preserved_controls['visibility'].get(control_mesh_id, {})
@@ -1555,7 +1610,8 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
                             mid=material_sections[selected_material.as_pointer()]
                             part=dict(common,partId=pid,
                                       authorData=addon.format_io.encode_mesh(author),
-                                      visibilityBindings=bindings,materialSlot=slot)
+                                      visibilityBindings=bindings,
+                                      materialSlot=inherited_source_material_slot(slot))
                             if preserved_controls:
                                 control_mesh_id = str(original.get('eiem_controls_mesh_id', original.name))
                                 expressions = preserved_controls['visibility'].get(control_mesh_id, {})
