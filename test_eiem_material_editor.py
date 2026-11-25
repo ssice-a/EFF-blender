@@ -1,6 +1,7 @@
 """Run in factory-startup Blender. Check RNA values and read-only panel drawing."""
 import argparse
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import bpy
@@ -223,6 +224,41 @@ try:
     for group in mat.eiem_editor_groups:group.expanded=True
     fields=[];editor.draw(Layout(fields),mat)
     assert ('eiem_float._ClearCoatSmoothness','scalar') in fields, 'raw escape hatch lost a disabled field'
+    stockings = bpy.data.materials.new('CharacterNPR stockings')
+    stockings['eiem_shader'] = 'HGRP/CharacterNPR'
+    stockings['eiem_source'] = 'assets/test.mat'
+    original = {
+        'float._SurfaceType': '1', 'keyword._ALPHABLEND_ON': '1',
+        'float._SilkStockings': '0', 'float._SilkStockingsAdvance': '0',
+        'value4._SilkStockingsColor': '0.25,0.25,0.25,1',
+        'float._SilkStockingsMinAffect': '0.05', 'float._SilkStockingsMaxAffect': '0.9',
+        'texture._BaseMap': 'assets/test_d.tga',
+        'texture_scale._SilkStockingsMask': '1,1',
+    }
+    for key, value in original.items():
+        stockings['eiem_' + key] = value
+    stockings['eiem_baseline_json'] = json.dumps(original)
+    editor._prepare_material(stockings)
+    fields = []
+    editor.draw(Layout(fields), stockings)
+    assert ('stockings', 'enabled') in fields
+    assert ('eiem_texture._SilkStockingsMask', 'text') not in fields
+    stockings.eiem_editor_features['stockings'].enabled = True
+    fields = []
+    editor.draw(Layout(fields), stockings)
+    assert ('eiem_texture._SilkStockingsMask', 'text') in fields
+    assert ('eiem_float._SilkStockingsAdvance', 'boolean') in fields
+    color = stockings.eiem_editor_values['eiem_value4._SilkStockingsColor']
+    color.color = (0, 0, 0, 1)
+    values, _ = package.eiem_blender_addon.material_override_payload(stockings, {})
+    assert {'float._SilkStockings=1', 'keyword._SILK_STOCKINGS=1',
+            'value4._SilkStockingsColor=0,0,0,1'} <= set(values)
+    assert not any(value.startswith(('texture.', 'float._SurfaceType=', 'keyword._ALPHABLEND_ON=',
+                                     'keyword._STYLIZED_FRESNEL=')) for value in values)
+    stockings.eiem_editor_values['eiem_float._SilkStockings'].boolean = False
+    assert not stockings.eiem_editor_features['stockings'].enabled
+    assert stockings['eiem_keyword._SILK_STOCKINGS'] == '0'
+    assert stockings['eiem_value4._SilkStockingsColor'] == '0,0,0,1'
     effect=bpy.data.materials.new('Dedicated VFX Editor Test')
     try:
         effect['eiem_shader']='HGRP/CharacterNPR_VFX'

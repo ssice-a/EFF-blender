@@ -517,6 +517,22 @@ def split_material(author):
         part['submeshes'] = [(0, 0, count, 0, 0, author['vertex_count'])]
         yield slot, part
 
+
+def inherited_source_material_slot(author_slot):
+    """Return the source Renderer slot for an inherited split Part.
+
+    ``author_slot`` belongs to the Blender Mesh and is only used to select
+    geometry and the author's material while splitting SubMeshes.  It is not
+    a slot number in the game's Renderer.  Format 3 currently has no Blender
+    mapping for a source Renderer with several materials, so inherited Parts
+    target the source Renderer default slot.  A hand-authored ``material`` or
+    ``material_slot`` in mod.ini remains the explicit escape hatch for that
+    advanced case.
+    """
+    if not isinstance(author_slot, int) or isinstance(author_slot, bool) or author_slot < 0:
+        raise ValueError('作者材质槽编号无效')
+    return 0
+
 def material_fields(tree, overrides, encode):
     def defaults(schema):
         if schema.type == 'string': return ''
@@ -1537,7 +1553,7 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
                                 part = dict(common,partId=variant_id,
                                     authorData=addon.format_io.encode_mesh(author),
                                     visibilityBindings=bindings+[dict(variable=switch['variable'],visible=[option_index])],
-                                    materialSlot=slot)
+                                    materialSlot=inherited_source_material_slot(slot))
                                 if preserved_controls:
                                     control_mesh_id = str(original.get('eiem_controls_mesh_id', original.name))
                                     expressions = preserved_controls['visibility'].get(control_mesh_id, {})
@@ -1555,7 +1571,8 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
                             mid=material_sections[selected_material.as_pointer()]
                             part=dict(common,partId=pid,
                                       authorData=addon.format_io.encode_mesh(author),
-                                      visibilityBindings=bindings,materialSlot=slot)
+                                      visibilityBindings=bindings,
+                                      materialSlot=inherited_source_material_slot(slot))
                             if preserved_controls:
                                 control_mesh_id = str(original.get('eiem_controls_mesh_id', original.name))
                                 expressions = preserved_controls['visibility'].get(control_mesh_id, {})
