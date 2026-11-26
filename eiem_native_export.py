@@ -348,14 +348,15 @@ def mesh_part_id(name, slot, split_count, imported_section=''):
 
 def control_program_source(preserved):
     """Keep imported declarations internally; author widgets supply edits."""
-    return (preserved or {}).get('program_source') or ''
+    source = (preserved or {}).get('program_source') or ''
+    return '\n'.join(source.values()) if isinstance(source, dict) else source
 
 
 def control_program_bindings(source):
     if not source:
         return []
     if isinstance(source, dict):
-        source = ''.join(source.values())
+        source = '\n'.join(source.values())
     ini = configparser.ConfigParser(interpolation=None, delimiters=('=',), strict=True)
     ini.optionxform = str
     ini.read_string(source)
@@ -365,7 +366,62 @@ def control_program_bindings(source):
 def control_program_materials(source):
     """Keep unchanged materials that are explicitly driven by INI bindings."""
     return {b.get('material', '') for b in control_program_bindings(source)
-            if b.get('target') == 'material.float'}
+            if b.get('target', '').startswith('material.')}
+
+
+def material_parameter_program(source, materials):
+    """Compile authored fields into the same INI declarations as hand-written controls."""
+    if not materials:
+        return source
+    ini = configparser.ConfigParser(interpolation=None, delimiters=('=',), strict=True)
+    ini.optionxform = str
+    ini.read_string(source)
+    variables = {ini[s].get('variable') for s in ini.sections() if s.startswith('Parameter')}
+    bindings = {(b.get('material'), b.get('property'), b.get('channel', ''))
+                for b in control_program_bindings(source) if b.get('target', '').startswith('material.')}
+    generated = configparser.ConfigParser(interpolation=None, delimiters=('=',), strict=True)
+    generated.optionxform = str
+    for mid, specs in sorted(materials.items()):
+        for spec in sorted(specs, key=lambda item: (item['property'], item['channel'])):
+            prop, channel = spec['property'], spec['channel']
+            target = mid, prop, channel
+            if target in bindings:
+                raise ValueError(f'{mid} 的 {prop} {channel.upper()} 已有 INI 绑定')
+            bindings.add(target)
+            # The resource reference uses the actual exported ID. Generated
+            # control names remain readable even for disambiguated materials.
+            stem = re.sub(r'(?:_[0-9a-fA-F]{12,})+$', '', mid)
+            stem = re.sub(r'[^A-Za-z0-9_]+', '_', f'{stem}_{prop.lstrip("_")}_{channel}').rstrip('_')
+            suffix = stem
+            index = 2
+            while (f'$mat_{suffix}' in variables or
+                   any(prefix + suffix in ini or prefix + suffix in generated
+                       for prefix in ('Parameter', 'Binding'))):
+                suffix = f'{stem}_{index}'
+                index += 1
+            variable = f'$mat_{suffix}'
+            variables.add(variable)
+            label = spec['label'] or f'{prop} {channel.upper()}'.strip()
+            widget = spec['widget']
+            parameter = dict(variable=variable, type='float', default=format(spec['default'], '.9g'),
+                             public='false' if widget == 'INI' else 'true', label=label)
+            if widget != 'INI':
+                parameter['ui.type'] = widget.lower()
+            if widget == 'SLIDER':
+                lo, hi = spec['minimum'], spec['maximum']
+                if not math.isfinite(lo) or not math.isfinite(hi) or lo >= hi:
+                    raise ValueError(f'{label} 的滑块范围无效')
+                if not lo <= spec['default'] <= hi:
+                    raise ValueError(f'{label} 的默认值必须在滑块范围内')
+                parameter.update(min=format(lo, '.9g'), max=format(hi, '.9g'))
+            generated['Parameter' + suffix] = parameter
+            binding = dict(target=spec['target'], material=mid, property=prop)
+            if channel:
+                binding['channel'] = channel
+            generated['Binding' + suffix] = dict(binding, value=variable)
+    tail = io.StringIO()
+    generated.write(tail, space_around_delimiters=False)
+    return (source.rstrip() + '\n\n' if source else '') + tail.getvalue()
 
 
 def part_shape_controls(controls, part_section, bindings):
@@ -1470,6 +1526,7 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
     material_sections = material_ids(selected_materials)
     addon.material_animation.register_action_tracks(selected_materials)
     parts, materials, textures, rules = [], {}, {}, []
+    exported_parameters = {}
     texture_inputs = {}
     texture_cache = {}
     material_sources = {}
@@ -1559,14 +1616,17 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
                                 material_animated = any(
                                     clip.enabled for clip,_track in
                                     addon.material_animation.action_tracks(variant))
+                                parameters = list(addon.material_editor.parameter_specs(variant))
                                 record = collect_material(
                                     addon, material_source(source, variant, material_sources), variant,
                                     images, textures, temporary, encode, mid=mid,
                                     texture_cache=texture_cache,
                                     include_native_fields=False, texture_inputs=texture_inputs,
-                                    force=bool(switch or material_animated or mid in program_materials))
+                                    force=bool(switch or material_animated or parameters or mid in program_materials))
                                 if record is not None:
                                     materials[mid] = record
+                                    if parameters:
+                                        exported_parameters[mid] = parameters
                                 detail['materialTexture'] += (time.perf_counter()-phase)*1000
                         phase = time.perf_counter()
                         fields = native_mesh_fields(modules, source, target, author,
@@ -1771,7 +1831,7 @@ def _export_native_package(addon, destination, mesh_objects, *, modules, dll,
             preserved_controls=(preserved_controls['controls'] if preserved_controls else None),
             preserved_bindings=(preserved_controls['bindings'] if preserved_controls else None),
             key_switch_enabled=(preserved_controls['key_switch_enabled'] if preserved_controls else True),
-            control_program_source=program_source,
+            control_program_source=material_parameter_program(program_source, exported_parameters),
             texture_template=next((t for t in templates if t['kind'] == 'Texture2D'), None))
         eiem_effect_author_resources.finalize_author_resources(format3_staging,effects,written)
         detail['writeAuthor'] = (time.perf_counter() - phase) * 1000

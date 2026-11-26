@@ -304,6 +304,267 @@ class EFF_PG_material_group(bpy.types.PropertyGroup):
     details_expanded: BoolProperty(default=False, options=set())
 
 
+_PARAMETER_WIDGETS = (
+    ('INI', '仅 INI', '只在 mod.ini 里声明参数'),
+    ('NUMBER', '数值输入', '在游戏 EFF 面板输入数值'),
+    ('SLIDER', '滑块', '在游戏 EFF 面板拖动滑块'),
+)
+_PARAMETER_CHANNELS = {
+    'FLOAT': (('value', '数值', ''),),
+    'COLOR': tuple((c, c.upper(), '') for c in 'rgba'),
+    'VECTOR4': tuple((c, c.upper(), '') for c in 'xyzw'),
+}
+
+
+def _parameter_kind(material, key):
+    value = material.get(key)
+    if value is not None and key.startswith(('eiem_float.', 'eiem_color.', 'eiem_value4.')):
+        return property_kind(key, value)
+    return ''
+
+
+def _parameter_value(material, key, channel):
+    kind = _parameter_kind(material, key)
+    channels = [item[0] for item in _PARAMETER_CHANNELS.get(kind, ())]
+    try:
+        values = [float(value) for value in str(material[key]).split(',')]
+        if len(values) != len(channels):
+            raise ValueError
+        value = values[channels.index(channel)]
+        if not math.isfinite(value) or abs(value) > 3.402823466e38:
+            raise ValueError
+        return value
+    except (KeyError, ValueError) as error:
+        raise ValueError(f'{material.name} 的 {features.property_name(key)} 没有有效的 {channel.upper()} 分量') from error
+
+
+class EFF_PG_material_parameter(bpy.types.PropertyGroup):
+    key: StringProperty()
+    channel: StringProperty()
+    label: StringProperty()
+    widget: EnumProperty(items=_PARAMETER_WIDGETS, default='SLIDER', options=set())
+    minimum: FloatProperty(precision=4, options=set())
+    maximum: FloatProperty(default=1, precision=4, options=set())
+
+
+def parameter_specs(material):
+    targets = {'FLOAT': 'material.float', 'COLOR': 'material.color', 'VECTOR4': 'material.vector'}
+    for row in material.eiem_material_parameters:
+        value = _parameter_value(material, row.key, row.channel)
+        yield dict(property=features.property_name(row.key), target=targets[_parameter_kind(material, row.key)],
+                   channel='' if row.channel == 'value' else row.channel, default=value,
+                   label=row.label, widget=row.widget, minimum=row.minimum, maximum=row.maximum)
+
+
+def _parameter_channels(self, context):
+    material = context_material(context, self.material_name)
+    return _PARAMETER_CHANNELS.get(_parameter_kind(material, self.key), ()) if material else ()
+
+
+def _search_parameter_fields(self, context, edit_text):
+    material = context_material(context, self.material_name)
+    if material is None:
+        return []
+    query = edit_text.casefold()
+    return sorted(key for key in material.keys()
+                  if query in key.casefold() and _parameter_kind(material, key) in _PARAMETER_CHANNELS)
+
+
+def _parameter_caption(key, channel):
+    name = features.property_name(key)
+    return name if channel == 'value' else f'{name} {channel.upper()}'
+
+
+def _load_parameter(self, context):
+    material = context_material(context, self.material_name)
+    if material is None or not self.channel:
+        return
+    saved = material.eiem_material_parameters.get(f'{self.key}:{self.channel}')
+    try:
+        value = _parameter_value(material, self.key, self.channel)
+    except ValueError:
+        value = 0
+    self.default_value = self.original_value = value
+    if saved is None:
+        self.label = _parameter_caption(self.key, self.channel)
+        self.widget = 'SLIDER'
+        self.minimum, self.maximum = (0, 1) if self.channel == 'a' else (min(0, value), max(1, value))
+    else:
+        self.label = saved.label
+        self.widget = saved.widget
+        self.minimum, self.maximum = saved.minimum, saved.maximum
+    self.remove = False
+
+
+def _set_parameter_field(self, context):
+    if not self.choose_target:
+        return
+    channels = _parameter_channels(self, context)
+    if channels:
+        self.channel = 'a' if channels is _PARAMETER_CHANNELS['COLOR'] else channels[0][0]
+        _load_parameter(self, context)
+
+
+def _set_parameter_material(self, context):
+    if self.choose_target:
+        self.key = ''
+
+
+class EFF_OT_material_parameter(bpy.types.Operator):
+    bl_idname = 'eiem.material_parameter'
+    bl_label = '公开为参数'
+    bl_description = '将此材质字段的一个分量导出为 INI 参数，可在游戏 EFF 面板调整'
+    bl_options = {'UNDO'}
+
+    choose_target: BoolProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    parameter_id: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    material_name: StringProperty(name='材质', update=_set_parameter_material, options={'SKIP_SAVE'})
+    key: StringProperty(name='材质属性', search=_search_parameter_fields,
+                        update=_set_parameter_field, options={'SKIP_SAVE'})
+    channel: EnumProperty(name='分量', items=_parameter_channels, update=_load_parameter)
+    label: StringProperty(name='显示名称')
+    widget: EnumProperty(name='游戏面板', items=_PARAMETER_WIDGETS, default='SLIDER')
+    minimum: FloatProperty(name='滑块最小值', precision=4)
+    maximum: FloatProperty(name='滑块最大值', default=1, precision=4)
+    default_value: FloatProperty(name='导出默认值', precision=5, options={'SKIP_SAVE'})
+    original_value: FloatProperty(options={'HIDDEN', 'SKIP_SAVE'})
+    remove: BoolProperty(name='移除此参数', options={'SKIP_SAVE'})
+
+    def invoke(self, context, event):
+        if self.choose_target:
+            material = context_material(context)
+            self.material_name = material.name if material else ''
+            return context.window_manager.invoke_props_dialog(self)
+        channels = _parameter_channels(self, context)
+        if not channels:
+            return {'CANCELLED'}
+        material = context_material(context, self.material_name)
+        saved = material.eiem_material_parameters.get(self.parameter_id)
+        self.channel = saved.channel if saved else next(
+            (item[0] for item in channels if f'{self.key}:{item[0]}' in material.eiem_material_parameters),
+            'a' if channels is _PARAMETER_CHANNELS['COLOR'] else channels[0][0])
+        _load_parameter(self, context)
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        if self.choose_target:
+            layout.prop_search(self, 'material_name', bpy.data, 'materials')
+            layout.prop(self, 'key')
+            if not _parameter_channels(self, context):
+                return
+        material = context_material(context, self.material_name)
+        if material is None:
+            return
+        if self.parameter_id:
+            layout.label(text=_parameter_caption(self.key, self.channel))
+        elif len(_parameter_channels(self, context)) > 1:
+            layout.prop(self, 'channel')
+        if not self.parameter_id and not self.choose_target and f'{self.key}:{self.channel}' in material.eiem_material_parameters:
+            layout.prop(self, 'remove')
+        if self.remove:
+            return
+        try:
+            _parameter_value(material, self.key, self.channel)
+            layout.prop(self, 'default_value')
+        except ValueError as error:
+            layout.label(text=str(error), icon='ERROR')
+        layout.prop(self, 'widget')
+        layout.prop(self, 'label')
+        if self.widget == 'SLIDER':
+            layout.prop(self, 'minimum')
+            layout.prop(self, 'maximum')
+
+    def execute(self, context):
+        material = context_material(context, self.material_name)
+        if material is None or material.get('eff_preview_instance'):
+            self.report({'ERROR'}, '请选择要编辑的材质')
+            return {'CANCELLED'}
+        rows = material.eiem_material_parameters
+        name = f'{self.key}:{self.channel}'
+        index = rows.find(name)
+        if self.remove:
+            index = rows.find(self.parameter_id or name)
+            if index >= 0:
+                rows.remove(index)
+            return {'FINISHED'}
+        try:
+            current = _parameter_value(material, self.key, self.channel)
+            if any(char in self.label for char in '\r\n'):
+                raise ValueError('显示名称必须为单行文字')
+            edit_value = (self.properties.is_property_set('default_value') and
+                          (not self.properties.is_property_set('original_value') or
+                           self.default_value != self.original_value))
+            value = self.default_value if edit_value else current
+            if not math.isfinite(value) or abs(value) > 3.402823466e38:
+                raise ValueError('导出默认值必须是有限数值')
+            if self.widget == 'SLIDER':
+                if not self.minimum < self.maximum:
+                    raise ValueError('滑块最大值必须大于最小值')
+                if not self.minimum <= value <= self.maximum:
+                    raise ValueError('导出默认值必须在滑块范围内')
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        if edit_value:
+            channels = [item[0] for item in _parameter_channels(self, context)]
+            values = str(material[self.key]).split(',')
+            values[channels.index(self.channel)] = format(self.default_value, '.9g')
+            _put(_row(material, self.key), ','.join(values))
+        row = rows[index] if index >= 0 else rows.add()
+        row.name, row.key, row.channel = name, self.key, self.channel
+        row.label, row.widget = self.label.strip(), self.widget
+        row.minimum, row.maximum = self.minimum, self.maximum
+        return {'FINISHED'}
+
+
+class EFF_PT_material_parameters(bpy.types.Panel):
+    bl_label = '材质参数'
+    bl_idname = 'VIEW3D_PT_eiem_material_parameters'
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'EFF'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        self.layout.operator('eiem.material_parameter', text='新增参数', icon='ADD').choose_target = True
+        materials = sorted((mat for mat in bpy.data.materials
+                            if mat.eiem_material_parameters and not mat.get('eff_preview_instance')),
+                           key=lambda mat: mat.name.casefold())
+        if not materials:
+            self.layout.label(text='当前工程没有已公开的材质参数')
+            return
+
+        widget_labels = {value: label for value, label, _ in _PARAMETER_WIDGETS}
+        for material in materials:
+            box = self.layout.box()
+            box.label(text=material.name, icon='MATERIAL')
+            for row in material.eiem_material_parameters:
+                caption = _parameter_caption(row.key, row.channel)
+                if row.label and row.label != caption:
+                    box.label(text=row.label)
+                line = box.row(align=True)
+                line.label(text=caption)
+                if _parameter_kind(material, row.key) in _PARAMETER_CHANNELS:
+                    edit = line.operator('eiem.material_parameter', text='', icon='PREFERENCES')
+                    edit.material_name, edit.key, edit.parameter_id = material.name, row.key, row.name
+                remove_row = line.row(align=True)
+                remove_row.operator_context = 'EXEC_DEFAULT'
+                remove = remove_row.operator('eiem.material_parameter', text='', icon='X')
+                remove.material_name, remove.key, remove.parameter_id = material.name, row.key, row.name
+                remove.remove = True
+                try:
+                    value = _parameter_value(material, row.key, row.channel)
+                except ValueError:
+                    box.label(text='源属性或分量无效', icon='ERROR')
+                    continue
+                widget = widget_labels[row.widget]
+                if row.widget == 'SLIDER':
+                    widget += f' {row.minimum:.6g}–{row.maximum:.6g}'
+                box.label(text=f'默认值 {value:.9g} · {widget}')
+
+
 def _row(material, key):
     rows = material.eiem_editor_values
     row = rows.get(key)
@@ -438,7 +699,12 @@ def draw_value(layout, material, key, simple=False):
                             *(row[1] for row in features.VFX_UV.values())):
         field = 'uv_speed'
     label = features.label(key) if simple else name or '渲染队列'
-    _value_layout(layout, label).prop(row, field, text='')
+    value = _value_layout(layout, label)
+    value.prop(row, field, text='')
+    if _parameter_kind(material, key) in _PARAMETER_CHANNELS:
+        active = any(item.key == key for item in material.eiem_material_parameters)
+        op = value.operator('eiem.material_parameter', text='', icon='DECORATE_KEYFRAME' if active else 'DRIVER', depress=active)
+        op.material_name, op.key = material.name, key
 
 
 def context_material(context, material_name=''):
@@ -742,6 +1008,7 @@ def draw(layout, material):
 
 
 CLASSES = (EFF_PG_material_value, EFF_PG_material_feature, EFF_PG_material_group,
+           EFF_PG_material_parameter, EFF_OT_material_parameter, EFF_PT_material_parameters,
            EFF_OT_material_texture_add, EFF_OT_material_texture_file)
 
 
@@ -750,6 +1017,7 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.Material.eiem_editor_groups = CollectionProperty(type=EFF_PG_material_group)
     bpy.types.Material.eiem_editor_features = CollectionProperty(type=EFF_PG_material_feature)
+    bpy.types.Material.eiem_material_parameters = CollectionProperty(type=EFF_PG_material_parameter)
     bpy.types.Material.eiem_editor_surface = EnumProperty(items=features.SURFACE_ITEMS,
         get=features.surface_mode, set=_set_surface, description='同步透明参数、Shader 关键字和实际渲染队列；保留贴图和深度写入')
     bpy.types.Material.eiem_editor_vfx_surface = EnumProperty(items=features.VFX_SURFACE_ITEMS,
@@ -778,7 +1046,7 @@ def unregister():
     _structure.cache_clear()
     for name in ('eiem_blend_brightness','eiem_editor_advanced','eiem_editor_surface','eiem_editor_vfx_surface','eiem_editor_features',
                  'eiem_editor_info_expanded','eiem_editor_uv_expanded','eiem_editor_search',
-                 'eiem_editor_groups','eiem_editor_values'):
+                 'eiem_editor_groups','eiem_editor_values','eiem_material_parameters'):
         delattr(bpy.types.Material,name)
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)

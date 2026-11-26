@@ -59,6 +59,38 @@ try:
     assert hdr['eiem_value4._BlendTint'] == '128,64,32,1', 'HDR lost its tint'
     assert (color_property.hard_min,color_property.hard_max)==(0.0,1.0)
     assert (color_property.soft_min,color_property.soft_max)==(0.0,1.0)
+    parameter_key = 'eiem_value4._BaseColor'
+    hdr[parameter_key] = '0.25,0.5,0.75,1.5'
+    status = bpy.ops.eiem.material_parameter(material_name=hdr.name, key=parameter_key,
+                                             channel='a', label='透明度', widget='SLIDER', maximum=2)
+    assert status == {'FINISHED'}
+    data, = editor.parameter_specs(hdr)
+    assert (data['target'], data['property'], data['channel'], data['default']) == (
+        'material.color', '_BaseColor', 'a', 1.5)
+    assert (data['label'], data['maximum']) == ('透明度', 2)
+    assert hdr[parameter_key] == '0.25,0.5,0.75,1.5'
+    overview = Layout([])
+    editor.EFF_PT_material_parameters.draw(type('Panel', (), {'layout': overview})(), bpy.context)
+    assert [label for label, _ in overview.labels] == [
+        hdr.name, '透明度', '_BaseColor A', '默认值 1.5 · 滑块 0–2']
+    hdr['eff_preview_instance'] = True
+    overview = Layout([])
+    editor.EFF_PT_material_parameters.draw(type('Panel', (), {'layout': overview})(), bpy.context)
+    assert [label for label, _ in overview.labels] == ['当前工程没有已公开的材质参数']
+    del hdr['eff_preview_instance']
+    exporter = package.eiem_blender_addon.native_export
+    source = exporter.material_parameter_program('', {'MaterialCloth': [data]})
+    assert 'material=MaterialCloth\nproperty=_BaseColor\nchannel=a\n' in source
+    assert 'default=1.5\npublic=true\nlabel=透明度\nui.type=slider\nmin=0\nmax=2\n' in source
+    assert bpy.ops.eiem.material_parameter(material_name=hdr.name, key=parameter_key, channel='a',
+                                           label='透明度', widget='SLIDER', maximum=1,
+                                           default_value=.625) == {'FINISHED'}
+    data, = editor.parameter_specs(hdr)
+    assert (data['default'], data['maximum']) == (.625, 1)
+    assert hdr[parameter_key] == '0.25,0.5,0.75,0.625'
+    assert bpy.ops.eiem.material_parameter(material_name=hdr.name, key=parameter_key,
+                                           parameter_id=parameter_key + ':a', remove=True) == {'FINISHED'}
+    assert not list(editor.parameter_specs(hdr))
     editor._prepare_material(queue_mat)
     queue_row=queue_mat.eiem_editor_values['eiem_render_queue']
     assert queue_row.render_queue==2000, 'an absent native queue must display its actual opaque queue'
