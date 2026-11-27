@@ -81,9 +81,19 @@ try:
             "[RenderBody]\npath=assets/test/body.renderer\nasset=BodyRenderer\n"
             "mesh=MeshBody\nmaterial.0=MaterialBody\n", encoding="utf-8")
 
-        imported = addon.eiem_blender_addon.import_package(
-            root, clean=True, include_physics=False)
-        assert imported == 1, imported
+        # An explicit missing physics file should fail before creating any objects.
+        existing_objects = set(bpy.data.objects)
+        try:
+            bpy.ops.eiem.import_package(filepath=str(root / "mod.ini"),
+                                        physics_file=str(root / "missing.physics"))
+        except RuntimeError as exc:
+            assert "missing.physics" in str(exc), str(exc)
+        else:
+            raise AssertionError("Import accepted an explicit missing physics file")
+        assert set(bpy.data.objects) == existing_objects
+
+        # The same package should import using the UI defaults without physics data.
+        assert bpy.ops.eiem.import_package(filepath=str(root / "mod.ini")) == {"FINISHED"}
         mesh_objects = [obj for obj in bpy.data.objects
                         if obj.type == "MESH" and obj.get("eiem_author_package") == str(root)]
         assert len(mesh_objects) == 1, [obj.name for obj in mesh_objects]
@@ -111,6 +121,6 @@ try:
         assert obj.data.materials and obj.data.materials[0]["eiem_source"] == "assets/test/body.mat"
         image = next(image for image in bpy.data.images if image.get("eiem_author_package") == str(root))
         assert image.colorspace_settings.name == "Non-Color"
-        print("EFFSOURCE_BLENDER_IMPORT_OK", imported, obj.name, image.colorspace_settings.name)
+        print("EFFSOURCE_BLENDER_IMPORT_OK", len(mesh_objects), obj.name, image.colorspace_settings.name)
 finally:
     addon.unregister()

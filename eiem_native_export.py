@@ -1295,7 +1295,28 @@ def publication_inventory(root):
                 raise ValueError('Format 3 发布目标资源路径超出 Mod：' + value)
             if path.is_file():
                 files.add(path.relative_to(root).as_posix())
-    return dict(format=3, modId=ini['Mod']['id'], modType=mod_type, _files=files)
+    gui = {key: ini['Mod'][key] for key in ('gui_script', 'gui_key', 'gui_enabled')
+           if key in ini['Mod']}
+    return dict(format=3, modId=ini['Mod']['id'], modType=mod_type, _files=files,
+                _gui=gui)
+
+
+def preserve_custom_gui(marker, gui):
+    """Keep hand-authored GUI settings when republishing generated resources."""
+    if not gui:
+        return
+    text = marker.read_text(encoding='utf-8-sig')
+    start = re.search(r'^\[Mod\][ \t]*\n', text, re.M)
+    if not start:
+        return
+    match = re.search(r'^\[', text[start.end():], re.M)
+    end = start.end() + match.start() if match else len(text)
+    section = text[start.end():end]
+    fields = ''.join(f'{key}={value}\n' for key, value in gui.items()
+                     if not re.search(rf'^[ \t]*{key}[ \t]*=', section, re.M))
+    if fields:
+        marker.write_text(text[:start.end()] + fields + text[start.end():],
+                          encoding='utf-8', newline='\n')
 
 
 def publish(staging, destination, reader, previous=None, candidate=None):
@@ -1304,6 +1325,8 @@ def publish(staging, destination, reader, previous=None, candidate=None):
     if previous is None:
         previous = publication_inventory(destination)
     if candidate is None:candidate = reader(staging)
+    if previous and previous.get('_gui') and previous['modId'] == candidate.get('modId'):
+        preserve_custom_gui(staging/'mod.ini', previous.get('_gui'))
     for name in candidate['_files']:
         if destination not in (destination / name).resolve().parents:
             raise ValueError('导出资源路径超出输出目录：' + name)

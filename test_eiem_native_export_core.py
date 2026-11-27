@@ -1484,6 +1484,27 @@ class NativeExportCoreTests(unittest.TestCase):
         self.assertIn('effect_native', modules)
         self.assertNotIn('runtime_controls', modules)
 
+    def test_format3_publish_preserves_custom_gui(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'mod'
+            staging = Path(directory) / 'staging'
+            root.mkdir()
+            staging.mkdir()
+            original = '[Mod]\nformat=3\nid=Example\n'
+            (root/'mod.ini').write_text(original + 'gui_script=ui/panel.lua\n'
+                                        'gui_key=F8\ngui_enabled=0\n', encoding='utf-8')
+            (root/'ui').mkdir()
+            (root/'ui/panel.lua').write_bytes(b'return function() end')
+            (root/'ui/card.png').write_bytes(b'image')
+            (staging/'mod.ini').write_text(original + '\n[Constants]\n$mode=1\n', encoding='utf-8')
+            reader = exporter.pack_modules()[0]['author_format3'].read_format3_directory
+            exporter.publish(staging, root, reader)
+            ini = (root/'mod.ini').read_text(encoding='utf-8')
+            self.assertIn('gui_script=ui/panel.lua\ngui_key=F8\ngui_enabled=0\n', ini)
+            self.assertIn('$mode=1', ini)
+            self.assertEqual((root/'ui/panel.lua').read_bytes(), b'return function() end')
+            self.assertEqual((root/'ui/card.png').read_bytes(), b'image')
+
     @unittest.skip('Format 2 package publication belongs to Mod Manager')
     def test_parent_export_preserves_nested_mods(self):
         import nativepack.ini_package as writer

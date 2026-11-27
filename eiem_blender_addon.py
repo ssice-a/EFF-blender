@@ -1242,6 +1242,27 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
         from importlib import import_module
         parser = import_module(modules['author_format3'].__package__ + '.effect_assembly').expand(root, parser)
     resources = {section: dict(parser.items(section)) for section in parser.sections()}
+    physics_resources = []
+    has_author_physics = any(values.get("type") == "physics" for values in resources.values())
+    if include_physics or has_author_physics:
+        if physics_file and not has_author_physics:
+            physics_resources.append(("", Path(bpy.path.abspath(physics_file))))
+        else:
+            for section, values in resources.items():
+                relative = values.get("path")
+                if values.get("type") == "physics":
+                    if not relative:
+                        raise ValueError(f"物理资源 {section} 缺少 path")
+                elif not relative or not section.lower().startswith(("physics", "resourcephysics")):
+                    continue
+                physics_resources.append((section, safe_path(root, relative)))
+            if not physics_resources:
+                candidate = root / "physics" / "components.json"
+                if candidate.is_file():
+                    physics_resources.append(("", candidate))
+        for _, file in physics_resources:
+            if not file.is_file():
+                raise ValueError(f"找不到物理文件：{file}")
     control_state = None
     if not is_source_package and parser.get("Mod", "controls", fallback="") == "ini":
         modules, _ = native_export.pack_modules()
@@ -1519,21 +1540,7 @@ def import_package(root, clean=False, include_physics=False, physics_file=""):
             unity_transform_matrix_to_blender_basis(), modules["state_rules"].Condition)
     for armature in armatures_by_hierarchy.values():
         armature.data["eiem_source_bindings_json"] = json.dumps(shared_skin_bindings(armature), separators=(",", ":"))
-    has_physics = any(values.get("type") == "physics" for values in resources.values())
-    if include_physics or has_physics:
-        physics_resources = [
-            (section, safe_path(root, values["path"]))
-            for section, values in resources.items()
-            if section.lower().startswith(("physics", "resourcephysics")) and values.get("path")
-        ]
-        if physics_file and not has_physics:
-            physics_resources = [("", Path(physics_file))]
-        if not physics_resources:
-            candidate = Path(root) / "physics" / "components.json"
-            if candidate.is_file():
-                physics_resources = [("", candidate)]
-        if not physics_resources:
-            raise ValueError("资源包未包含物理文件，请指定解包的 components.json 或 .physics")
+    if physics_resources:
         physics_rigs = {}
         for section, values in resources.items():
             if not section.lower().startswith("render"):
@@ -4720,7 +4727,7 @@ class EFF_OT_import(ImportHelper, bpy.types.Operator):
     filter_glob: StringProperty(default="mod.ini", options={"HIDDEN"})
     clean: BoolProperty(name="Clear EFF collection", default=False)
     include_physics: BoolProperty(name="导入物理骨骼与碰撞体", default=True,
-                                 description="可选；物理数据不影响只导出 Mesh")
+                                 description="导入可用的物理数据；没有物理数据的来源包仍可导入模型")
     physics_file: StringProperty(name="物理源文件", subtype="FILE_PATH",
                                 description="可选 components.json 或 .physics；留空使用包内声明")
 
